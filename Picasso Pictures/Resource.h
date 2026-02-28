@@ -5,9 +5,12 @@
 #define IDS_APP_TITLE			103
 #define IDR_MAINFRAME			128
 #define IDD_PICASSOPICTURES_DIALOG	102
+#define IDR_DEFAULT_BKG_JPG     101
 #define IDD_ABOUTBOX			103
 #define IDM_ABOUT				104
 #define IDM_EXIT				105
+#define ID_HELP_COMMANDS        106
+#define IDD_COMMANDBOX          107
 #define IDM_OPEN                32772
 #define IDI_PICASSOPICTURES		107
 #define IDI_SMALL				108

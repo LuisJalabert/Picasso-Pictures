@@ -1,9 +1,13 @@
-﻿// Picasso Pictures.cpp : Defines the entry point for the application.
+// Picasso Pictures.cpp : Defines the entry point for the application.
 //
+
+#define MAX_LOADSTRING 100
 
 #include "framework.h"
 #include "resource.h"
-
+#include "AnimatedButton.h"
+#include "UITextBox.h"
+#include <chrono>
 #include <windows.h>
 #include <objidl.h>
 #include <commdlg.h>
@@ -11,70 +15,349 @@
 #include <windowsx.h>
 #include <d2d1.h>
 #include <wincodec.h>
+#include <vector>
+#include <string>
+#include <dwrite.h>
+#include <shellapi.h>
+#include <filesystem>
+#include <dwmapi.h>
+#include <wrl/client.h>
+#include <cmath>
+#include <functional>
+#include <d2d1_1.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <wrl.h>
+#include <d2d1effects.h>
+#include <unordered_map>
 
-
-#define MAX_LOADSTRING 100
-
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dxguid.lib")
+
+using Microsoft::WRL::ComPtr;
+
+struct ImageViewState
+{
+    float zoom;
+    float offsetX;
+    float offsetY;
+    float targetZoom;
+    float targetOffsetX;
+    float targetOffsetY;
+    float rotation;
+    float targetRotation;
+};
+
+// Control IDs for text boxes
+int TEXTBOX_FILE_NAME = 0;
+int TEXTBOX_ZOOM_INPUT = 1;
+
 
 // Global Variables:
-HINSTANCE               hInst;                              // current instance
-WCHAR                   szTitle[MAX_LOADSTRING];            // The title bar text
-WCHAR                   szWindowClass[MAX_LOADSTRING];      // the main window class name
-ID2D1Factory*           g_d2dFactory = nullptr;
-ID2D1HwndRenderTarget*  g_renderTarget = nullptr;
-IWICImagingFactory*     g_wicFactory = nullptr;
-ID2D1Bitmap*            g_d2dBitmap = nullptr;
-float                   g_zoom = 1.0f;                      // Current zoom level
-float                   g_offsetX = 0.0f;                   // Pan offset X
-float                   g_offsetY = 0.0f;                   // Pan offset Y
-bool                    g_isDragging = false;
-POINT                   g_lastMouse = {};
-float                   g_targetZoom = 1.0f;
-float                   g_targetOffsetX = 0.0f;
-float                   g_targetOffsetY = 0.0f;
-bool                    g_isAnimating = false;
+HINSTANCE                                           hInst;                              // current instance
+WCHAR                                               szTitle[MAX_LOADSTRING];            // The title bar text
+WCHAR                                               szWindowClass[MAX_LOADSTRING];      // the main window class name
+ComPtr<ID2D1Factory1>                               g_d2dFactory;
+HWND                                                g_renderTargetWindow = nullptr;
+ComPtr<IWICImagingFactory>                          g_wicFactory;
+ComPtr<ID2D1Bitmap>                                 g_d2dBitmap;
+ComPtr<IWICBitmapSource>                            g_wicBitmapSource;                  // Cached, device-independent WIC source for current image
+float                                               g_zoom = 1.0f;                      // Current zoom level
+float                                               g_offsetX = 0.0f;                   // Pan offset X
+float                                               g_offsetY = 0.0f;                   // Pan offset Y
+bool                                                g_isDragging = false;
+POINT                                               g_lastMouse = {};
+POINT                                               g_mouseFromDown = {}; 
+LONG                                                g_lastZoomTime = 0;
+float                                               g_targetZoom = 1.0f;
+float                                               g_zoomDisplayAlpha = 0.0f;
+bool                                                g_showZoomDisplay = false;
+float                                               g_targetOffsetX = 0.0f;
+float                                               g_targetOffsetY = 0.0f;
+bool                                                g_isFullscreen = false;
+float                                               g_uiPixelScale = 1.0f;
+float                                               g_imageRotationAngle = 0.0f;
+float                                               g_targetRotationAngle = 0.0f;       // New rotation target
+float                                               g_rotationSpeed = 300.0f;           // degrees per second
+ComPtr<ID2D1Bitmap>                                 g_backgroundBitmap;                 // Device-dependent background bitmap
+ComPtr<IWICBitmap>                                  g_wicBackground;                    // Device-independent captured background (WIC)
+ComPtr<IWICBitmapSource>                            g_wicDefaultBackground;
+ComPtr<ID2D1Bitmap>                                 g_defaultBackgroundBitmap;
+std::vector<AnimatedButton>                         g_buttons;                          // Animated button instances
+bool                                                g_needsFullscreenInit = false;
+float                                               g_overlayAlpha = 0.0f;
+HWND                                                g_overlayWindow = nullptr;
+HWND                                                g_mainWindow = nullptr;
+bool                                                g_isExiting = false;
+bool                                                g_fullScreenInitDone = false;
+std::vector<std::wstring>                           g_imageFiles;
+int                                                 g_currentImageIndex = -1;
+std::wstring                                        g_currentFilePath;
+std::wstring                                        g_currentFileName;
+int                                                 g_imageWidth  = 0;
+int                                                 g_imageHeight = 0;
+std::unordered_map<std::wstring, ImageViewState>    g_imageStates;
+bool                                                g_restoredStateThisLoad = false;
+ComPtr<IDWriteFactory>                              g_dwriteFactory;
+ComPtr<IDWriteTextFormat>                           g_textFormat;
+LONG                                                g_lastFrameTime = 0;
+DWORD                                               g_zoomHideStartTime = 0;
+bool                                                g_launchedWithFile = false;
+D2D1_RECT_F                                         g_exitButtonRect = {};
+float                                               g_smooth = 0.13f;
+bool                                                g_pendingPreserveView = false;
+std::vector<ComPtr<IWICBitmapSource>>               g_gifFrames;
+DWORD                                               g_lastGifFrameTime = 0;
+std::vector<UINT>                                   g_gifFrameDelays;
+UINT                                                g_currentGifFrame = 0;
+bool                                                g_isAnimatedGif = false;
+ComPtr<ID3D11Device>                                g_d3dDevice;
+ComPtr<ID3D11DeviceContext>                         g_d3dContext;
+ComPtr<IDXGIDevice>                                 g_dxgiDevice;
+ComPtr<ID2D1Device>                                 g_d2dDevice;
+ComPtr<ID2D1DeviceContext>                          g_renderTarget;
+ComPtr<IDXGISwapChain1>                             g_swapChain;
+ComPtr<ID2D1Bitmap1>                                g_d2dTargetBitmap;
+ComPtr<ID2D1Effect>                                 g_shadowEffect;
+std::unordered_map<int, UITextBox>                  g_textBoxes;
+
 
 // Forward declarations of functions included in this code module:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
+ATOM                RegisterOverlayClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
 
+static std::wstring GetInitialFileFromCommandLine();
+int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow);
+int GetMonitorRefreshRate(HWND hWnd);
+bool LoadDefaultBackgroundFromResource();
+void EnableDarkTitleBar(HWND hwnd);
+ATOM MyRegisterClass(HINSTANCE hInstance);
+ATOM RegisterOverlayClass(HINSTANCE hInstance);
+void DiscardDeviceResources();
+void UpdateEngine(float dt);
+bool IsSupportedImage(const std::wstring& path);
+BOOL InitInstance(HINSTANCE hInstance, int nCmdShow);
+HWND CreateOverlayWindow(HWND parent);
+bool CreateDefaultBackgroundBitmap();
+void SetZoomCentered(float newZoom, HWND hWnd, bool instant);
+void CaptureDesktop(HWND hWnd);
+void FitToWindowRelative(HWND hWnd, float zoom);
+void FitWindowToImage(HWND hWnd);
+bool CreateBackgroundBitmap();
+void InitializeButtons();
+void InitializeImageInfoLabel();
+void UpdateTargetZoom(float newZoom);
+void EnterFullscreen(bool preserveView, bool needsDelay);
+void ExitFullscreen();
+void CreateRenderTarget(HWND hWnd);
+void RecreateImageBitmap();
+void InitializeImageLayout(HWND hWnd, bool hard);
+void Render(HWND hWnd);
+bool LoadImageD2D(HWND hWnd, const wchar_t* filename);
+void BuildImageList(const wchar_t* filename);
+bool OpenImageFile(HWND hWnd);
+bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt);
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
+INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
 
-int APIENTRY wWinMain(
-    _In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE hPrevInstance,
-    _In_ LPWSTR lpCmdLine,
-    _In_ int nCmdShow)
+static std::wstring GetInitialFileFromCommandLine()
+{
+    // Use CommandLineToArgvW so quoting/spaces are handled correctly.
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::wstring path;
+    if (argv && argc > 1 && argv[1])
+        path = argv[1];
+    if (argv)
+        LocalFree(argv);
+    return path;
+}
+
+int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow)
 {
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
+
+    // Get initial file from the command line.
+    std::wstring initialFile = GetInitialFileFromCommandLine();
+    g_launchedWithFile = !initialFile.empty();
+    // --- Load the strings early so we can find the existing window by class name ---
+    // (these load the same values you load later; moving them here lets FindWindow use them)
+    LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
+    LoadStringW(hInstance, IDC_PICASSOPICTURES, szWindowClass, MAX_LOADSTRING);
+
+    // --- Single-instance check using a named mutex ---
+    // Use a stable name for the mutex (change GUID-like part if you want a different token)
+    static const wchar_t* MUTEX_NAME = L"Local\\PicassoPictures_SingleInstance_v1";
+
+    HANDLE hMutex = CreateMutexW(nullptr, FALSE, MUTEX_NAME);
+
+    if (hMutex == nullptr)
+    {
+        // Can't create mutex — proceed as normal (or optionally exit)
+    }
+    else
+    {
+        DWORD lastErr = GetLastError();
+        if (lastErr == ERROR_ALREADY_EXISTS || lastErr == ERROR_ACCESS_DENIED)
+        {
+            // Another instance probably exists. Try to find its window and send the filename.
+            HWND hOtherWnd = FindWindowW(szWindowClass, nullptr);
+                        if (!hOtherWnd)
+            {
+                MessageBoxW(nullptr, L"Mutex exists but window not found!", L"Race condition!", MB_OK);
+            }
+            if (hOtherWnd)
+            {
+
+                // If we have a file, send it
+                if (!initialFile.empty())
+                {
+                    COPYDATASTRUCT cds;
+                    cds.dwData = 1;
+                    cds.cbData = static_cast<DWORD>((initialFile.size() + 1) * sizeof(wchar_t));
+                    cds.lpData = (PVOID)initialFile.c_str();
+
+                    DWORD_PTR result = 0;
+                    SendMessageTimeoutW(
+                        hOtherWnd,
+                        WM_COPYDATA,
+                        0,
+                        (LPARAM)&cds,
+                        SMTO_ABORTIFHUNG | SMTO_NORMAL,
+                        2000,
+                        &result);
+                }
+
+                // Bring existing window to foreground
+                if (IsIconic(hOtherWnd))
+                    ShowWindow(hOtherWnd, SW_RESTORE);
+
+                DWORD currentThread = GetCurrentThreadId();
+                DWORD targetThread = GetWindowThreadProcessId(hOtherWnd, nullptr);
+
+                AttachThreadInput(currentThread, targetThread, TRUE);
+
+                SetForegroundWindow(hOtherWnd);
+                SetFocus(hOtherWnd);
+                SetActiveWindow(hOtherWnd);
+
+                AttachThreadInput(currentThread, targetThread, FALSE);
+
+                CloseHandle(hMutex);
+                return 0;
+            }
+        }
+    }
+
+    // --- Normal initialization continues here ---
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    CoInitialize(nullptr);
 
-    D2D1CreateFactory(
+    if (FAILED(CoInitialize(nullptr)))
+    {
+        if (hMutex) CloseHandle(hMutex);
+        return FALSE;
+    }
+    D2D1_FACTORY_OPTIONS options = {};
+    #ifdef _DEBUG
+    options.debugLevel = D2D1_DEBUG_LEVEL_INFORMATION;
+    #endif
+
+    if (FAILED(D2D1CreateFactory(
         D2D1_FACTORY_TYPE_SINGLE_THREADED,
-        &g_d2dFactory
-    );
+        __uuidof(ID2D1Factory1),
+        &options,
+        reinterpret_cast<void**>(g_d2dFactory.GetAddressOf()))))
+    {
+        CoUninitialize();
+        if (hMutex) CloseHandle(hMutex);
+        return FALSE;
+    }
 
-    CoCreateInstance(
+    if (FAILED(CoCreateInstance(
         CLSID_WICImagingFactory,
         nullptr,
         CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(&g_wicFactory)
-    );
+        IID_PPV_ARGS(g_wicFactory.GetAddressOf()))))
+    {
+        CoUninitialize();
+        if (hMutex) CloseHandle(hMutex);
+        return FALSE;
+    }
 
-    // Initialize global strings
+    LoadDefaultBackgroundFromResource();
+
+    if (FAILED(DWriteCreateFactory(
+        DWRITE_FACTORY_TYPE_SHARED,
+        __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(g_dwriteFactory.GetAddressOf()))))
+    {
+        CoUninitialize();
+        if (hMutex) CloseHandle(hMutex);
+        return FALSE;
+    }
+  
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
+    g_smooth = g_smooth / ((float)(refreshRate) / 60.0f);
+
+    // Make overlay box 2.3% of screen height
+    float boxHeight = screenHeight * 0.023f;
+
+    // Font ~50% of that
+    float fontSize = boxHeight * 0.5f;
+
+    if (FAILED(g_dwriteFactory->CreateTextFormat(
+        L"Segoe UI",
+        nullptr,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        fontSize,
+        L"",
+        g_textFormat.GetAddressOf())))
+    {
+        CoUninitialize();
+        if (hMutex) CloseHandle(hMutex);
+        return FALSE;
+    }
+
+    // Center alignment
+    g_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    g_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+    // Initialize global strings (already loaded above but we keep this for consistency)
+    // (If you prefer, you can remove the earlier LoadString calls and keep these here.)
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_PICASSOPICTURES, szWindowClass, MAX_LOADSTRING);
     MyRegisterClass(hInstance);
+    RegisterOverlayClass(hInstance);
 
-    // Create window (loads image inside)
+    // Create window
     if (!InitInstance(hInstance, nCmdShow))
     {
+        CoUninitialize();
+        if (hMutex) CloseHandle(hMutex);
         return FALSE;
+    }
+
+    if (!initialFile.empty())
+    {
+        BuildImageList(initialFile.c_str());
+        LoadImageD2D(g_mainWindow, initialFile.c_str());
+        EnterFullscreen(false, true);
+
     }
 
     HACCEL hAccelTable = LoadAccelerators(
@@ -82,26 +365,127 @@ int APIENTRY wWinMain(
         MAKEINTRESOURCE(IDC_PICASSOPICTURES)
     );
 
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0))
+    MSG msg = {};
+    LONG lastTime = GetTickCount64();
+
+    // Main loop
+    while (true)
     {
-        if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
         {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+            if (msg.message == WM_QUIT)
+                goto shutdown;
+
+            if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+            {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
         }
+
+        LONG now = GetTickCount64();
+        float dt = (now - lastTime) / 1000.0f;
+        lastTime = now;
+
+        if (dt > 0.03f)
+            dt = 0.03f;
+
+        UpdateEngine(dt);
     }
 
+shutdown:
+    // Cleanup
+    CoUninitialize();
+    if (hMutex) CloseHandle(hMutex);
     return (int)msg.wParam;
 }
 
+int GetMonitorRefreshRate(HWND hWnd)
+{
+    HMONITOR hMonitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
 
+    MONITORINFOEX monitorInfo = {};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    GetMonitorInfo(hMonitor, &monitorInfo);
 
-//
-//  FUNCTION: MyRegisterClass()
-//
-//  PURPOSE: Registers the window class.
-//
+    DEVMODE dm = {};
+    dm.dmSize = sizeof(dm);
+
+    if (EnumDisplaySettings(monitorInfo.szDevice,
+                            ENUM_CURRENT_SETTINGS,
+                            &dm))
+    {
+        int refreshRate = dm.dmDisplayFrequency;
+        return refreshRate;
+    }
+    return 60; // Default to 60 Hz if we can't get the actual refresh rate
+}
+
+bool LoadDefaultBackgroundFromResource()
+{
+    if (g_wicDefaultBackground)
+        return true;
+
+    HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCE(IDR_DEFAULT_BKG_JPG), L"JPG");
+    if (!hRes)
+        return false;
+
+    HGLOBAL hData = LoadResource(hInst, hRes);
+    if (!hData)
+        return false;
+
+    void* pData = LockResource(hData);
+    DWORD size = SizeofResource(hInst, hRes);
+
+    ComPtr<IWICStream> stream;
+    if (FAILED(g_wicFactory->CreateStream(&stream)))
+        return false;
+
+    if (FAILED(stream->InitializeFromMemory(
+        reinterpret_cast<BYTE*>(pData),
+        size)))
+        return false;
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(g_wicFactory->CreateDecoderFromStream(
+        stream.Get(),
+        nullptr,
+        WICDecodeMetadataCacheOnLoad,
+        &decoder)))
+        return false;
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    if (FAILED(decoder->GetFrame(0, &frame)))
+        return false;
+
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(g_wicFactory->CreateFormatConverter(&converter)))
+        return false;
+
+    if (FAILED(converter->Initialize(
+        frame.Get(),
+        GUID_WICPixelFormat32bppPBGRA,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0f,
+        WICBitmapPaletteTypeCustom)))
+        return false;
+
+    g_wicDefaultBackground = converter;
+
+    return true;
+}
+
+void EnableDarkTitleBar(HWND hwnd)
+{
+    BOOL useDark = TRUE;
+    DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &useDark,
+        sizeof(useDark));
+}
+
 ATOM MyRegisterClass(HINSTANCE hInstance)
 {
     WNDCLASSEXW wcex;
@@ -115,7 +499,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
     wcex.hInstance      = hInstance;
     wcex.hIcon          = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_PICASSOPICTURES));
     wcex.hCursor        = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW+1);
+    wcex.hbrBackground  = nullptr;
     wcex.lpszMenuName   = MAKEINTRESOURCEW(IDC_PICASSOPICTURES);
     wcex.lpszClassName  = szWindowClass;
     wcex.hIconSm        = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
@@ -123,40 +507,187 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
     return RegisterClassExW(&wcex);
 }
 
-//
-//   FUNCTION: InitInstance(HINSTANCE, int)
-//
-//   PURPOSE: Saves instance handle and creates main window
-//
-//   COMMENTS:
-//
-//        In this function, we save the instance handle in a global variable and
-//        create and display the main program window.
-//
+ATOM RegisterOverlayClass(HINSTANCE hInstance)
+{
+    WNDCLASSEXW wcex = {};
+
+    wcex.cbSize = sizeof(WNDCLASSEX);
+    wcex.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wcex.lpfnWndProc = WndProc;
+    wcex.hInstance = hInstance;
+    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcex.hbrBackground = nullptr;
+    wcex.lpszClassName = L"OverlayWindowClass";
+
+    return RegisterClassExW(&wcex);
+}
+
+void DiscardDeviceResources()
+{
+    // D2D bitmaps
+    g_d2dBitmap.Reset();
+    g_backgroundBitmap.Reset();
+    g_defaultBackgroundBitmap.Reset();
+    g_d2dTargetBitmap.Reset();
+
+    // D2D context
+    g_renderTarget.Reset();
+
+    // DXGI / D3D
+    g_swapChain.Reset();
+    g_d3dContext.Reset();
+    g_d3dDevice.Reset();
+    g_d2dDevice.Reset();
+    g_shadowEffect.Reset();
+    g_renderTargetWindow = nullptr;
+}
+
+void UpdateEngine(float dt)
+{
+    LONG now = GetTickCount64();
+
+    if (g_isAnimatedGif && !g_gifFrames.empty())
+    {
+        if (now - g_lastGifFrameTime >= g_gifFrameDelays[g_currentGifFrame])
+        {
+            g_currentGifFrame =
+                (g_currentGifFrame + 1) % g_gifFrames.size();
+
+            g_wicBitmapSource = g_gifFrames[g_currentGifFrame];
+            RecreateImageBitmap();
+
+            g_lastGifFrameTime = now;
+        }
+    }
+
+    if (g_showZoomDisplay && now - g_lastZoomTime > 800)
+        g_showZoomDisplay = false;
+
+    const float fadeSpeed = 3.0f;
+
+    if (g_showZoomDisplay)
+    {
+        g_zoomDisplayAlpha += fadeSpeed * dt;
+        if (g_zoomDisplayAlpha > 1.0f)
+            g_zoomDisplayAlpha = 1.0f;
+    }
+    else
+    {
+        g_zoomDisplayAlpha -= fadeSpeed * dt;
+        if (g_zoomDisplayAlpha < 0.0f)
+            g_zoomDisplayAlpha = 0.0f;
+    }
+
+    if (std::fabs(g_targetRotationAngle - g_imageRotationAngle) > 0.01f)
+    {
+        float delta = g_targetRotationAngle - g_imageRotationAngle;
+        float step = g_rotationSpeed * dt;
+        if (std::fabs(step) > std::fabs(delta))
+            step = delta;
+        else
+            step *= (delta > 0 ? 1.f : -1.f);
+
+        g_imageRotationAngle += step;
+    }
+    float overlayTarget = g_isExiting ? 0.0f : 1.0f;
+    g_overlayAlpha += (overlayTarget - g_overlayAlpha) * 0.15f;
+
+    g_zoom     += (g_targetZoom     - g_zoom)     * g_smooth;
+    g_offsetX  += (g_targetOffsetX  - g_offsetX)  * g_smooth;
+    g_offsetY  += (g_targetOffsetY  - g_offsetY)  * g_smooth;
+
+    HWND renderWindow = (g_isFullscreen && g_overlayWindow)
+        ? g_overlayWindow
+        : g_mainWindow;
+
+    // Update button animations
+    static auto previousTime = std::chrono::high_resolution_clock::now();
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    float deltaTime = std::chrono::duration<float>(currentTime - previousTime).count();
+    previousTime = currentTime;
+    for (auto& btn : g_buttons)
+        btn.Update(deltaTime);
+
+    for (auto& [id, txt] : g_textBoxes)
+        txt.UpdateVisibility();
+
+    InvalidateRect(renderWindow, nullptr, FALSE);
+
+    if (g_isExiting &&
+        std::fabs(g_zoom - g_targetZoom) < 0.0005f &&
+        g_overlayAlpha < 0.01f)
+    {
+        if (g_overlayWindow)
+        {
+            DestroyWindow(g_mainWindow);
+            g_mainWindow = nullptr;
+            DestroyWindow(g_overlayWindow);
+            g_overlayWindow = nullptr;
+        }
+
+        PostQuitMessage(0);
+    }
+}
+
+bool IsSupportedImage(const std::wstring& path)
+{
+    std::wstring ext = std::filesystem::path(path).extension().wstring();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+
+    return ext == L".jpg"  ||
+           ext == L".jpeg" ||
+           ext == L".png"  ||
+           ext == L".bmp"  ||
+           ext == L".gif"  ||
+           ext == L".tif"  ||
+           ext == L".tiff" ||
+           ext == L".webp";
+}
+
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 {
-   hInst = hInstance; // Store instance handle in our global variable
+    hInst = hInstance; // Store instance handle in our global variable
 
-   HWND hWnd = CreateWindowW(
-    szWindowClass,
-    szTitle,
-    WS_OVERLAPPEDWINDOW,
-    CW_USEDEFAULT,
-    CW_USEDEFAULT,
-    800,     // width
-    600,     // height
-    nullptr,
-    nullptr,
-    hInstance,
-    nullptr
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+
+    // Use 50% of screen height
+    int windowHeight = screenH / 2;
+
+    // Default background aspect ratio (3:2)
+    float aspect = 1536.0f / 1024.0f;
+
+    // Compute width from height
+    int windowWidth = (int)(windowHeight * aspect);
+
+    HWND hWnd = CreateWindowExW(
+        0,
+        szWindowClass,
+        szTitle,
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        windowWidth,
+        windowHeight,
+        nullptr,
+        nullptr,
+        hInstance,
+        nullptr
     );
+
+    if (!hWnd)
+        return FALSE;
+
+    EnableDarkTitleBar(hWnd);
+    g_mainWindow = hWnd;
+    DragAcceptFiles(hWnd, TRUE);
 
     // Center window on screen at startup
     RECT rc;
     GetWindowRect(hWnd, &rc);
 
-    int windowWidth  = rc.right - rc.left;
-    int windowHeight = rc.bottom - rc.top;
+    windowWidth  = rc.right - rc.left;
+    windowHeight = rc.bottom - rc.top;
 
     int screenWidth  = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
@@ -174,18 +705,137 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
         SWP_NOSIZE | SWP_NOZORDER
     );
 
-   if (!hWnd)
-   {
-      return FALSE;
-   }
+    if (!g_launchedWithFile)
+    {
+        ShowWindow(hWnd, nCmdShow);
+        UpdateWindow(hWnd);
+    }
+    else
+    {
+        // We'll enter fullscreen once the command-line file loads successfully.
+        ShowWindow(hWnd, SW_HIDE);
+    }
 
-    ShowWindow(hWnd, nCmdShow);
-    UpdateWindow(hWnd);
-
-   return TRUE;
+    g_lastFrameTime = GetTickCount64();
+    return TRUE;
 }
 
-void FitToWindow(HWND hWnd)
+HWND CreateOverlayWindow(HWND parent)
+{
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(
+        MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST),
+        &mi);
+
+    RECT rc = mi.rcWork;
+
+    HWND overlay = CreateWindowEx(
+        WS_EX_TOOLWINDOW,
+        L"OverlayWindowClass",
+        L"",
+        WS_POPUP,
+        rc.left,
+        rc.top,
+        rc.right - rc.left,
+        rc.bottom - rc.top,
+        parent,
+        nullptr,
+        hInst,
+        nullptr);
+
+    // Important: don't force an immediate paint here. We'll show it once device resources are ready.
+    return overlay;
+}
+
+bool CreateDefaultBackgroundBitmap()
+{
+    if (!g_renderTarget || !g_wicDefaultBackground)
+        return false;
+
+    g_defaultBackgroundBitmap.Reset();
+
+    return SUCCEEDED(
+        g_renderTarget->CreateBitmapFromWicBitmap(
+            g_wicDefaultBackground.Get(),
+            nullptr,
+            g_defaultBackgroundBitmap.GetAddressOf()
+        )
+    );
+}
+
+void SetZoomCentered(float newZoom, HWND hWnd, bool instant = false)
+{
+    if (!g_d2dBitmap) return;
+
+    RECT rc;
+    GetClientRect(hWnd, &rc);
+    float windowWidth  = (float)(rc.right - rc.left);
+    float windowHeight = (float)(rc.bottom - rc.top);
+
+    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+
+    if (instant)
+    {
+        // Hard center in window
+        g_zoom = newZoom;
+        UpdateTargetZoom(newZoom);
+
+        g_offsetX = (windowWidth  - imgSize.width  * newZoom) / 2.0f;
+        g_offsetY = (windowHeight - imgSize.height * newZoom) / 2.0f;
+
+        g_targetOffsetX = g_offsetX;
+        g_targetOffsetY = g_offsetY;
+
+        return;
+    }
+
+    // Normal animated behavior (preserve center)
+    float centerX = g_offsetX + imgSize.width  * g_zoom / 2.0f;
+    float centerY = g_offsetY + imgSize.height * g_zoom / 2.0f;
+
+    g_targetOffsetX = centerX - (imgSize.width * newZoom) / 2.0f;
+    g_targetOffsetY = centerY - (imgSize.height * newZoom) / 2.0f;
+
+    UpdateTargetZoom(newZoom);
+}
+
+void CaptureDesktop(HWND hWnd)
+{
+    g_wicBackground.Reset();
+
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(
+        MonitorFromWindow(hWnd ? hWnd : g_mainWindow, MONITOR_DEFAULTTONEAREST),
+        &mi);
+
+    RECT rc = mi.rcWork;
+
+    int width  = rc.right  - rc.left;
+    int height = rc.bottom - rc.top;
+
+    HDC screenDC = GetDC(nullptr);
+    HDC memDC = CreateCompatibleDC(screenDC);
+
+    HBITMAP hBitmap = CreateCompatibleBitmap(screenDC, width, height);
+    HGDIOBJ old = SelectObject(memDC, hBitmap);
+
+    BitBlt(memDC, 0, 0, width, height,
+           screenDC, rc.left, rc.top, SRCCOPY);
+
+    SelectObject(memDC, old);
+
+    g_wicFactory->CreateBitmapFromHBITMAP(
+        hBitmap,
+        nullptr,
+        WICBitmapIgnoreAlpha,
+        g_wicBackground.GetAddressOf());
+
+    DeleteObject(hBitmap);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+}
+
+void FitToWindowRelative(HWND hWnd, float zoom)
 {
     if (!g_d2dBitmap) return;
 
@@ -200,138 +850,1630 @@ void FitToWindow(HWND hWnd)
     float scaleX = windowWidth  / imgSize.width;
     float scaleY = windowHeight / imgSize.height;
 
-    g_zoom = min(scaleX, scaleY);
+    float scale = min(scaleX, scaleY)*zoom;
 
-    // Center image
-    g_offsetX = (windowWidth  - imgSize.width  * g_zoom) / 2.0f;
-    g_offsetY = (windowHeight - imgSize.height * g_zoom) / 2.0f;
-
-    InvalidateRect(hWnd, nullptr, FALSE);
+    SetZoomCentered(scale, hWnd);
 }
 
+void FitWindowToImage(HWND hWnd)
+{
+    if (!g_d2dBitmap)
+        return;
+
+    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+
+    // Desired CLIENT size
+    RECT rc = {};
+    rc.left   = 0;
+    rc.top    = 0;
+    rc.right  = (LONG)imgSize.width;
+    rc.bottom = (LONG)imgSize.height;
+
+    // Convert client size to full window size
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
+
+    // Keep current window position
+    RECT current;
+    GetWindowRect(hWnd, &current);
+
+    SetWindowPos(
+        hWnd,
+        nullptr,
+        current.left,
+        current.top,
+        rc.right - rc.left,
+        rc.bottom - rc.top,
+        SWP_NOZORDER
+    );
+
+    // Reset zoom to 1:1
+    SetZoomCentered(1.0f, hWnd, true);
+}
+
+bool CreateBackgroundBitmap()
+{
+    if (!g_renderTarget || !g_wicBackground)
+        return false;
+
+    g_backgroundBitmap.Reset();
+
+    HRESULT hr = g_renderTarget->CreateBitmapFromWicBitmap(
+        g_wicBackground.Get(),
+        nullptr,
+        g_backgroundBitmap.GetAddressOf()
+    );
+
+    if (FAILED(hr))
+    {
+        OutputDebugString(L"CreateBackgroundBitmap failed\n");
+        return false;
+    }
+
+    return true;
+}
+
+void InitializeButtons()
+{
+    g_buttons.clear();
+
+    float width = 0.025f;
+    float height = 0.025f;
+    float fontSize = 0.011f;
+
+    // -------------------------
+    // Bottom activation zone
+    // -------------------------
+    AnimatedButton::ActivationZone bottomActivationZone;
+    bottomActivationZone.left   = 0.0f;
+    bottomActivationZone.top    = 0.8f;
+    bottomActivationZone.right  = 1.0f;
+    bottomActivationZone.bottom = 1.0f;
+
+    // -------------------------
+    // Zoom 1:1 Button
+    // -------------------------
+    AnimatedButton::Config buttonConfig;
+
+    buttonConfig.id = AnimatedButton::BUTTON_ZOOM_11;
+    buttonConfig.relativeX = 0.5f;
+    buttonConfig.relativeY = 0.96f;
+    buttonConfig.width = width;
+    buttonConfig.height = height;
+    buttonConfig.fontSize = fontSize * 1.1f;
+    buttonConfig.text = L"1:1";
+    buttonConfig.activationZone = bottomActivationZone;
+    buttonConfig.uiPixelScale = g_uiPixelScale;
+    D2D1_SIZE_F size = g_renderTarget->GetSize();
+
+    buttonConfig.referenceWidth  = size.width;
+    buttonConfig.referenceHeight = size.height;
+    buttonConfig.uiPixelScale    = min(size.width, size.height);
+
+    g_buttons.emplace_back();
+    g_buttons.back().Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        buttonConfig,
+        []()
+        {
+            g_offsetX = 0.0f;
+            g_offsetY = 0.0f;
+            SetZoomCentered(1.0f, g_overlayWindow, true);
+        });
+    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+
+    // -------------------------
+    // Zoom In Button
+    // -------------------------
+    buttonConfig.id = AnimatedButton::BUTTON_ZOOM_IN;
+    buttonConfig.relativeX = 0.52f;
+    buttonConfig.fontSize = fontSize;
+    buttonConfig.text = L"\u2795";
+
+    g_buttons.emplace_back();
+    g_buttons.back().Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        buttonConfig,
+        []()
+        {
+            ZoomIntoImage(g_overlayWindow, 250, nullptr);
+        });
+    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+
+    // -------------------------
+    // Zoom Out Button
+    // -------------------------
+
+    buttonConfig.id = AnimatedButton::BUTTON_ZOOM_OUT;
+    buttonConfig.relativeX = 0.48f;
+    buttonConfig.text = L"\u2796";
+
+    g_buttons.emplace_back();
+    g_buttons.back().Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        buttonConfig,
+        []()
+        {
+            ZoomIntoImage(g_overlayWindow, -250, nullptr);
+        });
+    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+
+    // -------------------------
+    // Rotate Left Button
+    // -------------------------
+
+    buttonConfig.id = AnimatedButton::BUTTON_ROTATE_LEFT;
+    buttonConfig.relativeX = 0.46f;
+    buttonConfig.fontSize = fontSize * 1.2f;
+    buttonConfig.text = L"\u2B6F";
+
+    g_buttons.emplace_back();
+    g_buttons.back().Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        buttonConfig,
+        []()
+        {
+            g_targetRotationAngle -= 90.0f;
+        });
+    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+
+    // -------------------------
+    // Rotate Right Button
+    // -------------------------
+
+    buttonConfig.id = AnimatedButton::BUTTON_ROTATE_RIGHT;
+    buttonConfig.relativeX = 0.54f;
+    buttonConfig.text = L"\u2B6E";
+
+    g_buttons.emplace_back();
+    g_buttons.back().Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        buttonConfig,
+        []()
+        {
+            g_targetRotationAngle += 90.0f;
+        });
+    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+
+    // -------------------------
+    // Previous Image Button
+    // -------------------------
+    buttonConfig.id = AnimatedButton::BUTTON_PREVIOUS;
+    buttonConfig.relativeX = 0.44f;
+    buttonConfig.fontSize = fontSize * 1.3f;
+    buttonConfig.text = L"\u2B9C";
+
+    g_buttons.emplace_back();
+    g_buttons.back().Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        buttonConfig,
+        []()
+        {
+            if (!g_imageFiles.empty())
+            {
+                g_currentImageIndex--;
+
+                if (g_currentImageIndex < 0)
+                    g_currentImageIndex =
+                        (int)g_imageFiles.size() - 1;
+
+                g_showZoomDisplay = false;
+                LoadImageD2D(g_overlayWindow, g_imageFiles[g_currentImageIndex].c_str());
+                InitializeImageLayout(g_overlayWindow, true);
+            }
+        });
+    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+
+    // -------------------------
+    // Next Image Button
+    // -------------------------
+
+    buttonConfig.id = AnimatedButton::BUTTON_NEXT;
+    buttonConfig.relativeX = 0.56f;
+    buttonConfig.text = L"\u2B9E";
+    
+    g_buttons.emplace_back();
+    g_buttons.back().Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        buttonConfig,
+        []()
+        {
+            if (!g_imageFiles.empty())
+            {
+                g_currentImageIndex =
+                    (g_currentImageIndex + 1) % (int)g_imageFiles.size();
+
+                g_showZoomDisplay = false;
+                LoadImageD2D(g_overlayWindow, g_imageFiles[g_currentImageIndex].c_str());
+                InitializeImageLayout(g_overlayWindow, true);
+            }
+        });
+    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+
+    // -------------------------
+    // Exit Button
+    // -------------------------
+    AnimatedButton::ActivationZone topRightActivationZone;
+    topRightActivationZone.left   = 0.9f;
+    topRightActivationZone.top    = 0.0f;
+    topRightActivationZone.right  = 1.0f;
+    topRightActivationZone.bottom = 0.1f;
+
+    float top = 0.012f;
+    float right = 1.0f - top * 9.0f / 16.0f;
+
+    AnimatedButton::Config exitConfig;
+    exitConfig.id = AnimatedButton::BUTTON_EXIT;
+    exitConfig.relativeX = right;
+    exitConfig.relativeY = top;
+    exitConfig.width = 0.036f;
+    exitConfig.height = 0.036f;
+    exitConfig.fontSize = 0.016f;
+    exitConfig.text = L"\u274C";
+    exitConfig.activationZone = topRightActivationZone;
+
+    g_buttons.emplace_back();
+    g_buttons.back().Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        exitConfig,
+        []()
+        {
+            if (!g_d2dBitmap)
+            {
+                PostQuitMessage(0);
+            }
+
+            D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+            float centerX = g_offsetX + imgSize.width  * g_zoom / 2.0f;
+            float centerY = g_offsetY + imgSize.height * g_zoom / 2.0f;
+
+            g_targetOffsetX = centerX - (imgSize.width * 0.05f) / 2.0f;
+            g_targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
+
+            int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
+            g_smooth = 2 * 0.18f / ((float)(refreshRate) / 60.0f);
+
+            g_targetZoom = 0.0005f;
+            g_showZoomDisplay = false;
+            g_isExiting = true;
+        });
+    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+}
+
+void InitializeImageInfoLabel()
+{
+    UITextBox::ActivationZone zone;
+    zone.left   = 0.0f;
+    zone.right  = 1.0f;
+    zone.top    = 0.8f;
+    zone.bottom = 1.0f;
+
+    UITextBox::Config config;
+    config.relativeX = 0.5f;
+    config.relativeY = 0.92f;
+    config.relativeFontSize = 0.012f;
+
+    config.width  = 0.6f;      // wide enough for filenames
+    config.height = 0.05f;
+
+    config.backgroundAlpha = 0.0f;   // no box
+    config.isEditable = false;      // display only
+
+    config.activationZone = zone;
+
+    config.uiPixelScale = g_uiPixelScale;
+
+    g_textBoxes[TEXTBOX_FILE_NAME].Initialize(
+        g_dwriteFactory.Get(),
+        config,
+        nullptr);
+    g_textBoxes[TEXTBOX_FILE_NAME].UpdateLayout(g_renderTarget.Get());
+
+    config.relativeX = 0.5865f;
+    config.relativeY = 0.96f;
+    config.width = 0.05f;
+    config.height = 0.025f;
+    config.backgroundAlpha = 0.2f; // semi-transparent box for zoom display
+    config.isEditable = true;
+    config.inputMode = UITextBox::InputMode::NumericFloat;
+    g_textBoxes[TEXTBOX_ZOOM_INPUT].Initialize(
+        g_dwriteFactory.Get(),
+        config,
+        [](const std::wstring& text)
+            {
+                if (text.empty())
+                    return;
+
+                try
+                {
+                    float value = std::stof(text);
+                    if (value < 1.0f)
+                    {
+                        value = 1.0f;
+                    } 
+                    else if (value > 10000.0f)
+                    {
+                        value = 10000.0f;
+                    } 
+                    
+                    UpdateTargetZoom(value/100.0);
+                    ZoomIntoImage(g_overlayWindow, 0, nullptr);
+                    
+                }
+                catch (...)
+                {
+                    // invalid number → ignore
+                }
+            }
+        );
+    g_textBoxes[TEXTBOX_ZOOM_INPUT].UpdateLayout(g_renderTarget.Get());
+}
+
+void UpdateTargetZoom(float newZoom)
+{
+    if (!g_d2dBitmap) return;
+    g_targetZoom = newZoom;
+    std::wstring text = std::to_wstring(int(g_targetZoom*100));
+    g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(text);
+    g_textBoxes[TEXTBOX_ZOOM_INPUT].UpdateLayout(g_renderTarget.Get());
+}
+
+void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
+{
+    // Prevent duplicate first-stage calls
+    if (g_isFullscreen && needsDelay)
+        return;
+
+    // ----------------------------------------
+    // STAGE 1 — make main window fully transparent and wait for DWM
+    // ----------------------------------------
+    if (needsDelay)
+    {
+        g_isFullscreen = true;
+
+        SetWindowLong(
+            g_mainWindow,
+            GWL_EXSTYLE,
+            GetWindowLong(g_mainWindow, GWL_EXSTYLE) | WS_EX_LAYERED
+        );
+
+        SetLayeredWindowAttributes(
+            g_mainWindow,
+            0,
+            0,
+            LWA_ALPHA
+        );
+
+        UpdateWindow(g_mainWindow);
+
+        // Give DWM time to settle before creating the overlay
+        SetTimer(g_mainWindow, 8888, 150, nullptr);
+
+        g_pendingPreserveView = preserveView;
+        return;
+    }
+
+    // ----------------------------------------
+    // STAGE 2 — actual fullscreen overlay creation
+    // ----------------------------------------
+
+    CaptureDesktop(g_mainWindow);
+
+    // We'll be switching the render target to the overlay window, so discard current device resources
+    DiscardDeviceResources();
+
+    g_overlayWindow = CreateOverlayWindow(g_mainWindow);
+
+    // Create device resources for overlay now
+    CreateRenderTarget(g_overlayWindow);
+    if (g_renderTarget)
+    {
+        D2D1_SIZE_F size = g_renderTarget->GetSize();
+        g_uiPixelScale = min(size.width, size.height);
+    }
+
+    CreateBackgroundBitmap();
+    RecreateImageBitmap();
+    InitializeButtons();
+    InitializeImageInfoLabel();
+
+    g_overlayAlpha = 0.0f;
+
+    if (!preserveView)
+    {
+        g_needsFullscreenInit = true;
+    }
+    else
+    {
+        g_needsFullscreenInit = false;
+
+        // Convert image position from main window → screen → overlay client
+        POINT pt = { (LONG)g_offsetX, (LONG)g_offsetY };
+        ClientToScreen(g_mainWindow, &pt);
+        ScreenToClient(g_overlayWindow, &pt);        
+        UpdateTargetZoom(g_zoom);
+        g_offsetX = (float)pt.x;
+        g_offsetY = (float)pt.y;
+
+        g_targetOffsetX = g_offsetX;
+        g_targetOffsetY = g_offsetY;
+    }
+
+    ShowWindow(g_overlayWindow, SW_SHOW);
+    UpdateWindow(g_overlayWindow);
+    g_fullScreenInitDone = true;
+}
+
+void ExitFullscreen()
+{
+    if (!g_isFullscreen)
+        return;
+
+    if (!g_d2dBitmap)
+    {
+        // No bitmap? Just bail out safely.
+        g_isFullscreen = false;
+        if (g_overlayWindow)
+        {
+            DestroyWindow(g_overlayWindow);
+            g_overlayWindow = nullptr;
+        }
+        return;
+    }
+
+    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+
+    RECT overlayClient;
+    GetClientRect(g_overlayWindow, &overlayClient);
+
+    // Get overlay window screen rect
+    RECT overlayRect;
+    GetWindowRect(g_overlayWindow, &overlayRect);
+
+    float overlayWidth  = (float)(overlayClient.right  - overlayClient.left);
+    float overlayHeight = (float)(overlayClient.bottom - overlayClient.top);
+
+    float imgLeft   = g_offsetX;
+    float imgTop    = g_offsetY;
+    float imgRight  = g_offsetX + imgSize.width  * g_zoom;
+    float imgBottom = g_offsetY + imgSize.height * g_zoom;
+
+    // Clamp to visible region
+    float visibleLeft   = max(0.0f, imgLeft);
+    float visibleTop    = max(0.0f, imgTop);
+    float offsetCorrectionX = imgLeft - visibleLeft;
+    float offsetCorrectionY = imgTop  - visibleTop;
+
+    float visibleRight  = min(overlayWidth,  imgRight);
+    float visibleBottom = min(overlayHeight, imgBottom);
+
+    float clientWidth  = visibleRight  - visibleLeft;
+    float clientHeight = visibleBottom - visibleTop;
+
+    // Adjust new position using visible region
+    int newX = overlayRect.left + (int)visibleLeft;
+    int newY = overlayRect.top  + (int)visibleTop;
+
+    // Tear down the overlay first
+    g_isFullscreen = false;
+    g_needsFullscreenInit = false;
+    g_overlayAlpha = 1.0f;
+
+    if (g_overlayWindow)
+    {
+        DestroyWindow(g_overlayWindow);
+        g_overlayWindow = nullptr;
+    }
+
+    // Discard device-dependent resources from the overlay render target.
+    // This is crucial to avoid drawing one frame using bitmaps created on the old render target.
+    DiscardDeviceResources();
+
+    // Calculate window rect BEFORE showing
+    RECT adj = { 0,0,(LONG)clientWidth,(LONG)clientHeight };
+    AdjustWindowRect(&adj, WS_OVERLAPPEDWINDOW, TRUE);
+
+    int nonClientOffsetY = -adj.top;
+    int nonClientOffsetX = -adj.left;
+
+    // Resize/move window WITHOUT triggering redraw yet (prevents a "wrong size" first frame)
+    SetWindowPos(
+        g_mainWindow,
+        nullptr,
+        newX - nonClientOffsetX,
+        newY - nonClientOffsetY,
+        adj.right - adj.left,
+        adj.bottom - adj.top,
+        SWP_NOZORDER | SWP_NOACTIVATE 
+    );
+
+    // Snap offsets/targets to final state for the new (cropped) client area
+    g_offsetX = offsetCorrectionX;
+    g_offsetY = offsetCorrectionY;
+
+    g_targetOffsetX = g_offsetX;
+    g_targetOffsetY = g_offsetY;
+
+    UpdateTargetZoom(g_zoom);
+
+    // Recreate device resources for the main window BEFORE making it visible again.
+    CreateRenderTarget(g_mainWindow);
+    RecreateImageBitmap();
+
+    // Restore main window visibility (remove layered transparency last)
+    LONG ex = GetWindowLong(g_mainWindow, GWL_EXSTYLE);
+    if (ex & WS_EX_LAYERED)
+    {
+        SetLayeredWindowAttributes(g_mainWindow, 0, 255, LWA_ALPHA);
+        SetWindowLong(g_mainWindow, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+    }
+
+    ShowWindow(g_mainWindow, SW_SHOW);
+
+    // Now redraw with correct size/zoom on the very first visible frame
+    RedrawWindow(g_mainWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+
+    // Update button and text layouts for the new render target
+    for (auto& button : g_buttons)
+        button.UpdateLayout(g_renderTarget.Get());
+
+    for (auto& [key, textbox] : g_textBoxes)
+        textbox.UpdateLayout(g_renderTarget.Get());
+
+    g_fullScreenInitDone = false;
+}
 
 void CreateRenderTarget(HWND hWnd)
 {
-    if (!g_renderTarget)
+    if (g_renderTarget)
+        return;
+
+    RECT rc;
+    GetClientRect(hWnd, &rc);
+
+    UINT width  = rc.right - rc.left;
+    UINT height = rc.bottom - rc.top;
+
+    if (width == 0 || height == 0)
+        return;
+
+    HRESULT hr;
+
+    // 1. Create D3D11 device
+    D3D_FEATURE_LEVEL featureLevel;
+    hr = D3D11CreateDevice(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        nullptr,
+        0,
+        D3D11_SDK_VERSION,
+        &g_d3dDevice,
+        &featureLevel,
+        &g_d3dContext);
+
+    if (FAILED(hr))
+        return;
+
+    // 2. Get DXGI device
+    hr = g_d3dDevice.As(&g_dxgiDevice);
+    if (FAILED(hr))
+        return;
+
+    // 3. Create D2D device + context
+    hr = g_d2dFactory->CreateDevice(g_dxgiDevice.Get(), &g_d2dDevice);
+    if (FAILED(hr))
+        return;
+
+    hr = g_d2dDevice->CreateDeviceContext(
+        D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+        &g_renderTarget);   // your DeviceContext
+    if (FAILED(hr))
+        return;
+
+    // 4. Create DXGI factory
+    ComPtr<IDXGIAdapter> adapter;
+    hr = g_dxgiDevice->GetAdapter(&adapter);
+    if (FAILED(hr))
+        return;
+
+    ComPtr<IDXGIFactory2> factory;
+    hr = adapter->GetParent(__uuidof(IDXGIFactory2),
+                            reinterpret_cast<void**>(factory.GetAddressOf()));
+    if (FAILED(hr))
+        return;
+
+    // 5. Swap chain description
+    DXGI_SWAP_CHAIN_DESC1 desc = {};
+    desc.Width  = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    desc.AlphaMode   = DXGI_ALPHA_MODE_IGNORE;
+
+    hr = factory->CreateSwapChainForHwnd(
+        g_d3dDevice.Get(),
+        hWnd,
+        &desc,
+        nullptr,
+        nullptr,
+        &g_swapChain);
+
+    if (FAILED(hr))
+        return;
+
+    // 6. Create target bitmap
+    ComPtr<IDXGISurface> surface;
+    hr = g_swapChain->GetBuffer(0, IID_PPV_ARGS(&surface));
+    if (FAILED(hr))
+        return;
+
+    D2D1_BITMAP_PROPERTIES1 props =
+        D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET |
+            D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+    hr = g_renderTarget->CreateBitmapFromDxgiSurface(
+        surface.Get(),
+        &props,
+        &g_d2dTargetBitmap);
+
+    if (FAILED(hr))
+        return;
+    g_renderTarget->SetTarget(g_d2dTargetBitmap.Get());
+
+    if (!g_shadowEffect)
     {
+        HRESULT hr = g_renderTarget->CreateEffect(
+            CLSID_D2D1Shadow,
+            &g_shadowEffect);
+
+        if (SUCCEEDED(hr))
+        {
+            g_shadowEffect->SetValue(
+                D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
+                25.0f);   // softness
+        }
+    }
+}
+
+void RecreateImageBitmap()
+{
+    if (!g_wicBitmapSource || !g_renderTarget)
+        return;
+
+    g_d2dBitmap.Reset();
+
+    HRESULT hr = g_renderTarget->CreateBitmapFromWicBitmap(
+        g_wicBitmapSource.Get(),
+        nullptr,
+        g_d2dBitmap.GetAddressOf()
+    );
+
+    if (FAILED(hr))
+    {
+        OutputDebugString(L"RecreateImageBitmap failed\n");
+        g_d2dBitmap.Reset();
+    }
+}
+
+void InitializeImageLayout(HWND hWnd, bool hard = false)
+{
+    if (!g_d2dBitmap) return;
+    if (g_restoredStateThisLoad)
+    return;
+    RECT rc;
+    GetClientRect(hWnd, &rc);
+
+    float windowWidth  = (float)(rc.right - rc.left);
+    float windowHeight = (float)(rc.bottom - rc.top);
+
+    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+
+    float scale = 1.0f;
+
+    if (hard)
+        g_overlayAlpha = 1.0f;
+    else
+        g_overlayAlpha = 0.0f;
+
+    // If image is larger than screen, scale down to ~92% of screen
+    if (imgSize.width > windowWidth || imgSize.height > windowHeight)
+    {
+        float scaleX = (windowWidth  * 0.92f) / imgSize.width;
+        float scaleY = (windowHeight * 0.92f) / imgSize.height;
+
+        scale = min(scaleX, scaleY);
+    }
+
+    float windowCenterX = windowWidth / 2.0f;
+    float windowCenterY = windowHeight / 2.0f;
+
+    if (hard)
+    {
+        g_zoom = scale;          // Hard clamp to final scale
+
+        UpdateTargetZoom(scale);
+
+        // Target offsets for final scale
+        g_targetOffsetX = windowCenterX - (imgSize.width  * g_targetZoom) / 2.0f;
+        g_targetOffsetY = windowCenterY - (imgSize.height * g_targetZoom) / 2.0f;
+
+        // Start offsets at final position since we're hard centering
+        g_offsetX = g_targetOffsetX;
+        g_offsetY = g_targetOffsetY;
+    }
+    else
+    {
+        g_zoom = 0.05f;             // Start tiny
+        UpdateTargetZoom(scale);    // Animate to final scale
+
+        // Start offsets so that image center is centered at window center at tiny zoom
+        g_offsetX = windowCenterX - (imgSize.width  * g_zoom) / 2.0f;
+        g_offsetY = windowCenterY - (imgSize.height * g_zoom) / 2.0f;
+
+        // Target offsets for final scale
+        g_targetOffsetX = windowCenterX - (imgSize.width  * g_targetZoom) / 2.0f;
+        g_targetOffsetY = windowCenterY - (imgSize.height * g_targetZoom) / 2.0f;
+    }
+}
+
+void Render(HWND hWnd)
+{
+    // Only render into the currently active window to avoid accidentally
+    // nuking/recreating device resources if the inactive window gets a stray WM_PAINT.
+    HWND activeWindow = (g_isFullscreen && g_overlayWindow) ? g_overlayWindow : g_mainWindow;
+    if (hWnd != activeWindow)
+        return;
+
+    CreateRenderTarget(hWnd);
+
+    if (!g_renderTarget || !g_swapChain)
+        return;
+
+    // Recreate any missing device-dependent resources (device-loss safe).
+    if (g_wicBitmapSource && !g_d2dBitmap)
+        RecreateImageBitmap();
+
+    if (!g_d2dBitmap && g_wicDefaultBackground && !g_defaultBackgroundBitmap)
+        CreateDefaultBackgroundBitmap();
+
+    if (g_isFullscreen && g_wicBackground && !g_backgroundBitmap)
+        CreateBackgroundBitmap();
+
+    g_renderTarget->BeginDraw();
+
+    // Clear background
+    if (g_isFullscreen)
+        g_renderTarget->Clear(D2D1::ColorF(0, 0, 0, 0.6f));
+    else
+        g_renderTarget->Clear(D2D1::ColorF(0.7f, 0.7f, 0.7f));
+
+    if (g_needsFullscreenInit)
+    {
+        // Ensure resources exist
+        if (g_wicBitmapSource && !g_d2dBitmap)
+            RecreateImageBitmap();
+        if (g_wicBackground && !g_backgroundBitmap)
+            CreateBackgroundBitmap();
+
+        // Initialize layout AFTER everything exists
+        InitializeImageLayout(hWnd);
+
+        g_needsFullscreenInit = false;
+    }
+
+    // Draw dimmed desktop background
+    if (g_isFullscreen && g_backgroundBitmap)
+    {
+        D2D1_SIZE_F size = g_backgroundBitmap->GetSize();
+
+        g_renderTarget->DrawBitmap(
+            g_backgroundBitmap.Get(),
+            D2D1::RectF(0, 0, size.width, size.height),
+            1.0f
+        );
+
+        ComPtr<ID2D1SolidColorBrush> brush;
+        g_renderTarget->CreateSolidColorBrush(
+            D2D1::ColorF(0, 0, 0, 0.67f * g_overlayAlpha),
+            brush.GetAddressOf()
+        );
+
+        if (brush)
+        {
+            g_renderTarget->FillRectangle(
+                D2D1::RectF(0, 0, size.width, size.height),
+                brush.Get()
+            );
+        }
+    }
+
+    if (g_d2dBitmap)
+    {
+        D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+
+        float imgCenterX = imgSize.width * 0.5f;
+        float imgCenterY = imgSize.height * 0.5f;
+
+        // First build scale + translation
+        D2D1::Matrix3x2F scale =
+            D2D1::Matrix3x2F::Scale(g_zoom, g_zoom);
+
+        D2D1::Matrix3x2F translate =
+            D2D1::Matrix3x2F::Translation(g_offsetX, g_offsetY);
+
+        D2D1::Matrix3x2F baseTransform = scale * translate;
+
+        // Now compute actual on-screen center AFTER scale+translate
+        D2D1_POINT_2F screenCenter =
+            baseTransform.TransformPoint(D2D1::Point2F(imgCenterX, imgCenterY));
+
+        // Rotate around that screen-space center
+        D2D1::Matrix3x2F rotation =
+            D2D1::Matrix3x2F::Rotation(g_imageRotationAngle, screenCenter);
+
+        // Final transform
+        g_renderTarget->SetTransform(baseTransform * rotation);
+
+        
+        // ---- DRAW SHADOW ----
+        if (g_shadowEffect && g_d2dBitmap)
+        {
+            g_shadowEffect->SetInput(0, g_d2dBitmap.Get());
+
+            // Slight offset for shadow
+            D2D1_POINT_2F shadowOffset = D2D1::Point2F(0.0f,0.0f);
+
+            g_renderTarget->DrawImage(
+                g_shadowEffect.Get(),
+                shadowOffset);
+        }
+
+        g_renderTarget->DrawBitmap(
+            g_d2dBitmap.Get(),
+            D2D1::RectF(0, 0, imgSize.width, imgSize.height),
+            1.0f,
+            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
+        );
+
+        g_renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
+    }
+    else if (g_defaultBackgroundBitmap)
+    {
+        RECT rc;
+        GetClientRect(g_mainWindow, &rc);
+
+        D2D1_RECT_F destRect = D2D1::RectF(
+            0.f,
+            0.f,
+            (float)(rc.right - rc.left),
+            (float)(rc.bottom - rc.top)
+        );
+
+        g_renderTarget->DrawBitmap(
+            g_defaultBackgroundBitmap.Get(),
+            destRect,
+            1.0f,
+            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
+        );
+    }
+    D2D1_SIZE_F rtSize = g_renderTarget->GetSize();
+
+    // Draw UI buttons
+    for (auto& btn : g_buttons)
+    {
+        if (!g_isFullscreen && btn.BUTTON_EXIT)
+            continue;
+
+        btn.Draw(g_renderTarget.Get());
+    }
+
+    for (auto& [id, txt] : g_textBoxes)
+    {
+        txt.Draw(g_renderTarget.Get());
+    }
+
+    // Draw zoom overlay
+    if (g_zoomDisplayAlpha > 0.01f)
+    {
+        wchar_t text[32];
+        swprintf_s(text, L"%.0f%%", g_zoom * 100.0f);
+
+        ComPtr<ID2D1SolidColorBrush> bgBrush;
+        ComPtr<ID2D1SolidColorBrush> textBrush;
+
+        g_renderTarget->CreateSolidColorBrush(
+            D2D1::ColorF(0.3f, 0.3f, 0.3f, g_zoomDisplayAlpha),
+            bgBrush.GetAddressOf());
+
+        g_renderTarget->CreateSolidColorBrush(
+            D2D1::ColorF(1.0f, 1.0f, 1.0f, g_zoomDisplayAlpha),
+            textBrush.GetAddressOf());
+            
         RECT rc;
         GetClientRect(hWnd, &rc);
 
-        D2D1_SIZE_U size = D2D1::SizeU(
-            rc.right - rc.left,
-            rc.bottom - rc.top
-        );
+        int screenHeight = GetSystemMetrics(SM_CYSCREEN);
 
-        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties();
+        // Make overlay height 2.3% of window height
+        float boxHeight = screenHeight * 0.023f;
 
-        props.dpiX = 96.0f;
-        props.dpiY = 96.0f;
+        // Keep 2:1 proportion
+        float boxWidth = boxHeight * 2.0f;
 
-        g_d2dFactory->CreateHwndRenderTarget(
-            props,
-            D2D1::HwndRenderTargetProperties(hWnd, size),
-            &g_renderTarget
-        );
+        float centerX = (rc.right - rc.left) / 2.0f;
+        float centerY = (rc.bottom - rc.top) / 2.0f;
+        float cornerRadius = boxHeight * 0.2f;
+        D2D1_ROUNDED_RECT rounded =
+            D2D1::RoundedRect(
+                D2D1::RectF(
+                    centerX - boxWidth / 2,
+                    centerY - boxHeight / 2,
+                    centerX + boxWidth / 2,
+                    centerY + boxHeight / 2),
+                cornerRadius,
+                cornerRadius);
+
+        if (bgBrush)
+            g_renderTarget->FillRoundedRectangle(rounded, bgBrush.Get());
+
+        D2D1_RECT_F textRect =
+            D2D1::RectF(
+                centerX - boxWidth / 2,
+                centerY - boxHeight / 2,
+                centerX + boxWidth / 2,
+                centerY + boxHeight / 2);
+
+        if (textBrush)
+        {
+            g_renderTarget->DrawTextW(
+                text,
+                (UINT32)wcslen(text),
+                g_textFormat.Get(),
+                textRect,
+                textBrush.Get()
+            );
+        }
     }
+
+    HRESULT hr = g_renderTarget->EndDraw();
+
+    if (SUCCEEDED(hr) && g_swapChain)
+    {
+        g_swapChain->Present(1, 0);
+    }
+
+    if (hr == D2DERR_RECREATE_TARGET)
+    {
+        DiscardDeviceResources();
+    }
+    g_renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
 bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 {
-    // If we already have a bitmap loaded, release it
-    if (g_d2dBitmap)
+    if (!g_wicFactory || !filename || !*filename)
+        return false;
+
+    // ------------------------------------------------------------
+    // Save previous image state
+    // ------------------------------------------------------------
+    if (!g_currentFilePath.empty())
     {
-        g_d2dBitmap->Release();
-        g_d2dBitmap = nullptr;
+        g_imageStates[g_currentFilePath] =
+        {
+            g_zoom,
+            g_offsetX,
+            g_offsetY,
+            g_targetZoom,
+            g_targetOffsetX,
+            g_targetOffsetY,
+            g_imageRotationAngle,
+            g_targetRotationAngle
+        };
     }
+    // Clear previous state
+    g_d2dBitmap.Reset();
+    g_wicBitmapSource.Reset();
+    g_gifFrames.clear();
+    g_gifFrameDelays.clear();
+    g_isAnimatedGif = false;
+    g_currentGifFrame = 0;
+    g_lastGifFrameTime = 0;
 
-    // Make sure render target exists
-    CreateRenderTarget(hWnd);
+    // --------------------------------------------
+    // Decode container
+    // --------------------------------------------
 
-    IWICBitmapDecoder* decoder = nullptr;
-    IWICBitmapFrameDecode* frame = nullptr;
-    IWICFormatConverter* converter = nullptr;
-
-    // Create decoder from file
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
     HRESULT hr = g_wicFactory->CreateDecoderFromFilename(
         filename,
         nullptr,
         GENERIC_READ,
         WICDecodeMetadataCacheOnLoad,
-        &decoder
-    );
+        decoder.GetAddressOf());
 
-    if (FAILED(hr)) return false;
+    if (FAILED(hr) || !decoder)
+        return false;
 
-    // Get first image frame
-    decoder->GetFrame(0, &frame);
+    UINT frameCount = 0;
+    hr = decoder->GetFrameCount(&frameCount);
 
-    // Create format converter
-    g_wicFactory->CreateFormatConverter(&converter);
+    if (FAILED(hr) || frameCount == 0)
+        return false;
 
-    // Convert to 32-bit BGRA format required by Direct2D
-    converter->Initialize(
-        frame,
-        GUID_WICPixelFormat32bppPBGRA,
-        WICBitmapDitherTypeNone,
-        nullptr,
-        0.0f,
-        WICBitmapPaletteTypeCustom
-    );
-    // Create Direct2D bitmap from WIC bitmap
-    g_renderTarget->CreateBitmapFromWicBitmap(
-        converter,
-        nullptr,
-        &g_d2dBitmap
-    );
-    if (g_d2dBitmap)
+    GUID container = {};
+    decoder->GetContainerFormat(&container);
+    const bool isGifContainer = IsEqualGUID(container, GUID_ContainerFormatGif);
+
+    // --------------------------------------------
+    // Small local helpers (avoid min/max macros)
+    // --------------------------------------------
+
+    auto imin = [](int a, int b) { return (a < b) ? a : b; };
+    auto imax = [](int a, int b) { return (a > b) ? a : b; };
+    auto umin = [](UINT a, UINT b) { return (a < b) ? a : b; };
+
+    auto ReadUIntMeta = [&](IWICMetadataQueryReader* reader, const wchar_t* name, UINT& outVal) -> bool
     {
-        D2D1_SIZE_F size = g_d2dBitmap->GetSize();
-        // Reset view state for new image
-        g_zoom = 1.0f;
-        g_offsetX = 0.0f;
-        g_offsetY = 0.0f;
+        if (!reader) return false;
 
-        int width  = (int)(size.width);
-        int height = (int)(size.height);
+        PROPVARIANT var;
+        PropVariantInit(&var);
+        HRESULT h = reader->GetMetadataByName(name, &var);
 
-        RECT rc = { 0, 0, width, height };
-        AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
+        if (FAILED(h))
+        {
+            PropVariantClear(&var);
+            return false;
+        }
 
-        int windowWidth  = rc.right - rc.left;
-        int windowHeight = rc.bottom - rc.top;
+        UINT v = 0;
+        switch (var.vt)
+        {
+            case VT_UI1: v = var.bVal;  break;
+            case VT_UI2: v = var.uiVal; break;
+            case VT_UI4: v = var.ulVal; break;
+            case VT_I2:  v = (var.iVal < 0) ? 0u : (UINT)var.iVal; break;
+            case VT_I4:  v = (var.lVal < 0) ? 0u : (UINT)var.lVal; break;
+        default:
+            PropVariantClear(&var);
+            return false;
+        }
 
-        // Get screen size
-        int screenWidth  = GetSystemMetrics(SM_CXSCREEN);
-        int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+        PropVariantClear(&var);
+        outVal = v;
+        return true;
+    };
 
-        // Center position
-        int posX = (screenWidth  - windowWidth)  / 2;
-        int posY = (screenHeight - windowHeight) / 2;
+    auto CloneBitmap = [&](IWICBitmapSource* src) -> Microsoft::WRL::ComPtr<IWICBitmap>
+    {
+        Microsoft::WRL::ComPtr<IWICBitmap> clone;
+        if (src)
+        {
+            if (SUCCEEDED(g_wicFactory->CreateBitmapFromSource(
+                src, WICBitmapCacheOnLoad, clone.GetAddressOf())))
+            {
+                return clone;
+            }
+        }
+        return nullptr;
+    };
 
-        // Clamp so window never starts off-screen
-        posX = max(0, posX);
-        posY = max(0, posY);
+    auto ClearRect = [&](IWICBitmap* bmp, const WICRect& rc) -> void
+    {
+        if (!bmp) return;
+        Microsoft::WRL::ComPtr<IWICBitmapLock> lock;
 
-        SetWindowPos(
-            hWnd,
+        if (FAILED(bmp->Lock(&rc, WICBitmapLockWrite, lock.GetAddressOf())) || !lock) return;
+
+        UINT cb = 0;
+        BYTE* data = nullptr;
+        UINT stride = 0;
+
+        if (FAILED(lock->GetDataPointer(&cb, &data)) || !data) return;
+        if (FAILED(lock->GetStride(&stride)) || stride == 0) return;
+
+        const UINT w = (UINT)rc.Width;
+        const UINT h = (UINT)rc.Height;
+        const size_t rowBytes = (size_t)w * 4;
+
+        for (UINT y = 0; y < h; ++y)
+            memset(data + (size_t)y * stride, 0, rowBytes); // transparent premultiplied
+    };
+
+    auto DecodeToPBGRA = [&](IWICBitmapSource* src,
+                            const WICRect* optionalCopyRect,
+                            std::vector<BYTE>& outPixels,
+                            UINT& outW, UINT& outH, UINT& outStride) -> bool
+    {
+        if (!src) return false;
+
+        UINT w = 0, h = 0;
+        if (FAILED(src->GetSize(&w, &h)) || w == 0 || h == 0)
+            return false;
+
+        // Convert to 32bppPBGRA
+        Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+        HRESULT hrc = g_wicFactory->CreateFormatConverter(converter.GetAddressOf());
+
+        if (FAILED(hrc) || !converter)
+            return false;
+
+        hrc = converter->Initialize(
+            src,
+            GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone,
             nullptr,
-            posX,
-            posY,
-            windowWidth,
-            windowHeight,
-            SWP_NOZORDER | SWP_NOACTIVATE
-        );
+            0.0f,
+            WICBitmapPaletteTypeCustom);
 
+        if (FAILED(hrc))
+            return false;
+
+        WICRect rc = { 0, 0, (INT)w, (INT)h };
+
+        if (optionalCopyRect)
+        {
+            // Clamp copy rect to source bounds
+            int cx = imax(0, optionalCopyRect->X);
+            int cy = imax(0, optionalCopyRect->Y);
+            int cw = imin(optionalCopyRect->Width,  (int)w - cx);
+            int ch = imin(optionalCopyRect->Height, (int)h - cy);
+
+            if (cw <= 0 || ch <= 0) return false;
+
+            rc = { cx, cy, cw, ch };
+        }
+
+        const UINT copyW = (UINT)rc.Width;
+        const UINT copyH = (UINT)rc.Height;
+        const UINT stride = copyW * 4;
+        const size_t bufSize = (size_t)stride * copyH;
+        outPixels.assign(bufSize, 0);
+
+        hrc = converter->CopyPixels(
+            optionalCopyRect ? &rc : nullptr,
+            stride,
+            (UINT)bufSize,
+            outPixels.data());
+
+        if (FAILED(hrc))
+            return false;
+
+        // CRITICAL: enforce correct premultiplied invariant:
+        // if A==0 then RGB MUST be 0, or you get dark speckles/noise.
+        for (size_t p = 0; p + 3 < outPixels.size(); p += 4)
+        {
+            if (outPixels[p + 3] == 0)
+            {
+                outPixels[p + 0] = 0;
+                outPixels[p + 1] = 0;
+                outPixels[p + 2] = 0;
+            }
+        }
+
+        outW = copyW;
+        outH = copyH;
+        outStride = stride;
+        return true;
+    };
+
+    auto BlendSrcOverCanvas = [&](IWICBitmap* canvas,
+                                  int dstX, int dstY,
+                                  const BYTE* srcPixels,
+                                  UINT srcW, UINT srcH, UINT srcStride) -> void
+    {
+        if (!canvas || !srcPixels || srcW == 0 || srcH == 0)
+            return;
+
+        UINT canvasW = 0, canvasH = 0;
+
+        if (FAILED(canvas->GetSize(&canvasW, &canvasH)) || canvasW == 0 || canvasH == 0)
+            return;
+
+        int x0 = dstX;
+        int y0 = dstY;
+
+        int x1 = dstX + (int)srcW;
+        int y1 = dstY + (int)srcH;
+
+        if (x1 <= 0 || y1 <= 0 || x0 >= (int)canvasW || y0 >= (int)canvasH)
+            return;
+
+        int clipX0 = imax(0, x0);
+        int clipY0 = imax(0, y0);
+        int clipX1 = imin((int)canvasW, x1);
+        int clipY1 = imin((int)canvasH, y1);
+
+        const UINT drawW = (UINT)(clipX1 - clipX0);
+        const UINT drawH = (UINT)(clipY1 - clipY0);
+        const UINT srcOffX = (UINT)(clipX0 - x0);
+        const UINT srcOffY = (UINT)(clipY0 - y0);
+
+        WICRect lockRc{ clipX0, clipY0, (INT)drawW, (INT)drawH };
+
+        Microsoft::WRL::ComPtr<IWICBitmapLock> lock;
+
+        if (FAILED(canvas->Lock(&lockRc, WICBitmapLockWrite, lock.GetAddressOf())) || !lock)
+            return;
+
+        UINT cb = 0;
+        BYTE* dst = nullptr;
+        UINT dstStride = 0;
+
+        if (FAILED(lock->GetDataPointer(&cb, &dst)) || !dst) return;
+        if (FAILED(lock->GetStride(&dstStride)) || dstStride == 0) return;
+
+        for (UINT y = 0; y < drawH; ++y)
+        {
+            BYTE* dRow = dst + (size_t)y * dstStride;
+            const BYTE* sRow = srcPixels + (size_t)(y + srcOffY) * srcStride + (size_t)srcOffX * 4;
+            for (UINT x = 0; x < drawW; ++x)
+            {
+                const BYTE sb = sRow[x * 4 + 0];
+                const BYTE sg = sRow[x * 4 + 1];
+                const BYTE sr = sRow[x * 4 + 2];
+                const BYTE sa = sRow[x * 4 + 3];
+
+                if (sa == 0)
+                {
+                    continue;
+                }
+                else if (sa == 255)
+                {
+                    dRow[x * 4 + 0] = sb;
+                    dRow[x * 4 + 1] = sg;
+                    dRow[x * 4 + 2] = sr;
+                    dRow[x * 4 + 3] = 255;
+                    continue;
+                }
+
+                // Premultiplied source-over
+                const UINT inv = 255u - sa;
+                const UINT db = dRow[x * 4 + 0];
+                const UINT dg = dRow[x * 4 + 1];
+                const UINT dr = dRow[x * 4 + 2];
+                const UINT da = dRow[x * 4 + 3];
+
+                dRow[x * 4 + 0] = (BYTE)(sb + (db * inv + 127) / 255);
+                dRow[x * 4 + 1] = (BYTE)(sg + (dg * inv + 127) / 255);
+                dRow[x * 4 + 2] = (BYTE)(sr + (dr * inv + 127) / 255);
+                dRow[x * 4 + 3] = (BYTE)(sa + (da * inv + 127) / 255);
+            }
+        }
+    };
+
+    // ============================================================
+    // Animated GIF (compose frames properly)
+    // ============================================================
+
+    if (isGifContainer && frameCount > 1)
+    {
+        // Logical screen size (canvas size)
+        UINT canvasW = 0, canvasH = 0;
+        {
+            Microsoft::WRL::ComPtr<IWICMetadataQueryReader> decMeta;
+
+            if (SUCCEEDED(decoder->GetMetadataQueryReader(decMeta.GetAddressOf())) && decMeta)
+            {
+                ReadUIntMeta(decMeta.Get(), L"/logscrdesc/Width",  canvasW);
+                ReadUIntMeta(decMeta.Get(), L"/logscrdesc/Height", canvasH);
+            }
+        }
+
+        if (canvasW == 0 || canvasH == 0)
+        {
+            // Fallback: first frame size
+            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> f0;
+
+            if (SUCCEEDED(decoder->GetFrame(0, f0.GetAddressOf())) && f0)
+                f0->GetSize(&canvasW, &canvasH);
+        }
+
+        if (canvasW == 0 || canvasH == 0)
+            return false;
+
+        // Composition canvas (full size)
+        Microsoft::WRL::ComPtr<IWICBitmap> canvas;
+        hr = g_wicFactory->CreateBitmap(
+            canvasW, canvasH,
+            GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapCacheOnLoad,
+            canvas.GetAddressOf());
+
+        if (FAILED(hr) || !canvas)
+            return false;
+
+        // Clear to transparent
+        ClearRect(canvas.Get(), WICRect{ 0, 0, (INT)canvasW, (INT)canvasH });
+        UINT prevDisposal = 0;
+        WICRect prevFrameRect{ 0,0,0,0 };
+        Microsoft::WRL::ComPtr<IWICBitmap> savedCanvasForDisposal3;
+
+        for (UINT i = 0; i < frameCount; ++i)
+        {
+            // Apply previous frame disposal BEFORE drawing this frame
+            if (i > 0)
+            {
+                if (prevDisposal == 2)
+                {
+                    // Restore to background (use transparent)
+                    if (prevFrameRect.Width > 0 && prevFrameRect.Height > 0)
+                        ClearRect(canvas.Get(), prevFrameRect);
+                }
+
+                else if (prevDisposal == 3 && savedCanvasForDisposal3)
+                {
+                    // Restore to previous
+                    canvas = savedCanvasForDisposal3;
+                    savedCanvasForDisposal3.Reset();
+                }
+            }
+
+            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+
+            if (FAILED(decoder->GetFrame(i, frame.GetAddressOf())) || !frame)
+                continue;
+
+            // Frame defaults
+            UINT left = 0, top = 0;
+            UINT w = 0, h = 0;
+            UINT disposal = 0;
+            UINT delayMs = 100; // default 100ms
+            UINT frameW = 0, frameH = 0;
+            frame->GetSize(&frameW, &frameH);
+            Microsoft::WRL::ComPtr<IWICMetadataQueryReader> meta;
+
+            if (SUCCEEDED(frame->GetMetadataQueryReader(meta.GetAddressOf())) && meta)
+            {
+                ReadUIntMeta(meta.Get(), L"/imgdesc/Left",   left);
+                ReadUIntMeta(meta.Get(), L"/imgdesc/Top",    top);
+                ReadUIntMeta(meta.Get(), L"/imgdesc/Width",  w);
+                ReadUIntMeta(meta.Get(), L"/imgdesc/Height", h);
+                ReadUIntMeta(meta.Get(), L"/grctlext/Disposal", disposal);
+                UINT delay10ms = 0;
+
+                if (ReadUIntMeta(meta.Get(), L"/grctlext/Delay", delay10ms))
+                    delayMs = delay10ms * 10;
+            }
+
+            if (delayMs < 10) delayMs = 100;
+            if (w == 0) w = frameW;
+            if (h == 0) h = frameH;
+            if (left >= canvasW || top >= canvasH)
+                continue;
+
+            const UINT dstW = umin(w, canvasW - left);
+            const UINT dstH = umin(h, canvasH - top);
+
+            if (dstW == 0 || dstH == 0)
+                continue;
+
+            WICRect frameRect{ (INT)left, (INT)top, (INT)dstW, (INT)dstH };
+
+            // If this frame uses "restore to previous", save canvas BEFORE drawing it.
+            if (disposal == 3)
+                savedCanvasForDisposal3 = CloneBitmap(canvas.Get());
+            else
+                savedCanvasForDisposal3.Reset();
+
+            // Decode pixels.
+            // If the frame decode surface is larger than the described subimage rect,
+            // copy only the described region to avoid undefined pixels (black noise).
+
+            std::vector<BYTE> src;
+            UINT srcW = 0, srcH = 0, srcStride = 0;
+            WICRect copyRect{ 0,0,(INT)frameW,(INT)frameH };
+            const WICRect* copyRectPtr = nullptr;
+            if (frameW >= left + dstW && frameH >= top + dstH &&
+                (frameW != dstW || frameH != dstH) && (left != 0 || top != 0))
+            {
+                // Pull only the subimage region out of a full-size frame surface.
+                copyRect = WICRect{ (INT)left, (INT)top, (INT)dstW, (INT)dstH };
+                copyRectPtr = &copyRect;
+            }
+
+            if (!DecodeToPBGRA(frame.Get(), copyRectPtr, src, srcW, srcH, srcStride))
+                continue;
+            const UINT drawW = umin(dstW, srcW);
+            const UINT drawH = umin(dstH, srcH);
+
+            // Blend onto the composition canvas at (left, top)
+            BlendSrcOverCanvas(canvas.Get(), (int)left, (int)top,
+                               src.data(), drawW, drawH, srcStride);
+
+            // Snapshot the composed full canvas as the visible frame
+            auto composedFrame = CloneBitmap(canvas.Get());
+
+            if (!composedFrame)
+                continue;
+
+            g_gifFrames.push_back(composedFrame);
+            g_gifFrameDelays.push_back(delayMs);
+            prevDisposal = disposal;
+            prevFrameRect = frameRect;
+        }
+
+        if (g_gifFrames.empty())
+            return false;
+
+        g_isAnimatedGif = true;
+        g_currentGifFrame = 0;
+        g_wicBitmapSource = g_gifFrames[0];
+        g_lastGifFrameTime = GetTickCount64();
+    }
+    // ============================================================
+    // Static image (or non-GIF multi-frame): load frame 0
+    // ============================================================
+    else
+    {
+        Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+        hr = decoder->GetFrame(0, frame.GetAddressOf());
+
+        if (FAILED(hr) || !frame)
+            return false;
+
+        Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+        hr = g_wicFactory->CreateFormatConverter(converter.GetAddressOf());
+
+        if (FAILED(hr) || !converter)
+            return false;
+
+        hr = converter->Initialize(
+            frame.Get(),
+            GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone,
+            nullptr,
+            0.0f,
+            WICBitmapPaletteTypeCustom);
+
+        if (FAILED(hr))
+            return false;
+
+        Microsoft::WRL::ComPtr<IWICBitmap> cached;
+        hr = g_wicFactory->CreateBitmapFromSource(
+            converter.Get(),
+            WICBitmapCacheOnLoad,
+            cached.GetAddressOf());
+
+        if (FAILED(hr) || !cached)
+            return false;
+
+        // Enforce premultiplied invariant for fully transparent pixels.
+        // (Prevents speckle/noise if RGB is non-zero under A==0.)
+        {
+            UINT w = 0, h = 0;
+
+            if (SUCCEEDED(cached->GetSize(&w, &h)) && w && h)
+            {
+                WICRect rc{ 0,0,(INT)w,(INT)h };
+                Microsoft::WRL::ComPtr<IWICBitmapLock> lock;
+
+                if (SUCCEEDED(cached->Lock(&rc, WICBitmapLockWrite, lock.GetAddressOf())) && lock)
+                {
+                    UINT cb = 0; BYTE* data = nullptr; UINT stride = 0;
+                    if (SUCCEEDED(lock->GetDataPointer(&cb, &data)) && data &&
+                        SUCCEEDED(lock->GetStride(&stride)) && stride)
+                    {
+                        for (UINT y = 0; y < h; ++y)
+                        {
+                            BYTE* row = data + (size_t)y * stride;
+                            for (UINT x = 0; x < w; ++x)
+                            {
+                                BYTE* px = row + x * 4;
+                                if (px[3] == 0)
+                                    px[0] = px[1] = px[2] = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        g_wicBitmapSource = cached;
+    }
+    // Create Direct2D Bitmap for the *current device*
+    RecreateImageBitmap();
+
+    // ------------------------------------------------------------
+    // Restore state for new image (if exists)
+    // ------------------------------------------------------------
+    std::wstring newPath = filename;
+    auto it = g_imageStates.find(newPath);
+
+    if (it != g_imageStates.end())
+    {
+        const ImageViewState& s = it->second;
+
+        g_zoom = s.zoom;
+        g_offsetX = s.offsetX;
+        g_offsetY = s.offsetY;
+        UpdateTargetZoom(s.targetZoom);
+        g_targetOffsetX = s.targetOffsetX;
+        g_targetOffsetY = s.targetOffsetY;
+        g_imageRotationAngle = s.rotation;
+        g_targetRotationAngle = s.targetRotation;
+        g_restoredStateThisLoad = true;
+    }
+    else
+    {
+        g_restoredStateThisLoad = false;
+    }
+    // Update current path
+    g_currentFilePath = newPath;
+    size_t slash = g_currentFilePath.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        g_currentFileName = g_currentFilePath.substr(slash + 1);
+    else
+        g_currentFileName = g_currentFilePath;
+
+    D2D1_SIZE_F size = g_d2dBitmap->GetSize();
+
+    g_imageWidth  = (int)size.width;
+    g_imageHeight = (int)size.height;
+    
+    std::wstring text =
+        g_currentFileName +
+        L" (" +
+        std::to_wstring(g_imageWidth) +
+        L" x " +
+        std::to_wstring(g_imageHeight) +
+        L")";
+
+    g_textBoxes[TEXTBOX_FILE_NAME].SetText(text);
+
+    return (g_d2dBitmap != nullptr);
     }
 
-    // Release temporary COM objects
-    converter->Release();
-    frame->Release();
-    decoder->Release();
+void BuildImageList(const wchar_t* filename)
+{
+    g_imageFiles.clear();
+    g_imageStates.clear();
+    g_currentImageIndex = -1;
 
-    // Force redraw
-    InvalidateRect(hWnd, nullptr, FALSE);
-    return g_d2dBitmap != nullptr;
+    std::filesystem::path p(filename);
+    std::filesystem::path dir = p.parent_path();
+
+    for (auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (!entry.is_regular_file())
+            continue;
+
+        std::wstring path = entry.path().wstring();
+        if (IsSupportedImage(path))
+            g_imageFiles.push_back(path);
+    }
+
+    std::sort(g_imageFiles.begin(), g_imageFiles.end(),
+        [](const std::wstring& a, const std::wstring& b)
+        {
+            return _wcsicmp(a.c_str(), b.c_str()) < 0;
+        });
+
+    for (size_t i = 0; i < g_imageFiles.size(); ++i)
+    {
+        if (_wcsicmp(g_imageFiles[i].c_str(), filename) == 0)
+        {
+            g_currentImageIndex = (int)i;
+            break;
+        }
+    }
 }
 
 bool OpenImageFile(HWND hWnd)
@@ -342,14 +2484,15 @@ bool OpenImageFile(HWND hWnd)
     // Structure used by the Windows file open dialog
     OPENFILENAME ofn = {};
 
-    ofn.lStructSize = sizeof(ofn);          // Required size
+    ofn.lStructSize = sizeof(ofn);         // Required size
     ofn.hwndOwner = hWnd;                  // Parent window
     ofn.lpstrFile = fileName;              // Output buffer
     ofn.nMaxFile = MAX_PATH;               // Buffer size
 
     // File filter (double-null terminated!)
     ofn.lpstrFilter =
-        L"Image Files (*.jpg;*.png;*.bmp)\0*.jpg;*.png;*.bmp\0"
+        L"All Supported Images (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.webp)\0"
+        L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.webp\0"
         L"All Files (*.*)\0*.*\0";
 
     ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST;
@@ -365,235 +2508,595 @@ bool OpenImageFile(HWND hWnd)
         MessageBox(hWnd, L"Failed to load image.", L"Error", MB_ICONERROR);
         return false;
     }
-
+    BuildImageList(fileName);
+    EnterFullscreen();
     return true;
 }
 
+bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt)
+{
+    if (g_isExiting || !g_d2dBitmap)
+        return false;
 
-//
-//  FUNCTION: WndProc(HWND, UINT, WPARAM, LPARAM)
-//
-//  PURPOSE: Processes messages for the main window.
-//
-//  WM_COMMAND  - process the application menu
-//  WM_PAINT    - Paint the main window
-//  WM_DESTROY  - post a quit message and return
-//
-//
+    bool useMouse = (optionalPt != nullptr);
+
+    POINT pt{};
+    if (useMouse)
+    {
+        pt = *optionalPt;
+        ScreenToClient(hWnd, &pt);
+    }
+
+    g_showZoomDisplay = true;
+    g_lastZoomTime = GetTickCount64();
+
+    float zoomStep = delta / 120.0f;
+    float zoomAmount = powf(1.1f, zoomStep);
+    float newTargetZoom = g_targetZoom * zoomAmount;
+
+    if (newTargetZoom < 0.01f) newTargetZoom = 0.01f;
+    if (newTargetZoom > 100.0f) newTargetZoom = 100.0f;
+
+    ScreenToClient(hWnd, &pt);
+
+    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+
+    // Check if mouse is over the image
+    bool overImage = false;
+
+    if (useMouse)
+    {
+        overImage =
+            pt.x >= g_offsetX &&
+            pt.x <= g_offsetX + imgSize.width * g_zoom &&
+            pt.y >= g_offsetY &&
+            pt.y <= g_offsetY + imgSize.height * g_zoom;
+    }
+
+    if (useMouse && overImage)
+    {
+        // zoom relative to cursor
+        float imageX = (pt.x - g_offsetX) / g_zoom;
+        float imageY = (pt.y - g_offsetY) / g_zoom;
+
+        g_targetOffsetX = pt.x - imageX * newTargetZoom;
+        g_targetOffsetY = pt.y - imageY * newTargetZoom;
+    }
+    else
+    {
+        // ALWAYS zoom from center
+        float centerX = g_offsetX + imgSize.width  * g_zoom / 2.0f;
+        float centerY = g_offsetY + imgSize.height * g_zoom / 2.0f;
+
+        g_targetOffsetX = centerX - (imgSize.width  * newTargetZoom) / 2.0f;
+        g_targetOffsetY = centerY - (imgSize.height * newTargetZoom) / 2.0f;
+    }
+
+    UpdateTargetZoom(newTargetZoom);
+    return true;
+}
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
     {
-    case WM_COMMAND:
-        {
-            int wmId = LOWORD(wParam);
-            // Parse the menu selections:
-            switch (wmId)
-            {
-            case IDM_OPEN:
-                OpenImageFile(hWnd);
-                break;
-            case IDM_ABOUT:
-                DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
-                break;
-            case IDM_EXIT:
-                DestroyWindow(hWnd);
-                break;
-            default:
-                return DefWindowProc(hWnd, message, wParam, lParam);
-            }
-        }
-        break;
-
-        case WM_PAINT:
-        {
-            PAINTSTRUCT ps;
-            BeginPaint(hWnd, &ps);
-
-            CreateRenderTarget(hWnd);
-            g_renderTarget->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            g_renderTarget->BeginDraw();
-
-            g_renderTarget->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-
-            if (g_d2dBitmap)
-            {
-                D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
-
-                // Apply zoom transform
-                D2D1::Matrix3x2F transform =
-                    D2D1::Matrix3x2F::Scale(g_zoom, g_zoom) *
-                    D2D1::Matrix3x2F::Translation(g_offsetX, g_offsetY);
-
-
-                g_renderTarget->SetTransform(transform);
-
-                D2D1_RECT_F destRect =
-                    D2D1::RectF(0, 0, imgSize.width, imgSize.height);
-
-                #if defined(D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC)
-                    g_renderTarget->SetInterpolationMode(
-                        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
-                #else
-                    g_renderTarget->DrawBitmap(
-                        g_d2dBitmap,
-                        destRect,
-                        1.0f,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
-                    );
-                #endif
-                // Reset transform
-                g_renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
-            }
-
-            g_renderTarget->EndDraw();
-
-            EndPaint(hWnd, &ps);
-        }
-        break;
-        case WM_SIZE:
-            if (g_renderTarget)
-            {
-                UINT width = LOWORD(lParam);
-                UINT height = HIWORD(lParam);
-                g_renderTarget->Resize(D2D1::SizeU(width, height));
-                FitToWindow(hWnd);
-            }
-        break;
-
-        break;
-        case WM_DESTROY:
-
-            if (g_d2dBitmap) g_d2dBitmap->Release();
-            if (g_renderTarget) g_renderTarget->Release();
-            if (g_d2dFactory) g_d2dFactory->Release();
-            if (g_wicFactory) g_wicFactory->Release();
-
-            CoUninitialize();
-            PostQuitMessage(0);
-            break;
-       
-        case WM_MOUSEWHEEL:
-        {
-            if (!g_d2dBitmap) break;
-
-            short delta = GET_WHEEL_DELTA_WPARAM(wParam);
-
-            float zoomStep = delta / 120.0f;
-            float zoomAmount = powf(1.1f, zoomStep);
-
-            float newTargetZoom = g_targetZoom * zoomAmount;
-
-            if (newTargetZoom < 0.05f) newTargetZoom = 0.05f;
-            if (newTargetZoom > 50.0f) newTargetZoom = 50.0f;
-
-            POINT pt;
-            pt.x = GET_X_LPARAM(lParam);
-            pt.y = GET_Y_LPARAM(lParam);
-            ScreenToClient(hWnd, &pt);
-
-            // Convert cursor to image space using CURRENT zoom
-            float imageX = (pt.x - g_offsetX) / g_zoom;
-            float imageY = (pt.y - g_offsetY) / g_zoom;
-
-            // Compute target offsets using target zoom
-            float newTargetOffsetX = pt.x - imageX * newTargetZoom;
-            float newTargetOffsetY = pt.y - imageY * newTargetZoom;
-
-            g_targetZoom = newTargetZoom;
-            g_targetOffsetX = newTargetOffsetX;
-            g_targetOffsetY = newTargetOffsetY;
-
-            if (!g_isAnimating)
-            {
-                SetTimer(hWnd, 1, 16, nullptr); // ~60 FPS
-                g_isAnimating = true;
-            }
-        }
-        break;
-
-
-        case WM_LBUTTONDOWN:
-        {
-            g_isDragging = true;
-            SetCapture(hWnd);
-
-            g_lastMouse.x = GET_X_LPARAM(lParam);
-            g_lastMouse.y = GET_Y_LPARAM(lParam);
-        }
-        break;
-
-        case WM_MOUSEMOVE:
-        {
-            if (g_isDragging)
-            {
-                POINT pt;
-                pt.x = GET_X_LPARAM(lParam);
-                pt.y = GET_Y_LPARAM(lParam);
-
-                g_offsetX += (pt.x - g_lastMouse.x);
-                g_offsetY += (pt.y - g_lastMouse.y);
-
-                g_lastMouse = pt;
-
-                InvalidateRect(hWnd, nullptr, FALSE);
-            }
-        }
-        break;
-
-        case WM_LBUTTONUP:
-        {
-            g_isDragging = false;
-            ReleaseCapture();
-        }
-        break;
-
-        case WM_LBUTTONDBLCLK:
-        {
-            if (!g_d2dBitmap) break;
-
-            RECT rc;
-            GetClientRect(hWnd, &rc);
-
-            float windowWidth  = (float)(rc.right - rc.left);
-            float windowHeight = (float)(rc.bottom - rc.top);
-
-            D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
-
-            g_zoom = 1.0f;
-
-            g_offsetX = (windowWidth  - imgSize.width)  / 2.0f;
-            g_offsetY = (windowHeight - imgSize.height) / 2.0f;
-
-            InvalidateRect(hWnd, nullptr, FALSE);
-        }
-        break;
-
-    case WM_TIMER:
+    case WM_ERASEBKGND:
     {
-        const float smooth = 0.18f;  // smaller = more inertia
-
-        g_zoom += (g_targetZoom - g_zoom) * smooth;
-        g_offsetX += (g_targetOffsetX - g_offsetX) * smooth;
-        g_offsetY += (g_targetOffsetY - g_offsetY) * smooth;
-
-        // Stop when very close
-        if (fabs(g_zoom - g_targetZoom) < 0.001f &&
-            fabs(g_offsetX - g_targetOffsetX) < 0.5f &&
-            fabs(g_offsetY - g_targetOffsetY) < 0.5f)
-        {
-            g_zoom = g_targetZoom;
-            g_offsetX = g_targetOffsetX;
-            g_offsetY = g_targetOffsetY;
-
-            KillTimer(hWnd, 1);
-            g_isAnimating = false;
-        }
-
-        InvalidateRect(hWnd, nullptr, FALSE);
+        return 1;
     }
     break;
 
+    case WM_COPYDATA:
+    {
+        PCOPYDATASTRUCT pcds = (PCOPYDATASTRUCT)lParam;
+        if (pcds && pcds->dwData == 1 && pcds->lpData)
+        {
+            const wchar_t* incomingPath = reinterpret_cast<const wchar_t*>(pcds->lpData);
+            if (incomingPath && incomingPath[0])
+            {
+                // Open the image in the existing instance
+                BuildImageList(incomingPath);
+                if (LoadImageD2D(g_mainWindow, incomingPath))
+                {
+                    // Use existing logic to enter fullscreen and display
+                    EnterFullscreen(false, true);
+                    // Bring ourselves to front (safe way)
+                    if (IsIconic(hWnd))
+                        ShowWindow(hWnd, SW_RESTORE);
+
+                    SetForegroundWindow(hWnd);
+                    SetActiveWindow(hWnd);
+                }
+            }
+        }
+        return 0;
+    }
+    break;
+
+    case WM_ACTIVATE:
+    {
+        if (LOWORD(wParam) == WA_INACTIVE)
+        {
+            if (g_isFullscreen && g_fullScreenInitDone)
+            {
+                ExitFullscreen();
+            }
+        }
+    }
+    break;
+
+    case WM_DROPFILES:
+    {
+        HDROP hDrop = (HDROP)wParam;
+
+        wchar_t filePath[MAX_PATH];
+        DragQueryFile(hDrop, 0, filePath, MAX_PATH);
+
+        DragFinish(hDrop);
+
+        LoadImageD2D(hWnd, filePath);
+        BuildImageList(filePath);
+        EnterFullscreen();
+    }
+    break;
+
+    case WM_COMMAND:
+    {
+        int wmId = LOWORD(wParam);
+        // Parse the menu selections:
+        switch (wmId)
+        {
+        case IDM_OPEN:
+            OpenImageFile(hWnd);
+            break;
+        case IDM_ABOUT:
+            DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
+            break;
+        case IDM_EXIT:
+            DestroyWindow(hWnd);
+            break;
+        case ID_HELP_COMMANDS:
+            DialogBox(hInst, MAKEINTRESOURCE(IDD_COMMANDBOX), hWnd, About);
+            break;
+        default:
+            return DefWindowProc(hWnd, message, wParam, lParam);
+        }
+    }
+    break;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        BeginPaint(hWnd, &ps);
+        Render(hWnd);
+        EndPaint(hWnd, &ps);
+    }
+    break;
+
+    case WM_SIZE:
+    {
+        if (!g_swapChain || !g_renderTarget)
+            break;
+
+        UINT width  = LOWORD(lParam);
+        UINT height = HIWORD(lParam);
+
+        if (width == 0 || height == 0)
+            break;
+
+        // Unbind current target
+        g_renderTarget->SetTarget(nullptr);
+        g_d2dTargetBitmap.Reset();
+
+        HRESULT hr = g_swapChain->ResizeBuffers(
+            0,
+            width,
+            height,
+            DXGI_FORMAT_UNKNOWN,
+            0);
+
+        if (FAILED(hr))
+            break;
+
+        // Recreate target bitmap
+        ComPtr<IDXGISurface> surface;
+        if (SUCCEEDED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&surface))))
+        {
+            D2D1_BITMAP_PROPERTIES1 props =
+                D2D1::BitmapProperties1(
+                    D2D1_BITMAP_OPTIONS_TARGET |
+                    D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                    D2D1::PixelFormat(
+                        DXGI_FORMAT_B8G8R8A8_UNORM,
+                        D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+            if (SUCCEEDED(
+                g_renderTarget->CreateBitmapFromDxgiSurface(
+                    surface.Get(),
+                    &props,
+                    &g_d2dTargetBitmap)))
+            {
+                g_renderTarget->SetTarget(g_d2dTargetBitmap.Get());
+            }
+        }
+    }
+    break;
+
+    case WM_MOUSEWHEEL:
+    {
+        if (!g_d2dBitmap)
+            break;
+        short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        POINT pt;
+        GetCursorPos(&pt);
+        ZoomIntoImage(hWnd, delta, &pt);
+    }
+    break;
+
+    case WM_LBUTTONDOWN:
+    {
+        if (!g_d2dBitmap)
+            break;
+
+        float x = GET_X_LPARAM(lParam);
+        float y = GET_Y_LPARAM(lParam);
+
+        for (auto& btn : g_buttons)
+        {
+            if (btn.OnMouseDown(x, y))
+                return 0;  // STOP — button handled it
+        }
+
+        for (auto& [id, box] : g_textBoxes)
+        {
+            if (box.OnMouseDown(x, y))
+                return 0;
+        }
+        g_isDragging = true;
+        SetCapture(hWnd);
+        g_lastMouse.x = x;
+        g_lastMouse.y = y;
+        g_mouseFromDown = g_lastMouse;
+    }
+    break;
+    
+    case WM_LBUTTONUP:
+    {
+        if (!g_d2dBitmap) break;
+
+        g_isDragging = false;
+        ReleaseCapture();
+        
+        float x = (float)GET_X_LPARAM(lParam);
+        float y = (float)GET_Y_LPARAM(lParam);
+        D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+        bool overImage =
+            x >= g_offsetX &&
+            x <= g_offsetX + imgSize.width * g_zoom &&
+            y >= g_offsetY &&
+            y <= g_offsetY + imgSize.height * g_zoom;
+
+        bool wasReallyDragging = (abs(x - g_mouseFromDown.x) > 5) || (abs(y - g_mouseFromDown.y) > 5);
+
+        if (g_isFullscreen && !overImage && !wasReallyDragging)
+        {
+            ExitFullscreen();
+        }
+
+        for (auto& btn : g_buttons)
+        {
+            btn.OnMouseUp(x, y);
+        }
+
+        for (auto& [id, box] : g_textBoxes)
+        {
+            break;
+        }
+        // Handle incomplete rotations
+        SetTimer(hWnd, 123, 120, nullptr);
+    }
+    break;
+
+    case WM_MOUSEMOVE:
+    {
+        POINT pt;
+        pt.x = GET_X_LPARAM(lParam);
+        pt.y = GET_Y_LPARAM(lParam);
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        float windowWidth   = (float)(rc.right - rc.left);
+        float windowHeight  = (float)(rc.bottom - rc.top);
+        for (auto& btn : g_buttons)
+            btn.UpdateProximity(pt.x, pt.y, windowWidth, windowHeight);
+
+        for (auto& [id, txt] : g_textBoxes)
+            txt.UpdateProximity(pt.x, pt.y, windowWidth, windowHeight);
+
+
+        if (g_isDragging && (wParam & MK_LBUTTON))
+        {
+            float dx = (float)(pt.x - g_lastMouse.x);
+            float dy = (float)(pt.y - g_lastMouse.y);
+
+            g_offsetX += dx;
+            g_offsetY += dy;
+
+            // Keep animation targets aligned
+            g_targetOffsetX = g_offsetX;
+            g_targetOffsetY = g_offsetY;
+
+            g_lastMouse = pt;
+
+            HWND renderWindow = (g_isFullscreen && g_overlayWindow)
+                ? g_overlayWindow
+                : hWnd;
+        }
+    }
+    break;
+
+    case WM_LBUTTONDBLCLK:
+    {
+        if (!g_d2dBitmap){ 
+            OpenImageFile(hWnd);
+            break;
+        }
+
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+
+        for (auto& btn : g_buttons)
+        {
+            if (btn.HitTest(pt.x, pt.y))
+                return 0;
+        }
+
+        for (auto& [id, box] : g_textBoxes)
+        {
+            if (box.HitTest(pt.x, pt.y))
+                return 0;
+        }
+
+
+        bool overImage =
+            pt.x >= g_offsetX &&
+            pt.x <= g_offsetX + imgSize.width * g_zoom &&
+            pt.y >= g_offsetY &&
+            pt.y <= g_offsetY + imgSize.height * g_zoom;
+
+        if (!g_isFullscreen && overImage)
+        {
+            EnterFullscreen(true, true); // preserve zoom & position
+        }
+        else if (g_isFullscreen)
+        {
+            if (overImage)
+            {
+                g_lastZoomTime = GetTickCount64();
+                g_showZoomDisplay = true;
+                if (g_targetZoom == 1.0f)
+                    FitToWindowRelative(g_overlayWindow, 0.96f);
+                else
+                    SetZoomCentered(1.0f, g_overlayWindow);
+            }
+        }
+    }
+    break;
+
+    case WM_TIMER:
+    {
+        if (wParam == 8888)
+        {
+            KillTimer(hWnd, 8888);
+            EnterFullscreen(g_pendingPreserveView, false);
+        }
+        if (wParam == 123)
+        {
+            // Handle incomplete rotations:
+            KillTimer(hWnd, 123);
+            if (g_imageRotationAngle < g_targetRotationAngle)
+            {
+                g_targetRotationAngle = std::ceil(g_imageRotationAngle / 90.0f) * 90.0f;
+            }
+            else
+            {
+                g_targetRotationAngle = std::floor(g_imageRotationAngle / 90.0f) * 90.0f;
+            }
+        }
+    }
+    break;
+
+    case WM_CHAR:
+        for (auto& [id, box] : g_textBoxes)
+            box.OnChar((wchar_t)wParam);
+        break;
+
+        for (auto& [id, box] : g_textBoxes)
+            box.OnKeyDown(wParam);
+
+
+    case WM_KEYDOWN:
+    {   
+        // If any textbox is focused, let it handle the key
+        for (auto& [id, box] : g_textBoxes)
+        {
+            if (box.IsFocused())
+            {
+                box.OnKeyDown(wParam);
+                return 0;  // STOP. Do NOT process global shortcuts.
+            }
+        }
+
+        switch (wParam)
+        {
+            case VK_ESCAPE:
+            {
+                if (!g_d2dBitmap)
+                {
+                    PostQuitMessage(0);
+                    return 0;
+                }
+                if (g_isFullscreen)
+                {
+                    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+                    float centerX = g_offsetX + imgSize.width  * g_zoom / 2.0f;
+                    float centerY = g_offsetY + imgSize.height * g_zoom / 2.0f;
+
+                    g_targetOffsetX = centerX - (imgSize.width * 0.05f) / 2.0f;
+                    g_targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
+
+                    int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
+                    g_smooth = 2*0.18f/((float)(refreshRate) / 60.0f);
+                    g_targetZoom = 0.0005f;
+                }
+
+                g_showZoomDisplay = false;
+                g_isExiting = true;
+
+                return 0;
+            }
+
+            case 0x46: // 'F' key
+            {
+                if (!g_d2dBitmap)
+                {
+                    break;
+                }
+                else if (g_isFullscreen)
+                {
+                    ExitFullscreen();
+                }
+                else
+                {
+                    EnterFullscreen(true, true);
+                }
+                return 0;
+            }
+            break;
+
+            case 0x57: // 'W' key
+            case VK_UP:
+            {
+                ZoomIntoImage(hWnd, 250, nullptr);
+                return 0;
+            }
+
+            case 0x53: // 'S' key
+            case VK_DOWN:
+            {
+                ZoomIntoImage(hWnd, -250, nullptr);
+                return 0;
+            }
+
+            case 0x41: // 'A' key
+            case VK_LEFT:
+            {
+                if (!g_imageFiles.empty())
+                {
+                    g_currentImageIndex--;
+
+                    if (g_currentImageIndex < 0)
+                        g_currentImageIndex =
+                            (int)g_imageFiles.size() - 1;
+
+                    g_showZoomDisplay = false;
+                    LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
+                    InitializeImageLayout(hWnd, true);
+                }
+                return 0;
+            }
+
+            case 0x44: // 'D' key
+            case VK_RIGHT:
+            {
+                if (!g_imageFiles.empty())
+                {
+                    g_currentImageIndex =
+                        (g_currentImageIndex + 1) % (int)g_imageFiles.size();
+
+                    g_showZoomDisplay = false;
+                    LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
+                    InitializeImageLayout(hWnd, true);
+                }
+                return 0;
+            }
+
+            case 0x51: // 'Q' key
+            {
+                if (g_d2dBitmap)
+                {
+                    g_targetRotationAngle -= 90.0f;
+                }
+                return 0;
+            }
+
+            case 0x45: // 'E' key
+            {
+                if (g_d2dBitmap)
+                {
+                    g_targetRotationAngle += 90.0f;
+                }
+                return 0;
+            }
+        }
+    }
+    break;
+
+    case WM_SYSCOMMAND:
+    {
+        switch (wParam & 0xFFF0)
+        {
+            case SC_MAXIMIZE:
+                if (!g_d2dBitmap)
+                {
+                    return DefWindowProc(hWnd, message, wParam, lParam);
+                }
+                else
+                {
+                    EnterFullscreen();
+                    return 0;
+                }
+            case SC_RESTORE:
+                ExitFullscreen(); // optional
+                return 0;
+
+            default:
+                // Let Windows handle all other system commands (menus, icon clicks, etc.)
+                return DefWindowProc(hWnd, message, wParam, lParam);
+        }
+    }
+    break;
+
+    case WM_KEYUP:
+    {
+        // Handle incomplete rotations
+        SetTimer(hWnd, 123, 120, nullptr);
+    }
+    break;
+
+    case WM_DESTROY:
+    {
+        if (hWnd == g_mainWindow)
+        {
+            // Ensure overlay is cleaned up too.
+            if (g_overlayWindow)
+            {
+                DestroyWindow(g_overlayWindow);
+                g_overlayWindow = nullptr;
+            }
+
+            DiscardDeviceResources();
+            g_wicDefaultBackground.Reset();
+            g_wicBackground.Reset();
+            g_wicBitmapSource.Reset();
+            g_wicFactory.Reset();
+            g_d2dFactory.Reset();
+            g_textFormat.Reset();
+            g_dwriteFactory.Reset();
+            CoUninitialize();
+            PostQuitMessage(0);
+        }
+    }
+    break;
 
     default:
         return DefWindowProc(hWnd, message, wParam, lParam);
@@ -601,7 +3104,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
-// Message handler for about box.
 INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
     UNREFERENCED_PARAMETER(lParam);

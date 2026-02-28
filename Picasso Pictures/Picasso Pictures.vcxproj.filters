@@ -27,9 +27,21 @@
     <ClInclude Include="Picasso Pictures.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="AnimatedButton.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="UITextBox.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Picasso Pictures.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AnimatedButton.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="UITextBox.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
