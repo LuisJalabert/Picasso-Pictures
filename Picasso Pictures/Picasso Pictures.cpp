@@ -1751,7 +1751,8 @@ void Render(HWND hWnd)
     // Draw UI buttons
 
     std::wstring text = std::to_wstring(int(g_zoom*100));
-    g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(text);
+    if (!g_textBoxes[TEXTBOX_ZOOM_INPUT].IsFocused())
+        g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(text);
 
     for (auto& btn : g_buttons)
     {
