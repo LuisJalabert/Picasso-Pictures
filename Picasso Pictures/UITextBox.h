@@ -67,17 +67,18 @@ public:
 private:
     Config m_config;
 
-    float   m_visibility = 0.f;
-    float   m_targetVisibility = 0.f;
-    float   m_currentScale = 1.f;
-    float   m_pixelFontSize = 16.f;
-    float   m_pixelWidth = 200.f;
-    float   m_pixelHeight = 50.f;
-    bool    m_focused = false;
-    bool    m_selectAllOnFocus = false;
-    float   m_focusPulseTime = 0.f;
-    bool    m_layoutFrozen = false;
-    bool    m_anchorToBottom = false;
+    float m_visibility = 0.f;
+    float m_targetVisibility = 0.f;
+    float m_currentScale = 1.f;
+    float m_pixelFontSize = 16.f;
+    float m_pixelWidth = 200.f;
+    float m_pixelHeight = 50.f;
+    bool m_focused = false;
+    bool m_selectAllOnFocus = false;
+    float m_focusPulseTime = 0.f;
+    bool m_layoutCaptured = false;
+    float m_groupRelativeCenterX = 0.0f;
+    float m_bottomOffset = 0.0f;
 
     std::wstring m_text;
     D2D1_RECT_F m_rect = {};

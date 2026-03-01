@@ -17,30 +17,57 @@ bool UITextBox::Initialize(
 
 void UITextBox::UpdateLayout(ID2D1RenderTarget* rt)
 {
-    if (!rt || !m_factory || m_layoutFrozen)
+    if (!rt || !m_factory)
         return;
 
-    if (!m_layoutFrozen)
-        m_layoutFrozen = true; // Freeze layout after first update to prevent changes on resolution change
+    D2D1_SIZE_F rtSize = rt->GetSize();
 
-    D2D1_SIZE_F size = rt->GetSize();
+    //
+    // ---- CAPTURE FULLSCREEN LAYOUT ONCE ----
+    //
+    if (!m_layoutCaptured)
+    {
+        float fsWidth  = rtSize.width;
+        float fsHeight = rtSize.height;
 
-    float centerX = size.width  * m_config.relativeX;
-    float centerY = size.height * m_config.relativeY;
+        float centerX = fsWidth  * m_config.relativeX;
+        float centerY = fsHeight * m_config.relativeY;
 
-    float pixelWidth    = m_config.uiPixelScale * m_config.width;
-    float pixelHeight   = m_config.uiPixelScale * m_config.height;
-    float pixelFontSize = m_config.uiPixelScale * m_config.relativeFontSize;
+        float pixelWidth    = m_config.uiPixelScale * m_config.width;
+        float pixelHeight   = m_config.uiPixelScale * m_config.height;
+        float pixelFontSize = m_config.uiPixelScale * m_config.relativeFontSize;
 
-    m_pixelWidth    = pixelWidth;
-    m_pixelHeight   = pixelHeight;
-    m_pixelFontSize = pixelFontSize;
+        m_pixelWidth    = pixelWidth;
+        m_pixelHeight   = pixelHeight;
+        m_pixelFontSize = pixelFontSize;
+
+        // Store horizontal offset from center
+        m_groupRelativeCenterX = centerX - (fsWidth * 0.5f);
+
+        // Store bottom offset
+        float bottomEdge = centerY + (pixelHeight * 0.5f);
+        m_bottomOffset = fsHeight - bottomEdge;
+
+        m_layoutCaptured = true;
+    }
+
+    //
+    // ---- REPOSITION USING STORED PIXEL VALUES ----
+    //
+
+    float newCenterX = (rtSize.width * 0.5f) + m_groupRelativeCenterX;
+    float newBottomEdge = rtSize.height - m_bottomOffset;
+    float newCenterY = newBottomEdge - (m_pixelHeight * 0.5f);
 
     m_rect = D2D1::RectF(
-        centerX - pixelWidth * 0.5f,
-        centerY - pixelHeight * 0.5f,
-        centerX + pixelWidth * 0.5f,
-        centerY + pixelHeight * 0.5f);
+        newCenterX - m_pixelWidth * 0.5f,
+        newCenterY - m_pixelHeight * 0.5f,
+        newCenterX + m_pixelWidth * 0.5f,
+        newCenterY + m_pixelHeight * 0.5f);
+
+    //
+    // ---- TEXT FORMAT (font size stays fixed) ----
+    //
 
     m_textFormat.Reset();
 
@@ -50,7 +77,7 @@ void UITextBox::UpdateLayout(ID2D1RenderTarget* rt)
         DWRITE_FONT_WEIGHT_SEMI_BOLD,
         DWRITE_FONT_STYLE_NORMAL,
         DWRITE_FONT_STRETCH_NORMAL,
-        pixelFontSize,
+        m_pixelFontSize,
         L"",
         &m_textFormat);
 
@@ -60,47 +87,6 @@ void UITextBox::UpdateLayout(ID2D1RenderTarget* rt)
         m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
 }
-/*
-void UITextBox::UpdateLayout(ID2D1RenderTarget* rt)
-{
-    if (!rt) return;
-
-    float baseWidth  = m_config.uiReferenceWidth;
-    float baseHeight = m_config.uiReferenceHeight;
-
-    float uiScale = baseHeight;
-
-    float centerX = baseWidth  * m_config.relativeX;
-    float centerY = baseHeight * m_config.relativeY;
-
-    m_pixelFontSize = uiScale * m_config.relativeFontSize;
-    m_pixelWidth    = uiScale * m_config.width;
-    m_pixelHeight   = uiScale * m_config.height;
-    
-    m_rect = D2D1::RectF(
-    centerX - m_pixelWidth * 0.5f,
-    centerY - m_pixelHeight * 0.5f,
-    centerX + m_pixelWidth * 0.5f,
-    centerY + m_pixelHeight * 0.5f);
-    m_textFormat.Reset();
-
-    m_factory->CreateTextFormat(
-        L"Segoe UI",
-        nullptr,
-        DWRITE_FONT_WEIGHT_SEMI_BOLD,
-        DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL,
-        m_pixelFontSize,
-        L"",
-        &m_textFormat);
-
-    if (m_textFormat)
-    {
-        m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    }
-}
-*/
 void UITextBox::UpdateVisibility()
 {
     m_visibility += (m_targetVisibility - m_visibility) * 0.08f;

@@ -16,6 +16,7 @@ bool AnimatedButton::Initialize(
     UpdateLayout(renderTarget);
     return true;
 }
+
 void AnimatedButton::UpdateLayout(ID2D1RenderTarget* renderTarget)
 {
     if (!renderTarget || !m_dwriteFactory)
@@ -82,12 +83,13 @@ void AnimatedButton::UpdateLayout(ID2D1RenderTarget* renderTarget)
         L"",
         &m_textFormat);
 
-    if (SUCCEEDED(hr) && m_textFormat)
-    {
-        m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    }
+    if (FAILED(hr) || !m_textFormat)
+        return;
 
+    m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+/*
     if (m_config.id == BUTTON_ZOOM_11)
     {
         std::wstringstream ss;
@@ -120,53 +122,9 @@ void AnimatedButton::UpdateLayout(ID2D1RenderTarget* renderTarget)
         ss << L"  bottom = " << m_rect.bottom << L"\n";
 
         MessageBoxW(nullptr, ss.str().c_str(), L"UpdateLayout Debug", MB_OK);
+    }*/
 }
-}
 
-/* 
-void AnimatedButton::UpdateLayout(ID2D1RenderTarget* renderTarget)
-{
-    if (!renderTarget || !m_dwriteFactory)
-        return;
-
-    D2D1_SIZE_F rtSize = renderTarget->GetSize();
-
-    float centerX = rtSize.width  * m_config.relativeX;
-    float centerY = rtSize.height * m_config.relativeY;
-    float uiScale = min(rtSize.width, rtSize.height);
-
-    float pixelWidth = uiScale * m_config.width;
-    float pixelHeight = uiScale * m_config.height;
-    float pixelFontSize = uiScale * m_config.fontSize;
-
-    m_pixelWidth  = pixelWidth;
-    m_pixelHeight = pixelHeight;
-
-    m_rect = D2D1::RectF(
-        centerX - pixelWidth  * 0.5f,
-        centerY - pixelHeight * 0.5f,
-        centerX + pixelWidth  * 0.5f,
-        centerY + pixelHeight * 0.5f);
-
-    m_textFormat.Reset();
-
-    HRESULT hr = m_dwriteFactory->CreateTextFormat(
-        L"Segoe UI",
-        nullptr,
-        DWRITE_FONT_WEIGHT_SEMI_BOLD,
-        DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL,
-        pixelFontSize,
-        L"",
-        &m_textFormat);
-
-    if (FAILED(hr) || !m_textFormat)
-        return;
-
-    m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-}
-*/
 void AnimatedButton::Update(float deltaTime)
 {
     float smooth = 0.12f;
@@ -270,6 +228,9 @@ bool AnimatedButton::HitTest(float x, float y) const
 
 bool AnimatedButton::OnMouseDown(float x, float y)
 {
+    if (HitTest(x, y) && m_callback)
+        m_callback();
+
     if (HitTest(x, y))
     {
         m_pressed = true;
@@ -295,8 +256,6 @@ bool AnimatedButton::OnMouseUp(float x, float y)
     m_targetScale = 1.f;
     m_targetOpacity = 0.85f;
 
-    if (HitTest(x, y) && m_callback)
-        m_callback();
 
     return true;
 }
