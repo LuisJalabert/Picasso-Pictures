@@ -52,7 +52,9 @@ public:
 
 
     void UpdateLayout(ID2D1RenderTarget* renderTarget);
-    void UpdateVisibility();
+    void UpdateVisibility(float fallOf = 0.08f);
+    void SetTargetVisibility(float visibility);
+    void SetForcedVisibility(bool forced);
     void UpdateProximity(float mouseX, float mouseY, float windowWidth, float windowHeight);
     void Draw(ID2D1RenderTarget* rt);
     // Editing
@@ -79,6 +81,7 @@ private:
     bool m_layoutCaptured = false;
     float m_groupRelativeCenterX = 0.0f;
     float m_bottomOffset = 0.0f;
+    bool m_forcedVisibility = false;
 
     std::wstring m_text;
     D2D1_RECT_F m_rect = {};

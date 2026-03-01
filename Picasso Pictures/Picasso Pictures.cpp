@@ -74,11 +74,8 @@ float                                               g_offsetX = 0.0f;           
 float                                               g_offsetY = 0.0f;                   // Pan offset Y
 bool                                                g_isDragging = false;
 POINT                                               g_lastMouse = {};
-POINT                                               g_mouseFromDown = {}; 
-LONG                                                g_lastZoomTime = 0;
+POINT                                               g_mouseFromDown = {};
 float                                               g_targetZoom = 1.0f;
-float                                               g_zoomDisplayAlpha = 0.0f;
-bool                                                g_showZoomDisplay = false;
 float                                               g_targetOffsetX = 0.0f;
 float                                               g_targetOffsetY = 0.0f;
 bool                                                g_isFullscreen = false;
@@ -169,6 +166,7 @@ bool OpenImageFile(HWND hWnd);
 void OpenNextImage(HWND hWnd);
 void OpenPrevImage(HWND hWnd);
 bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt);
+void MakeZoomVisible(HWND hWnd);
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
 
@@ -562,24 +560,6 @@ void UpdateEngine(float dt)
         }
     }
 
-    if (g_showZoomDisplay && now - g_lastZoomTime > 800)
-        g_showZoomDisplay = false;
-
-    const float fadeSpeed = 3.0f;
-
-    if (g_showZoomDisplay)
-    {
-        g_zoomDisplayAlpha += fadeSpeed * dt;
-        if (g_zoomDisplayAlpha > 1.0f)
-            g_zoomDisplayAlpha = 1.0f;
-    }
-    else
-    {
-        g_zoomDisplayAlpha -= fadeSpeed * dt;
-        if (g_zoomDisplayAlpha < 0.0f)
-            g_zoomDisplayAlpha = 0.0f;
-    }
-
     if (std::fabs(g_targetRotationAngle - g_imageRotationAngle) > 0.01f)
     {
         float delta = g_targetRotationAngle - g_imageRotationAngle;
@@ -919,8 +899,6 @@ void UpdateTargetZoom(float newZoom)
 {
     if (!g_d2dBitmap) return;
     g_targetZoom = newZoom;
-    std::wstring text = std::to_wstring(int(g_targetZoom*100));
-    g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(text);
 }
 
 void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
@@ -1379,6 +1357,7 @@ void InitializeButtons()
         buttonConfig,
         []()
         {
+            MakeZoomVisible(g_renderTargetWindow);
             SetZoomCentered(1.0f, g_renderTargetWindow, true);
         });
     g_buttons.back().UpdateLayout(g_renderTarget.Get());
@@ -1399,6 +1378,8 @@ void InitializeButtons()
         []()
         {
             ZoomIntoImage(g_renderTargetWindow, 250, nullptr);
+            MakeZoomVisible(g_renderTargetWindow);
+
         });
     g_buttons.back().UpdateLayout(g_renderTarget.Get());
 
@@ -1418,6 +1399,7 @@ void InitializeButtons()
         []()
         {
             ZoomIntoImage(g_renderTargetWindow, -250, nullptr);
+            MakeZoomVisible(g_renderTargetWindow);
         });
     g_buttons.back().UpdateLayout(g_renderTarget.Get());
 
@@ -1543,7 +1525,6 @@ void InitializeButtons()
             g_smooth = 2 * 0.18f / ((float)(refreshRate) / 60.0f);
 
             g_targetZoom = 0.0005f;
-            g_showZoomDisplay = false;
             g_isExiting = true;
         });
     g_buttons.back().UpdateLayout(g_renderTarget.Get());
@@ -1551,6 +1532,8 @@ void InitializeButtons()
 
 void InitializeImageInfoLabel()
 {
+
+    // Filename display.
     UITextBox::ActivationZone zone;
     zone.left   = 0.0f;
     zone.right  = 1.0f;
@@ -1578,11 +1561,17 @@ void InitializeImageInfoLabel()
         nullptr);
     g_textBoxes[TEXTBOX_FILE_NAME].UpdateLayout(g_renderTarget.Get());
 
-    config.relativeX = 0.5865f;
-    config.relativeY = 0.96f;
+    // Zoom level display/input.
+    zone.left   = 0.4f;
+    zone.right  = 0.6f;
+    zone.top    = 0.4f;
+    zone.bottom = 0.6f;
+    config.activationZone = zone;
+    config.relativeX = 0.5;
+    config.relativeY = 0.5f;
     config.width = 0.05f;
     config.height = 0.025f;
-    config.backgroundAlpha = 0.2f; // semi-transparent box for zoom display
+    config.backgroundAlpha = 0.5f; // semi-transparent box for zoom display
     config.isEditable = true;
     config.inputMode = UITextBox::InputMode::NumericFloat;
     g_textBoxes[TEXTBOX_ZOOM_INPUT].Initialize(
@@ -1760,6 +1749,10 @@ void Render(HWND hWnd)
     D2D1_SIZE_F rtSize = g_renderTarget->GetSize();
 
     // Draw UI buttons
+
+    std::wstring text = std::to_wstring(int(g_zoom*100));
+    g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(text);
+
     for (auto& btn : g_buttons)
     {
         if (!g_isFullscreen && btn.GetId() == AnimatedButton::BUTTON_EXIT)
@@ -1772,69 +1765,7 @@ void Render(HWND hWnd)
     {
         txt.Draw(g_renderTarget.Get());
     }
-
-    // Draw zoom overlay
-    if (g_zoomDisplayAlpha > 0.01f)
-    {
-        wchar_t text[32];
-        swprintf_s(text, L"%.0f%%", g_zoom * 100.0f);
-
-        ComPtr<ID2D1SolidColorBrush> bgBrush;
-        ComPtr<ID2D1SolidColorBrush> textBrush;
-
-        g_renderTarget->CreateSolidColorBrush(
-            D2D1::ColorF(0.3f, 0.3f, 0.3f, g_zoomDisplayAlpha),
-            bgBrush.GetAddressOf());
-
-        g_renderTarget->CreateSolidColorBrush(
-            D2D1::ColorF(1.0f, 1.0f, 1.0f, g_zoomDisplayAlpha),
-            textBrush.GetAddressOf());
-            
-        RECT rc;
-        GetClientRect(hWnd, &rc);
-
-        int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-
-        // Make overlay height 2.3% of window height
-        float boxHeight = screenHeight * 0.023f;
-
-        // Keep 2:1 proportion
-        float boxWidth = boxHeight * 2.0f;
-
-        float centerX = (rc.right - rc.left) / 2.0f;
-        float centerY = (rc.bottom - rc.top) / 2.0f;
-        float cornerRadius = boxHeight * 0.2f;
-        D2D1_ROUNDED_RECT rounded =
-            D2D1::RoundedRect(
-                D2D1::RectF(
-                    centerX - boxWidth / 2,
-                    centerY - boxHeight / 2,
-                    centerX + boxWidth / 2,
-                    centerY + boxHeight / 2),
-                cornerRadius,
-                cornerRadius);
-
-        if (bgBrush)
-            g_renderTarget->FillRoundedRectangle(rounded, bgBrush.Get());
-
-        D2D1_RECT_F textRect =
-            D2D1::RectF(
-                centerX - boxWidth / 2,
-                centerY - boxHeight / 2,
-                centerX + boxWidth / 2,
-                centerY + boxHeight / 2);
-
-        if (textBrush)
-        {
-            g_renderTarget->DrawTextW(
-                text,
-                (UINT32)wcslen(text),
-                g_textFormat.Get(),
-                textRect,
-                textBrush.Get()
-            );
-        }
-    }
+    
 
     HRESULT hr = g_renderTarget->EndDraw();
 
@@ -1860,6 +1791,22 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     // ------------------------------------------------------------
     if (!g_currentFilePath.empty())
     {
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+
+        float winW = float(rc.right - rc.left);
+        float winH = float(rc.bottom - rc.top);
+
+        if (winW > 0) {
+            g_offsetX /= winW;
+            g_targetOffsetX /= winW;
+        }
+
+        if (winH > 0) {
+            g_offsetY /= winH;
+            g_targetOffsetY /= winH;
+        }
+
         g_imageStates[g_currentFilePath] =
         {
             g_zoom,
@@ -2396,6 +2343,17 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         g_imageRotationAngle = s.rotation;
         g_targetRotationAngle = s.targetRotation;
         g_restoredStateThisLoad = true;
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+
+        float winW = float(rc.right - rc.left);
+        float winH = float(rc.bottom - rc.top);
+
+        g_offsetX *= winW;
+        g_targetOffsetX *= winW;
+
+        g_offsetY *= winH;
+        g_targetOffsetY *= winH;
     }
     else
     {
@@ -2509,7 +2467,6 @@ void OpenPrevImage(HWND hWnd)
             g_currentImageIndex =
                 (int)g_imageFiles.size() - 1;
 
-        g_showZoomDisplay = false;
         LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
         InitializeImageLayout(hWnd, true);
     }
@@ -2522,7 +2479,6 @@ void OpenNextImage(HWND hWnd)
         g_currentImageIndex =
             (g_currentImageIndex + 1) % (int)g_imageFiles.size();
 
-        g_showZoomDisplay = false;
         LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
         InitializeImageLayout(hWnd, true);
     }
@@ -2541,9 +2497,6 @@ bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt)
         pt = *optionalPt;
         ScreenToClient(hWnd, &pt);
     }
-
-    g_showZoomDisplay = true;
-    g_lastZoomTime = GetTickCount64();
 
     float zoomStep = delta / 120.0f;
     float zoomAmount = powf(1.1f, zoomStep);
@@ -2586,9 +2539,14 @@ bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt)
         g_targetOffsetX = centerX - (imgSize.width  * newTargetZoom) / 2.0f;
         g_targetOffsetY = centerY - (imgSize.height * newTargetZoom) / 2.0f;
     }
-
     UpdateTargetZoom(newTargetZoom);
     return true;
+}
+
+void MakeZoomVisible(HWND hWnd)
+{
+    g_textBoxes[TEXTBOX_ZOOM_INPUT].SetForcedVisibility(true);
+    SetTimer(hWnd, 666, 1000, nullptr);
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -2745,6 +2703,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         POINT pt;
         GetCursorPos(&pt);
         ZoomIntoImage(hWnd, delta, &pt);
+        MakeZoomVisible(hWnd);
     }
     break;
 
@@ -2887,8 +2846,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
             if (overImage)
             {
-                g_lastZoomTime = GetTickCount64();
-                g_showZoomDisplay = true;
                 if (g_targetZoom == 1.0f)
                     FitToWindowRelative(g_overlayWindow, 0.96f);
                 else
@@ -2917,6 +2874,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             {
                 g_targetRotationAngle = std::floor(g_imageRotationAngle / 90.0f) * 90.0f;
             }
+        }
+        if (wParam == 666)
+            {
+                KillTimer(hWnd, 666);
+                g_textBoxes[TEXTBOX_ZOOM_INPUT].SetForcedVisibility(false);
         }
     }
     break;
@@ -2965,7 +2927,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     g_targetZoom = 0.0005f;
                 }
 
-                g_showZoomDisplay = false;
                 g_isExiting = true;
 
                 return 0;
@@ -2993,6 +2954,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             case VK_UP:
             {
                 ZoomIntoImage(hWnd, 250, nullptr);
+                MakeZoomVisible(hWnd);
                 return 0;
             }
 
@@ -3000,6 +2962,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             case VK_DOWN:
             {
                 ZoomIntoImage(hWnd, -250, nullptr);
+                MakeZoomVisible(hWnd);
                 return 0;
             }
 

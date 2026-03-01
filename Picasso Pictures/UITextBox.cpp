@@ -87,9 +87,32 @@ void UITextBox::UpdateLayout(ID2D1RenderTarget* rt)
         m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
 }
-void UITextBox::UpdateVisibility()
+
+void UITextBox::SetForcedVisibility(bool forced){
+    m_forcedVisibility = forced; 
+    if (m_forcedVisibility)
+    {
+        m_targetVisibility = 1.f; // Ensure it becomes visible
+    } 
+    else
+    {
+        m_targetVisibility = 0.f; // Allow it to fade out
+    }
+}
+
+void UITextBox::UpdateVisibility(float fallOff)
 {
-    m_visibility += (m_targetVisibility - m_visibility) * 0.08f;
+    float effectiveTarget = m_targetVisibility;
+
+    if (m_forcedVisibility || m_focused)
+    {
+        // Prevent decreasing visibility
+        if (effectiveTarget < m_visibility)
+            effectiveTarget = m_visibility;
+    }
+
+    m_visibility += (effectiveTarget - m_visibility) * fallOff;
+
     // ---- Focus pulse animation ----
     if (m_focused && m_selectAllOnFocus)
     {
@@ -119,6 +142,11 @@ void UITextBox::UpdateProximity(float mouseX, float mouseY, float windowWidth, f
     }
 }
  
+void UITextBox::SetTargetVisibility(float visibility) 
+{ 
+    m_targetVisibility = visibility; 
+}
+
  void UITextBox::Draw(ID2D1RenderTarget* rt)
 {
     if (!rt || !m_textFormat) 
@@ -163,7 +191,7 @@ void UITextBox::UpdateProximity(float mouseX, float mouseY, float windowWidth, f
         if (bg)
             rt->FillRoundedRectangle(&rounded, bg.Get());
 
-        float borderAlpha = m_focused ? 1.0f : 0.45f;
+        float borderAlpha = m_focused ? 1.0f : 0.0f;
         ComPtr<ID2D1SolidColorBrush> borderBrush;
         rt->CreateSolidColorBrush(
             D2D1::ColorF(1.f, 1.f, 1.f, borderAlpha * m_visibility),
