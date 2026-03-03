@@ -43,14 +43,13 @@
 
 using Microsoft::WRL::ComPtr;
 
-struct ImageViewState
-{
+struct ImageViewState {
     float zoom;
-    float offsetX;
-    float offsetY;
+    float panX;        // image-center minus window-center, in pixels
+    float panY;
     float targetZoom;
-    float targetOffsetX;
-    float targetOffsetY;
+    float targetPanX;
+    float targetPanY;
     float rotation;
     float targetRotation;
 };
@@ -357,7 +356,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         BuildImageList(initialFile.c_str());
         LoadImageD2D(g_mainWindow, initialFile.c_str());
         EnterFullscreen(false, true);
-
     }
 
     HACCEL hAccelTable = LoadAccelerators(
@@ -398,6 +396,38 @@ shutdown:
     CoUninitialize();
     if (hMutex) CloseHandle(hMutex);
     return (int)msg.wParam;
+}
+
+static bool GetClientSizeF(HWND hWnd, float& outW, float& outH)
+{
+    RECT rc{};
+    if (!GetClientRect(hWnd, &rc)) return false;
+    outW = float(rc.right - rc.left);
+    outH = float(rc.bottom - rc.top);
+    return outW > 0.f && outH > 0.f;
+}
+
+static bool PanFromOffsets(HWND hWnd, float zoom, float offsetX, float offsetY, float imgW, float imgH, float& outPanX, float& outPanY)
+{
+    float winW = 0.f, winH = 0.f;
+    if (!GetClientSizeF(hWnd, winW, winH) || zoom <= 0.00001f) return false;
+
+    const float imgCenterX = offsetX + (imgW * zoom * 0.5f);
+    const float imgCenterY = offsetY + (imgH * zoom * 0.5f);
+
+    outPanX = imgCenterX - (winW * 0.5f);
+    outPanY = imgCenterY - (winH * 0.5f);
+    return true;
+}
+
+static bool OffsetsFromPan(HWND hWnd, float zoom, float imgW, float imgH, float panX, float panY, float& outOffsetX, float& outOffsetY)
+{
+    float winW = 0.f, winH = 0.f;
+    if (!GetClientSizeF(hWnd, winW, winH) || zoom <= 0.00001f) return false;
+
+    outOffsetX = (winW * 0.5f) + panX - (imgW * zoom * 0.5f);
+    outOffsetY = (winH * 0.5f) + panY - (imgH * zoom * 0.5f);
+    return true;
 }
 
 int GetMonitorRefreshRate(HWND hWnd)
@@ -748,12 +778,11 @@ bool CreateDefaultBackgroundBitmap()
 void SetZoomCentered(float newZoom, HWND hWnd, bool instant = false)
 {
     if (!g_d2dBitmap) return;
-    g_offsetX = 0.0f;
-    g_offsetY = 0.0f;
+
     RECT rc;
     GetClientRect(hWnd, &rc);
-    float windowWidth  = (float)(rc.right - rc.left);
-    float windowHeight = (float)(rc.bottom - rc.top);
+    float windowWidth  = float(rc.right - rc.left);
+    float windowHeight = float(rc.bottom - rc.top);
 
     D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
 
@@ -763,21 +792,20 @@ void SetZoomCentered(float newZoom, HWND hWnd, bool instant = false)
         g_zoom = newZoom;
         UpdateTargetZoom(newZoom);
 
-        g_offsetX = (windowWidth  - imgSize.width  * newZoom) / 2.0f;
-        g_offsetY = (windowHeight - imgSize.height * newZoom) / 2.0f;
+        g_offsetX = (windowWidth  - imgSize.width  * newZoom) * 0.5f;
+        g_offsetY = (windowHeight - imgSize.height * newZoom) * 0.5f;
 
         g_targetOffsetX = g_offsetX;
         g_targetOffsetY = g_offsetY;
-
         return;
     }
 
-    // Normal animated behavior (preserve center)
-    float centerX = g_offsetX + imgSize.width  * g_zoom / 2.0f;
-    float centerY = g_offsetY + imgSize.height * g_zoom / 2.0f;
+    // Preserve current on-screen image center
+    float centerX = g_offsetX + imgSize.width  * g_zoom * 0.5f;
+    float centerY = g_offsetY + imgSize.height * g_zoom * 0.5f;
 
-    g_targetOffsetX = centerX - (imgSize.width * newZoom) / 2.0f;
-    g_targetOffsetY = centerY - (imgSize.height * newZoom) / 2.0f;
+    g_targetOffsetX = centerX - imgSize.width  * newZoom * 0.5f;
+    g_targetOffsetY = centerY - imgSize.height * newZoom * 0.5f;
 
     UpdateTargetZoom(newZoom);
 }
@@ -904,8 +932,7 @@ void UpdateTargetZoom(float newZoom)
 void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
 {
     // Prevent duplicate first-stage calls
-    if (g_isFullscreen && needsDelay)
-        return;
+    if (g_isFullscreen && needsDelay) return;
 
     // ----------------------------------------
     // STAGE 1 — make main window fully transparent and wait for DWM
@@ -914,41 +941,56 @@ void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
     {
         g_isFullscreen = true;
 
-        SetWindowLong(
-            g_mainWindow,
-            GWL_EXSTYLE,
-            GetWindowLong(g_mainWindow, GWL_EXSTYLE) | WS_EX_LAYERED
-        );
+        SetWindowLong(g_mainWindow, GWL_EXSTYLE,
+            GetWindowLong(g_mainWindow, GWL_EXSTYLE) | WS_EX_LAYERED);
 
-        SetLayeredWindowAttributes(
-            g_mainWindow,
-            0,
-            0,
-            LWA_ALPHA
-        );
-
+        SetLayeredWindowAttributes(g_mainWindow, 0, 0, LWA_ALPHA);
         UpdateWindow(g_mainWindow);
 
-        // Give DWM time to settle before creating the overlay
         SetTimer(g_mainWindow, 8888, 150, nullptr);
-
         g_pendingPreserveView = preserveView;
         return;
+    }
+
+    // If we are preserving, compute whether the current view is "centered"
+    // using pan (imageCenter - windowCenter). pan==0 means centered for any window size.
+    float panX = 0.f, panY = 0.f;
+    float targetPanX = 0.f, targetPanY = 0.f;
+    bool havePan = false;
+    bool viewIsCentered = false;
+
+    if (preserveView && g_d2dBitmap)
+    {
+        D2D1_SIZE_F imgSizeMain = g_d2dBitmap->GetSize();
+
+        havePan =
+            PanFromOffsets(g_mainWindow, g_zoom, g_offsetX, g_offsetY,
+                           imgSizeMain.width, imgSizeMain.height, panX, panY) &&
+            PanFromOffsets(g_mainWindow, g_targetZoom, g_targetOffsetX, g_targetOffsetY,
+                           imgSizeMain.width, imgSizeMain.height, targetPanX, targetPanY);
+
+        if (havePan)
+        {
+            constexpr float EPS = 1.0f; // pixels
+            viewIsCentered =
+                (fabsf(panX) < EPS && fabsf(panY) < EPS &&
+                 fabsf(targetPanX) < EPS && fabsf(targetPanY) < EPS);
+        }
     }
 
     // ----------------------------------------
     // STAGE 2 — actual fullscreen overlay creation
     // ----------------------------------------
-
     CaptureDesktop(g_mainWindow);
 
-    // We'll be switching the render target to the overlay window, so discard current device resources
+    // Switching render targets -> discard device resources
     DiscardDeviceResources();
 
     g_overlayWindow = CreateOverlayWindow(g_mainWindow);
 
     // Create device resources for overlay now
     CreateRenderTarget(g_overlayWindow);
+
     if (g_renderTarget)
     {
         D2D1_SIZE_F size = g_renderTarget->GetSize();
@@ -970,20 +1012,39 @@ void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
     {
         g_needsFullscreenInit = false;
 
-        // Convert image position from main window → screen → overlay client
-        POINT pt = { (LONG)g_offsetX, (LONG)g_offsetY };
-        ClientToScreen(g_mainWindow, &pt);
-        ScreenToClient(g_overlayWindow, &pt);        
-        UpdateTargetZoom(g_zoom);
-        g_offsetX = (float)pt.x;
-        g_offsetY = (float)pt.y;
+        if (viewIsCentered && havePan && g_d2dBitmap)
+        {
+            // Center-relative preservation:
+            // recompute absolute offsets for the new render target from pan.
+            D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
 
-        g_targetOffsetX = g_offsetX;
-        g_targetOffsetY = g_offsetY;
+            OffsetsFromPan(g_overlayWindow, g_zoom,
+                           imgSize.width, imgSize.height,
+                           panX, panY, g_offsetX, g_offsetY);
+
+            OffsetsFromPan(g_overlayWindow, g_targetZoom,
+                           imgSize.width, imgSize.height,
+                           targetPanX, targetPanY, g_targetOffsetX, g_targetOffsetY);
+        }
+        else
+        {
+            // Screen-anchored preservation (your original behavior):
+            // Convert image position from main window → screen → overlay client
+            POINT pt = { (LONG)g_offsetX, (LONG)g_offsetY };
+            ClientToScreen(g_mainWindow, &pt);
+            ScreenToClient(g_overlayWindow, &pt);
+
+            UpdateTargetZoom(g_zoom);
+            g_offsetX = (float)pt.x;
+            g_offsetY = (float)pt.y;
+            g_targetOffsetX = g_offsetX;
+            g_targetOffsetY = g_offsetY;
+        }
     }
 
     ShowWindow(g_overlayWindow, SW_SHOW);
     UpdateWindow(g_overlayWindow);
+
     g_fullScreenInitDone = true;
     g_renderTargetWindow = g_overlayWindow;
 }
@@ -1244,6 +1305,7 @@ void RecreateImageBitmap()
 
     if (FAILED(hr))
     {
+           
         OutputDebugString(L"RecreateImageBitmap failed\n");
         g_d2dBitmap.Reset();
     }
@@ -1786,41 +1848,31 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 {
     if (!g_wicFactory || !filename || !*filename)
         return false;
-
+        
     // ------------------------------------------------------------
     // Save previous image state
     // ------------------------------------------------------------
-    if (!g_currentFilePath.empty())
+    if (!g_currentFilePath.empty() && g_d2dBitmap)
     {
-        RECT rc;
-        GetClientRect(hWnd, &rc);
+    
+        D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
 
-        float winW = float(rc.right - rc.left);
-        float winH = float(rc.bottom - rc.top);
+        float panX = 0.f, panY = 0.f;
+        float targetPanX = 0.f, targetPanY = 0.f;
 
-        if (winW > 0) {
-            g_offsetX /= winW;
-            g_targetOffsetX /= winW;
-        }
-
-        if (winH > 0) {
-            g_offsetY /= winH;
-            g_targetOffsetY /= winH;
-        }
-
-        g_imageStates[g_currentFilePath] =
+        if (PanFromOffsets(hWnd, g_zoom, g_offsetX, g_offsetY,
+                           imgSize.width, imgSize.height, panX, panY) &&
+            PanFromOffsets(hWnd, g_targetZoom, g_targetOffsetX, g_targetOffsetY,
+                           imgSize.width, imgSize.height, targetPanX, targetPanY))
         {
-            g_zoom,
-            g_offsetX,
-            g_offsetY,
-            g_targetZoom,
-            g_targetOffsetX,
-            g_targetOffsetY,
-            g_imageRotationAngle,
-            g_targetRotationAngle
-        };
+            g_imageStates[g_currentFilePath] = {
+                g_zoom, panX, panY,
+                g_targetZoom, targetPanX, targetPanY,
+                g_imageRotationAngle, g_targetRotationAngle
+            };
+        }
     }
-
+    
     // Clear previous state
     g_d2dBitmap.Reset();
     g_wicBitmapSource.Reset();
@@ -1829,7 +1881,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     g_isAnimatedGif = false;
     g_currentGifFrame = 0;
     g_lastGifFrameTime = 0;
-
+    
     // --------------------------------------------
     // Decode container
     // --------------------------------------------
@@ -1858,6 +1910,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     // --------------------------------------------
     // Small local helpers (avoid min/max macros)
     // --------------------------------------------
+    
 
     auto imin = [](int a, int b) { return (a < b) ? a : b; };
     auto imax = [](int a, int b) { return (a > b) ? a : b; };
@@ -2242,6 +2295,9 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
             g_gifFrameDelays.push_back(delayMs);
             prevDisposal = disposal;
             prevFrameRect = frameRect;
+
+            g_imageWidth  = (int)canvasW;
+            g_imageHeight = (int)canvasH;
         }
 
         if (g_gifFrames.empty())
@@ -2298,7 +2354,8 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
             {
                 WICRect rc{ 0,0,(INT)w,(INT)h };
                 Microsoft::WRL::ComPtr<IWICBitmapLock> lock;
-
+                g_imageWidth  = (int)w;
+                g_imageHeight = (int)h;
                 if (SUCCEEDED(cached->Lock(&rc, WICBitmapLockWrite, lock.GetAddressOf())) && lock)
                 {
                     UINT cb = 0; BYTE* data = nullptr; UINT stride = 0;
@@ -2329,32 +2386,31 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     // Restore state for new image (if exists)
     // ------------------------------------------------------------
     std::wstring newPath = filename;
-    auto it = g_imageStates.find(newPath);
 
-    if (it != g_imageStates.end())
+    auto it = g_imageStates.find(newPath);
+            
+    if (it != g_imageStates.end() && g_d2dBitmap)
     {
+        
+
         const ImageViewState& s = it->second;
 
         g_zoom = s.zoom;
-        g_offsetX = s.offsetX;
-        g_offsetY = s.offsetY;
         UpdateTargetZoom(s.targetZoom);
-        g_targetOffsetX = s.targetOffsetX;
-        g_targetOffsetY = s.targetOffsetY;
+
+        D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+
+        // Convert stored pan back into absolute offsets for THIS render target
+        OffsetsFromPan(hWnd, g_zoom, imgSize.width, imgSize.height,
+                       s.panX, s.panY, g_offsetX, g_offsetY);
+
+        OffsetsFromPan(hWnd, g_targetZoom, imgSize.width, imgSize.height,
+                       s.targetPanX, s.targetPanY, g_targetOffsetX, g_targetOffsetY);
+
         g_imageRotationAngle = s.rotation;
         g_targetRotationAngle = s.targetRotation;
+
         g_restoredStateThisLoad = true;
-        RECT rc;
-        GetClientRect(hWnd, &rc);
-
-        float winW = float(rc.right - rc.left);
-        float winH = float(rc.bottom - rc.top);
-
-        g_offsetX *= winW;
-        g_targetOffsetX *= winW;
-
-        g_offsetY *= winH;
-        g_targetOffsetY *= winH;
     }
     else
     {
@@ -2363,17 +2419,13 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     // Update current path
     g_currentFilePath = newPath;
     size_t slash = g_currentFilePath.find_last_of(L"\\/");
+
     if (slash != std::wstring::npos)
         g_currentFileName = g_currentFilePath.substr(slash + 1);
     else
         g_currentFileName = g_currentFilePath;
 
-    D2D1_SIZE_F size = g_d2dBitmap->GetSize();
-
-    g_imageWidth  = (int)size.width;
-    g_imageHeight = (int)size.height;
-    
-    std::wstring text =
+     std::wstring text =
         g_currentFileName +
         L" (" +
         std::to_wstring(g_imageWidth) +
@@ -2552,6 +2604,7 @@ void MakeZoomVisible(HWND hWnd)
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+
     switch (message)
     {
     case WM_ERASEBKGND:
@@ -2885,13 +2938,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     break;
 
     case WM_CHAR:
+    {
         for (auto& [id, box] : g_textBoxes)
             box.OnChar((wchar_t)wParam);
-        break;
-
-        for (auto& [id, box] : g_textBoxes)
-            box.OnKeyDown(wParam);
-
+    }
+    break;
 
     case WM_KEYDOWN:
     {   
