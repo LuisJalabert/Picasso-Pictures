@@ -58,6 +58,16 @@ struct ImageViewState {
 int TEXTBOX_FILE_NAME = 0;
 int TEXTBOX_ZOOM_INPUT = 1;
 
+// Control IDs for buttons
+
+int BUTTON_ZOOM_11 = 0;
+int BUTTON_ZOOM_IN = 1;
+int BUTTON_ZOOM_OUT = 2;
+int BUTTON_ROTATE_LEFT = 3;
+int BUTTON_ROTATE_RIGHT = 4;
+int BUTTON_PREVIOUS = 5;
+int BUTTON_NEXT = 6;
+int BUTTON_EXIT = 7;
 
 // Global Variables:
 HINSTANCE                                           hInst;                              // current instance
@@ -86,7 +96,6 @@ ComPtr<ID2D1Bitmap>                                 g_backgroundBitmap;         
 ComPtr<IWICBitmap>                                  g_wicBackground;                    // Device-independent captured background (WIC)
 ComPtr<IWICBitmapSource>                            g_wicDefaultBackground;
 ComPtr<ID2D1Bitmap>                                 g_defaultBackgroundBitmap;
-std::vector<AnimatedButton>                         g_buttons;                          // Animated button instances
 bool                                                g_needsFullscreenInit = false;
 float                                               g_overlayAlpha = 0.0f;
 HWND                                                g_overlayWindow = nullptr;
@@ -123,7 +132,7 @@ ComPtr<IDXGISwapChain1>                             g_swapChain;
 ComPtr<ID2D1Bitmap1>                                g_d2dTargetBitmap;
 ComPtr<ID2D1Effect>                                 g_shadowEffect;
 std::unordered_map<int, UITextBox>                  g_textBoxes;
-
+std::unordered_map<int, AnimatedButton>             g_buttons;
 
 // Forward declarations of functions included in this code module:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -145,10 +154,9 @@ bool IsSupportedImage(const std::wstring& path);
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow);
 HWND CreateOverlayWindow(HWND parent);
 bool CreateDefaultBackgroundBitmap();
-void SetZoomCentered(float newZoom, HWND hWnd, bool instant);
+void SetZoomCentered(float newZoom, HWND hWnd, bool instant, bool preserveCenter);
 void CaptureDesktop(HWND hWnd);
-void FitToWindowRelative(HWND hWnd, float zoom);
-void FitWindowToImage(HWND hWnd);
+void FitToWindowRelative(HWND hWnd, float zoom, bool preserveCenter);
 bool CreateBackgroundBitmap();
 void InitializeButtons();
 void InitializeImageInfoLabel();
@@ -617,7 +625,7 @@ void UpdateEngine(float dt)
     auto currentTime = std::chrono::high_resolution_clock::now();
     float deltaTime = std::chrono::duration<float>(currentTime - previousTime).count();
     previousTime = currentTime;
-    for (auto& btn : g_buttons)
+    for (auto& [id, btn] : g_buttons)
         btn.Update(deltaTime);
 
     for (auto& [id, txt] : g_textBoxes)
@@ -775,7 +783,7 @@ bool CreateDefaultBackgroundBitmap()
     );
 }
 
-void SetZoomCentered(float newZoom, HWND hWnd, bool instant = false)
+void SetZoomCentered(float newZoom, HWND hWnd, bool instant, bool preserveCenter)
 {
     if (!g_d2dBitmap) return;
 
@@ -786,9 +794,28 @@ void SetZoomCentered(float newZoom, HWND hWnd, bool instant = false)
 
     D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
 
+    if (!preserveCenter)
+    {
+        // Always center in window
+        g_targetOffsetX = (windowWidth  - imgSize.width  * newZoom) * 0.5f;
+        g_targetOffsetY = (windowHeight - imgSize.height * newZoom) * 0.5f;
+
+        UpdateTargetZoom(newZoom);
+
+        if (instant)
+        {
+            g_zoom = newZoom;
+            g_offsetX = g_targetOffsetX;
+            g_offsetY = g_targetOffsetY;
+        }
+
+        return;
+    }
+
+    // ---- Existing behavior: preserve current on-screen center ----
+
     if (instant)
     {
-        // Hard center in window
         g_zoom = newZoom;
         UpdateTargetZoom(newZoom);
 
@@ -800,7 +827,6 @@ void SetZoomCentered(float newZoom, HWND hWnd, bool instant = false)
         return;
     }
 
-    // Preserve current on-screen image center
     float centerX = g_offsetX + imgSize.width  * g_zoom * 0.5f;
     float centerY = g_offsetY + imgSize.height * g_zoom * 0.5f;
 
@@ -846,7 +872,7 @@ void CaptureDesktop(HWND hWnd)
     ReleaseDC(nullptr, screenDC);
 }
 
-void FitToWindowRelative(HWND hWnd, float zoom)
+void FitToWindowRelative(HWND hWnd, float zoom, bool preserveCenter = true)
 {
     if (!g_d2dBitmap) return;
 
@@ -863,42 +889,7 @@ void FitToWindowRelative(HWND hWnd, float zoom)
 
     float scale = min(scaleX, scaleY)*zoom;
 
-    SetZoomCentered(scale, hWnd);
-}
-
-void FitWindowToImage(HWND hWnd)
-{
-    if (!g_d2dBitmap)
-        return;
-
-    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
-
-    // Desired CLIENT size
-    RECT rc = {};
-    rc.left   = 0;
-    rc.top    = 0;
-    rc.right  = (LONG)imgSize.width;
-    rc.bottom = (LONG)imgSize.height;
-
-    // Convert client size to full window size
-    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, TRUE);
-
-    // Keep current window position
-    RECT current;
-    GetWindowRect(hWnd, &current);
-
-    SetWindowPos(
-        hWnd,
-        nullptr,
-        current.left,
-        current.top,
-        rc.right - rc.left,
-        rc.bottom - rc.top,
-        SWP_NOZORDER
-    );
-
-    // Reset zoom to 1:1
-    SetZoomCentered(1.0f, hWnd, true);
+    SetZoomCentered(scale, hWnd, false, preserveCenter);
 }
 
 bool CreateBackgroundBitmap()
@@ -1095,6 +1086,20 @@ void ExitFullscreen()
     float clientWidth  = visibleRight  - visibleLeft;
     float clientHeight = visibleBottom - visibleTop;
 
+    const float MIN_CLIENT_W = 600.0f;
+    const float MIN_CLIENT_H = 400.0f;
+    
+    float oldClientW = clientWidth;
+    float oldClientH = clientHeight;
+
+    clientWidth  = max(clientWidth,  MIN_CLIENT_W);
+    clientHeight = max(clientHeight, MIN_CLIENT_H);
+    float extraW = clientWidth  - oldClientW;
+    float extraH = clientHeight - oldClientH;
+
+    visibleLeft -= extraW * 0.5f;
+    visibleTop  -= extraH * 0.5f;
+
     // Adjust new position using visible region
     int newX = overlayRect.left + (int)visibleLeft;
     int newY = overlayRect.top  + (int)visibleTop;
@@ -1133,8 +1138,13 @@ void ExitFullscreen()
     );
 
     // Snap offsets/targets to final state for the new (cropped) client area
+
     g_offsetX = offsetCorrectionX;
     g_offsetY = offsetCorrectionY;
+
+    
+    g_offsetX = (clientWidth  - imgSize.width  * g_zoom) * 0.5f;
+    g_offsetY = (clientHeight - imgSize.height * g_zoom) * 0.5f;
 
     g_targetOffsetX = g_offsetX;
     g_targetOffsetY = g_offsetY;
@@ -1159,8 +1169,8 @@ void ExitFullscreen()
     RedrawWindow(g_mainWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
 
     // Update button and text layouts for the new render target
-    for (auto& button : g_buttons)
-        button.UpdateLayout(g_renderTarget.Get());
+    for (auto& [id, btn] : g_buttons)
+        btn.UpdateLayout(g_renderTarget.Get());
 
     for (auto& [key, textbox] : g_textBoxes)
         textbox.UpdateLayout(g_renderTarget.Get());
@@ -1397,43 +1407,44 @@ void InitializeButtons()
     // -------------------------
     AnimatedButton::Config buttonConfig;
 
-    buttonConfig.id = AnimatedButton::BUTTON_ZOOM_11;
-    buttonConfig.relativeX = 0.5f;
-    buttonConfig.relativeY = 0.96f;
-    buttonConfig.width = width;
-    buttonConfig.height = height;
+    buttonConfig.layout.x.value = 0.5f;
+    buttonConfig.layout.x.anchor = AnimatedButton::Anchor::OffsetFromCenter;
+    buttonConfig.layout.x.mode = AnimatedButton::PosMode::Normalized;
+    buttonConfig.layout.y.value = 0.96f;
+    buttonConfig.layout.y.anchor = AnimatedButton::Anchor::OffsetFromEnd;
+    buttonConfig.layout.y.mode = AnimatedButton::PosMode::Normalized;
+    buttonConfig.layout.width = width;
+    buttonConfig.layout.height = height;
     buttonConfig.fontSize = fontSize * 1.1f;
     buttonConfig.text = L"1:1";
-    buttonConfig.activationZone = bottomActivationZone;
-    buttonConfig.uiPixelScale = g_uiPixelScale;
+    buttonConfig.layout.activationZone = bottomActivationZone;
+    buttonConfig.layout.uiPixelScale = g_uiPixelScale;
     D2D1_SIZE_F size = g_renderTarget->GetSize();
 
-    buttonConfig.referenceWidth  = size.width;
-    buttonConfig.referenceHeight = size.height;
-    buttonConfig.uiPixelScale    = min(size.width, size.height);
+    buttonConfig.layout.referenceWidth  = size.width;
+    buttonConfig.layout.referenceHeight = size.height;
+    buttonConfig.layout.uiPixelScale    = min(size.width, size.height);
 
-    g_buttons.emplace_back();
-    g_buttons.back().Initialize(
+    g_buttons[BUTTON_ZOOM_11].Initialize(
         g_renderTarget.Get(),
         g_dwriteFactory.Get(),
         buttonConfig,
         []()
         {
             MakeZoomVisible(g_renderTargetWindow);
-            SetZoomCentered(1.0f, g_renderTargetWindow, true);
+            SetZoomCentered(1.0f, g_renderTargetWindow, false, false);
         });
-    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+    g_buttons[BUTTON_ZOOM_11].UpdateLayout(g_renderTarget.Get());
 
+ 
     // -------------------------
     // Zoom In Button
     // -------------------------
-    buttonConfig.id = AnimatedButton::BUTTON_ZOOM_IN;
-    buttonConfig.relativeX = 0.52f;
+    buttonConfig.layout.x.value = 0.52f;
     buttonConfig.fontSize = fontSize;
     buttonConfig.text = L"\u2795";
 
-    g_buttons.emplace_back();
-    g_buttons.back().Initialize(
+    g_buttons[BUTTON_ZOOM_IN].Initialize(
         g_renderTarget.Get(),
         g_dwriteFactory.Get(),
         buttonConfig,
@@ -1443,18 +1454,16 @@ void InitializeButtons()
             MakeZoomVisible(g_renderTargetWindow);
 
         });
-    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+    g_buttons[BUTTON_ZOOM_IN].UpdateLayout(g_renderTarget.Get());
 
     // -------------------------
     // Zoom Out Button
     // -------------------------
 
-    buttonConfig.id = AnimatedButton::BUTTON_ZOOM_OUT;
-    buttonConfig.relativeX = 0.48f;
+    buttonConfig.layout.x.value = 0.48f;
     buttonConfig.text = L"\u2796";
 
-    g_buttons.emplace_back();
-    g_buttons.back().Initialize(
+    g_buttons[BUTTON_ZOOM_OUT].Initialize(
         g_renderTarget.Get(),
         g_dwriteFactory.Get(),
         buttonConfig,
@@ -1463,19 +1472,17 @@ void InitializeButtons()
             ZoomIntoImage(g_renderTargetWindow, -250, nullptr);
             MakeZoomVisible(g_renderTargetWindow);
         });
-    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+    g_buttons[BUTTON_ZOOM_OUT].UpdateLayout(g_renderTarget.Get());
 
     // -------------------------
     // Rotate Left Button
     // -------------------------
 
-    buttonConfig.id = AnimatedButton::BUTTON_ROTATE_LEFT;
-    buttonConfig.relativeX = 0.46f;
+    buttonConfig.layout.x.value = 0.46f;
     buttonConfig.fontSize = fontSize * 1.2f;
     buttonConfig.text = L"\u2B6F";
 
-    g_buttons.emplace_back();
-    g_buttons.back().Initialize(
+    g_buttons[BUTTON_ROTATE_LEFT].Initialize(
         g_renderTarget.Get(),
         g_dwriteFactory.Get(),
         buttonConfig,
@@ -1483,18 +1490,16 @@ void InitializeButtons()
         {
             g_targetRotationAngle -= 90.0f;
         });
-    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+    g_buttons[BUTTON_ROTATE_LEFT].UpdateLayout(g_renderTarget.Get());
 
     // -------------------------
     // Rotate Right Button
     // -------------------------
 
-    buttonConfig.id = AnimatedButton::BUTTON_ROTATE_RIGHT;
-    buttonConfig.relativeX = 0.54f;
+    buttonConfig.layout.x.value = 0.54f;
     buttonConfig.text = L"\u2B6E";
 
-    g_buttons.emplace_back();
-    g_buttons.back().Initialize(
+    g_buttons[BUTTON_ROTATE_RIGHT].Initialize(
         g_renderTarget.Get(),
         g_dwriteFactory.Get(),
         buttonConfig,
@@ -1502,18 +1507,16 @@ void InitializeButtons()
         {
             g_targetRotationAngle += 90.0f;
         });
-    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+    g_buttons[BUTTON_ROTATE_RIGHT].UpdateLayout(g_renderTarget.Get());
 
     // -------------------------
     // Previous Image Button
     // -------------------------
-    buttonConfig.id = AnimatedButton::BUTTON_PREVIOUS;
-    buttonConfig.relativeX = 0.44f;
+    buttonConfig.layout.x.value = 0.44f;
     buttonConfig.fontSize = fontSize * 1.3f;
     buttonConfig.text = L"\u2B9C";
 
-    g_buttons.emplace_back();
-    g_buttons.back().Initialize(
+    g_buttons[BUTTON_PREVIOUS].Initialize(
         g_renderTarget.Get(),
         g_dwriteFactory.Get(),
         buttonConfig,
@@ -1521,18 +1524,16 @@ void InitializeButtons()
         {
             OpenPrevImage(g_renderTargetWindow );
         });
-    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+    g_buttons[BUTTON_PREVIOUS].UpdateLayout(g_renderTarget.Get());
 
     // -------------------------
     // Next Image Button
     // -------------------------
 
-    buttonConfig.id = AnimatedButton::BUTTON_NEXT;
-    buttonConfig.relativeX = 0.56f;
+    buttonConfig.layout.x.value = 0.56f;
     buttonConfig.text = L"\u2B9E";
     
-    g_buttons.emplace_back();
-    g_buttons.back().Initialize(
+    g_buttons[BUTTON_NEXT].Initialize(
         g_renderTarget.Get(),
         g_dwriteFactory.Get(),
         buttonConfig,
@@ -1540,7 +1541,7 @@ void InitializeButtons()
         {
             OpenNextImage(g_renderTargetWindow );
         });
-    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+    g_buttons[BUTTON_NEXT].UpdateLayout(g_renderTarget.Get());
 
     // -------------------------
     // Exit Button
@@ -1555,17 +1556,15 @@ void InitializeButtons()
     float right = 1.0f - top * 9.0f / 16.0f;
 
     AnimatedButton::Config exitConfig;
-    exitConfig.id = AnimatedButton::BUTTON_EXIT;
-    exitConfig.relativeX = right;
-    exitConfig.relativeY = top;
-    exitConfig.width = 0.036f;
-    exitConfig.height = 0.036f;
+    exitConfig.layout.x.value = right;
+    exitConfig.layout.y.value = top;
+    exitConfig.layout.width = 0.036f;
+    exitConfig.layout.height = 0.036f;
     exitConfig.fontSize = 0.016f;
     exitConfig.text = L"\u274C";
-    exitConfig.activationZone = topRightActivationZone;
+    exitConfig.layout.activationZone = topRightActivationZone;
 
-    g_buttons.emplace_back();
-    g_buttons.back().Initialize(
+    g_buttons[BUTTON_EXIT].Initialize(
         g_renderTarget.Get(),
         g_dwriteFactory.Get(),
         exitConfig,
@@ -1589,12 +1588,11 @@ void InitializeButtons()
             g_targetZoom = 0.0005f;
             g_isExiting = true;
         });
-    g_buttons.back().UpdateLayout(g_renderTarget.Get());
+    g_buttons[BUTTON_EXIT].UpdateLayout(g_renderTarget.Get());
 }
 
 void InitializeImageInfoLabel()
 {
-
     // Filename display.
     UITextBox::ActivationZone zone;
     zone.left   = 0.0f;
@@ -1603,22 +1601,31 @@ void InitializeImageInfoLabel()
     zone.bottom = 1.0f;
 
     UITextBox::Config config;
-    config.relativeX = 0.5f;
-    config.relativeY = 0.92f;
-    config.relativeFontSize = 0.012f;
+    D2D1_SIZE_F size = g_renderTarget->GetSize();
 
-    config.width  = 0.6f;      // wide enough for filenames
-    config.height = 0.05f;
+    config.layout.referenceWidth  = size.width;
+    config.layout.referenceHeight = size.height;
+    config.layout.x.value = 0.5f;
+    config.layout.x.anchor = UITextBox::Anchor::OffsetFromCenter;
+    config.layout.x.mode = UITextBox::PosMode::Normalized;
+    config.layout.y.value = 0.92f;
+    config.layout.y.anchor = UITextBox::Anchor::OffsetFromEnd;
+    config.layout.x.mode = UITextBox::PosMode::Normalized;
+
+    config.relativeFontSize = 0.012f;
+    config.layout.width  = 0.6f;      // wide enough for filenames
+    config.layout.height = 0.05f;
 
     config.backgroundAlpha = 0.0f;   // no box
     config.isEditable = false;      // display only
 
-    config.activationZone = zone;
+    config.layout.activationZone = zone;
 
-    config.uiPixelScale = g_uiPixelScale;
+    config.layout.uiPixelScale = g_uiPixelScale;
 
     g_textBoxes[TEXTBOX_FILE_NAME].Initialize(
         g_dwriteFactory.Get(),
+        g_renderTarget.Get(),
         config,
         nullptr);
     g_textBoxes[TEXTBOX_FILE_NAME].UpdateLayout(g_renderTarget.Get());
@@ -1628,20 +1635,22 @@ void InitializeImageInfoLabel()
     zone.right  = 0.6f;
     zone.top    = 0.4f;
     zone.bottom = 0.6f;
-    config.activationZone = zone;
-    config.relativeX = 0.5;
-    config.relativeY = 0.5f;
-    config.width = 0.05f;
-    config.height = 0.025f;
+    config.layout.activationZone = zone;
+    config.layout.x.value = 0.5;
+    config.layout.y.value = 0.5f;
+    config.layout.y.anchor = UITextBox::Anchor::OffsetFromCenter;
+    config.layout.width = 0.05f;
+    config.layout.height = 0.025f;
     config.backgroundAlpha = 0.5f; // semi-transparent box for zoom display
     config.isEditable = true;
     config.inputMode = UITextBox::InputMode::NumericFloat;
     g_textBoxes[TEXTBOX_ZOOM_INPUT].Initialize(
         g_dwriteFactory.Get(),
+        g_renderTarget.Get(),
         config,
         [](const std::wstring& text)
             {
-                if (text.empty())
+              if (text.empty())
                     return;
 
                 try
@@ -1698,7 +1707,7 @@ void Render(HWND hWnd)
     if (g_isFullscreen)
         g_renderTarget->Clear(D2D1::ColorF(0, 0, 0, 0.6f));
     else
-        g_renderTarget->Clear(D2D1::ColorF(0.7f, 0.7f, 0.7f));
+        g_renderTarget->Clear(D2D1::ColorF(0.4f, 0.4f, 0.4f));
 
     if (g_needsFullscreenInit)
     {
@@ -1812,14 +1821,14 @@ void Render(HWND hWnd)
 
     // Draw UI buttons
 
-    std::wstring text = std::to_wstring(int(g_zoom*100));
+    std::wstring text = std::to_wstring(int(std::round(g_zoom*100)));
     if (!g_textBoxes[TEXTBOX_ZOOM_INPUT].IsFocused())
         g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(text);
 
-    for (auto& btn : g_buttons)
+    for (auto& [id, btn] : g_buttons)
     {
-        if (!g_isFullscreen && btn.GetId() == AnimatedButton::BUTTON_EXIT)
-                continue;
+        if (!g_isFullscreen && id == BUTTON_EXIT)
+            continue;
 
         btn.Draw(g_renderTarget.Get());
     }
@@ -2425,12 +2434,24 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     else
         g_currentFileName = g_currentFilePath;
 
-     std::wstring text =
+    uintmax_t bytes = std::filesystem::file_size(g_currentFileName);
+    wchar_t buffer[64];
+    if (bytes < 1024)
+        swprintf(buffer, 64, L"%llu B", bytes);
+    else if (bytes < 1024 * 1024)
+        swprintf(buffer, 64, L"%.1f KB", bytes / 1024.0);
+    else
+        swprintf(buffer, 64, L"%.2f MB", bytes / (1024.0 * 1024.0));
+
+
+    std::wstring text =
         g_currentFileName +
         L" (" +
         std::to_wstring(g_imageWidth) +
         L" x " +
         std::to_wstring(g_imageHeight) +
+        L", " +
+        buffer +
         L")";
 
     g_textBoxes[TEXTBOX_FILE_NAME].SetText(text);
@@ -2626,7 +2647,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 if (LoadImageD2D(g_mainWindow, incomingPath))
                 {
                     // Use existing logic to enter fullscreen and display
-                    EnterFullscreen(false, true);
+                    EnterFullscreen(true, true);
                     // Bring ourselves to front (safe way)
                     if (IsIconic(hWnd))
                         ShowWindow(hWnd, SW_RESTORE);
@@ -2744,8 +2765,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     &g_d2dTargetBitmap)))
             {
                 g_renderTarget->SetTarget(g_d2dTargetBitmap.Get());
+                for (auto& [id, btn] : g_buttons)
+                    btn.UpdateLayout(g_renderTarget.Get());
+
+                for (auto& [key, textbox] : g_textBoxes)
+                    textbox.UpdateLayout(g_renderTarget.Get());
             }
         }
+
+ 
+        if (g_d2dBitmap)
+        {
+            if (wParam == SIZE_MAXIMIZED || wParam == SIZE_RESTORED)
+            {
+                // Recenter image for new window size
+                SetZoomCentered(g_zoom, hWnd, true, false);
+            }
+        }
+
+        //return DefWindowProc(hWnd, message, wParam, lParam);
+  
     }
     break;
 
@@ -2769,7 +2808,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         float x = GET_X_LPARAM(lParam);
         float y = GET_Y_LPARAM(lParam);
 
-        for (auto& btn : g_buttons)
+        for (auto& [id, btn] : g_buttons)
+
         {
             if (btn.OnMouseDown(x, y))
                 return 0;  // STOP — button handled it
@@ -2811,7 +2851,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             ExitFullscreen();
         }
 
-        for (auto& btn : g_buttons)
+        for (auto& [id, btn] : g_buttons)
         {
             btn.OnMouseUp(x, y);
         }
@@ -2834,7 +2874,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         GetClientRect(hWnd, &rc);
         float windowWidth   = (float)(rc.right - rc.left);
         float windowHeight  = (float)(rc.bottom - rc.top);
-        for (auto& btn : g_buttons)
+        for (auto& [id, btn] : g_buttons)
             btn.UpdateProximity(pt.x, pt.y, windowWidth, windowHeight);
 
         for (auto& [id, txt] : g_textBoxes)
@@ -2874,7 +2914,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         float x = GET_X_LPARAM(lParam);
         float y = GET_Y_LPARAM(lParam);
 
-        for (auto& btn : g_buttons)
+        for (auto& [id, btn] : g_buttons)
         {
             if (btn.OnMouseDown(x, y))
                 return 0;  // STOP — button handled it
@@ -2901,14 +2941,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             if (overImage)
             {
                 if (g_targetZoom == 1.0f)
-                    FitToWindowRelative(g_overlayWindow, 0.96f);
+                    FitToWindowRelative(g_overlayWindow, 0.96f, false);
                 else
-                    SetZoomCentered(1.0f, g_overlayWindow);
+                    SetZoomCentered(1.0f, g_overlayWindow, false, false);
             }
         }
     }
     break;
-
+    
     case WM_TIMER:
     {
         if (wParam == 8888)
@@ -2958,6 +2998,56 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         switch (wParam)
         {
+            case VK_DELETE:
+            {
+                if (g_currentImageIndex < 0 || g_currentImageIndex >= (int)g_imageFiles.size())
+                    return 0;
+
+                std::wstring fileToDelete = g_imageFiles[g_currentImageIndex];
+
+                bool shiftHeld = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                bool success = false;
+
+                if (shiftHeld)
+                {
+                    // Permanent delete
+                    success = std::filesystem::remove(fileToDelete);
+                }
+                else
+                {
+                    // Send to recycle bin
+                    SHFILEOPSTRUCTW op = {};
+                    std::wstring from = fileToDelete + L'\0';
+
+                    op.wFunc = FO_DELETE;
+                    op.pFrom = from.c_str();
+                    op.fFlags =
+                        FOF_ALLOWUNDO |       // recycle bin
+                        FOF_NOCONFIRMATION |
+                        FOF_SILENT;
+
+                    success = (SHFileOperationW(&op) == 0);
+                }
+
+                if (success)
+                {
+                    g_imageFiles.erase(g_imageFiles.begin() + g_currentImageIndex);
+
+                    if (g_imageFiles.empty())
+                    {
+                        g_currentImageIndex = -1;
+                        ExitFullscreen();
+                        return 0;
+                    }
+
+                    if (g_currentImageIndex >= (int)g_imageFiles.size())
+                        g_currentImageIndex = (int)g_imageFiles.size() - 1;
+
+                    LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
+                }
+                return 0;
+            } 
+            break;
             case VK_ESCAPE:
             {
                 if (!g_d2dBitmap)
@@ -3067,9 +3157,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     EnterFullscreen();
                     return 0;
                 }
-            case SC_RESTORE:
-                ExitFullscreen(); // optional
-                return 0;
 
             default:
                 // Let Windows handle all other system commands (menus, icon clicks, etc.)

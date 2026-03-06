@@ -1,73 +1,46 @@
 #include "UITextBox.h"
-#include <algorithm>
+#include <cwctype>
+#include <cmath>
 
-using namespace Microsoft::WRL;
+using Microsoft::WRL::ComPtr;
 
-
-bool UITextBox::Initialize(
-    IDWriteFactory* factory,
-    const Config& config,
-    Callback callback)
+bool UITextBox::Initialize( IDWriteFactory* factory,
+                            ID2D1RenderTarget* renderTarget,
+                            const Config& config, 
+                            Callback callback)
 {
-    m_factory = factory;
+    if (!factory)
+        return false;
+
     m_config = config;
-    m_callback = callback;
+    m_callback = std::move(callback);
+    m_factory = factory;
+
+    SetLayout(m_config.layout);
+
+    // Pixel sizes from uiPixelScale (matches your current approach)
+    const float wPx = m_config.layout.uiPixelScale * m_config.layout.width;
+    const float hPx = m_config.layout.uiPixelScale * m_config.layout.height;
+    SetPixelSize(wPx, hPx);
+
+    // capture anchor offsets once, from reference size
+    const auto rtSize = renderTarget->GetSize();
+    m_lastRTW = rtSize.width;
+    m_lastRTH = rtSize.height;
+
+    // Capture anchors based on reference size (only once)
+    CaptureAnchorsOnce(m_lastRTW, m_lastRTH);
+    m_pixelFontSize = m_config.layout.uiPixelScale * m_config.relativeFontSize;
+    UpdateLayout(renderTarget);
+    EnsureTextFormat();
+
     return true;
 }
 
-void UITextBox::UpdateLayout(ID2D1RenderTarget* rt)
+void UITextBox::EnsureTextFormat()
 {
-    if (!rt || !m_factory)
+    if (!m_factory)
         return;
-
-    D2D1_SIZE_F rtSize = rt->GetSize();
-
-    //
-    // ---- CAPTURE FULLSCREEN LAYOUT ONCE ----
-    //
-    if (!m_layoutCaptured)
-    {
-        float fsWidth  = rtSize.width;
-        float fsHeight = rtSize.height;
-
-        float centerX = fsWidth  * m_config.relativeX;
-        float centerY = fsHeight * m_config.relativeY;
-
-        float pixelWidth    = m_config.uiPixelScale * m_config.width;
-        float pixelHeight   = m_config.uiPixelScale * m_config.height;
-        float pixelFontSize = m_config.uiPixelScale * m_config.relativeFontSize;
-
-        m_pixelWidth    = pixelWidth;
-        m_pixelHeight   = pixelHeight;
-        m_pixelFontSize = pixelFontSize;
-
-        // Store horizontal offset from center
-        m_groupRelativeCenterX = centerX - (fsWidth * 0.5f);
-
-        // Store bottom offset
-        float bottomEdge = centerY + (pixelHeight * 0.5f);
-        m_bottomOffset = fsHeight - bottomEdge;
-
-        m_layoutCaptured = true;
-    }
-
-    //
-    // ---- REPOSITION USING STORED PIXEL VALUES ----
-    //
-
-    float newCenterX = (rtSize.width * 0.5f) + m_groupRelativeCenterX;
-    float newBottomEdge = rtSize.height - m_bottomOffset;
-    float newCenterY = newBottomEdge - (m_pixelHeight * 0.5f);
-
-    m_rect = D2D1::RectF(
-        newCenterX - m_pixelWidth * 0.5f,
-        newCenterY - m_pixelHeight * 0.5f,
-        newCenterX + m_pixelWidth * 0.5f,
-        newCenterY + m_pixelHeight * 0.5f);
-
-    //
-    // ---- TEXT FORMAT (font size stays fixed) ----
-    //
 
     m_textFormat.Reset();
 
@@ -79,75 +52,40 @@ void UITextBox::UpdateLayout(ID2D1RenderTarget* rt)
         DWRITE_FONT_STRETCH_NORMAL,
         m_pixelFontSize,
         L"",
-        &m_textFormat);
+        m_textFormat.GetAddressOf());
 
-    if (SUCCEEDED(hr) && m_textFormat)
-    {
-        m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    }
+    if (FAILED(hr) || !m_textFormat)
+        return;
+
+    m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 }
 
-void UITextBox::SetForcedVisibility(bool forced){
-    m_forcedVisibility = forced; 
-    if (m_forcedVisibility)
-    {
-        m_targetVisibility = 1.f; // Ensure it becomes visible
-    } 
-    else
-    {
-        m_targetVisibility = 0.f; // Allow it to fade out
-    }
-}
-
-void UITextBox::UpdateVisibility(float fallOff)
+void UITextBox::UpdateLayout(ID2D1RenderTarget* renderTarget)
 {
-    float effectiveTarget = m_targetVisibility;
+    if (!renderTarget)
+        return;
 
-    if (m_forcedVisibility || m_focused)
-    {
-        // Prevent decreasing visibility
-        if (effectiveTarget < m_visibility)
-            effectiveTarget = m_visibility;
-    }
+    const auto rtSize = renderTarget->GetSize();
 
-    m_visibility += (effectiveTarget - m_visibility) * fallOff;
+    // If uiPixelScale changed (e.g. different monitor or orientation),
+    // update pixel size + text format.
+    const float wPx = m_config.layout.uiPixelScale * m_config.layout.width;
+    const float hPx = m_config.layout.uiPixelScale * m_config.layout.height;
 
-    // ---- Focus pulse animation ----
-    if (m_focused && m_selectAllOnFocus)
+    if (std::fabs(wPx - GetPixelWidth()) > 0.5f || std::fabs(hPx - GetPixelHeight()) > 0.5f)
     {
-        m_focusPulseTime += 0.016f; // approx 60 FPS
+        SetPixelSize(wPx, hPx);
+        EnsureTextFormat();
     }
-    else
+    if (!m_xCache.captured || !m_yCache.captured)
     {
-        m_focusPulseTime = 0.f;
+        CaptureAnchorsOnce(rtSize.width, rtSize.height);
     }
+    UpdateLayoutForSize(rtSize.width, rtSize.height);
 }
 
-void UITextBox::UpdateProximity(float mouseX, float mouseY, float windowWidth, float windowHeight)
-{
-    float left   = windowWidth  * m_config.activationZone.left;
-    float top    = windowHeight * m_config.activationZone.top;
-    float right  = windowWidth  * m_config.activationZone.right;
-    float bottom = windowHeight * m_config.activationZone.bottom;
-
-    if (mouseX >= left && mouseX <= right &&
-        mouseY >= top  && mouseY <= bottom)
-    {
-        m_targetVisibility = 1.f;
-    }
-    else
-    {
-        m_targetVisibility = 0.f;
-    }
-}
- 
-void UITextBox::SetTargetVisibility(float visibility) 
-{ 
-    m_targetVisibility = visibility; 
-}
-
- void UITextBox::Draw(ID2D1RenderTarget* rt)
+void UITextBox::Draw(ID2D1RenderTarget* rt)
 {
     if (!rt || !m_textFormat) 
         return;
@@ -155,14 +93,12 @@ void UITextBox::SetTargetVisibility(float visibility)
     if (m_visibility <= 0.01f) 
         return;
 
-    //
     // ---- Use layout rect directly (already resolution scaled) ----
-    //
     float centerX = (m_rect.left + m_rect.right) * 0.5f;
     float centerY = (m_rect.top + m_rect.bottom) * 0.5f;
 
-    float scaledW = m_pixelWidth;
-    float scaledH = m_pixelHeight;
+    const float scaledW = GetPixelWidth() * m_currentScale;
+    const float scaledH = GetPixelHeight() * m_currentScale;
 
     D2D1_RECT_F drawRect = D2D1::RectF(
         centerX - scaledW * 0.5f,
@@ -254,9 +190,28 @@ void UITextBox::SetText(const std::wstring& text)
     m_text = text;
 }
 
-const std::wstring& UITextBox::GetText() const
+bool UITextBox::AcceptChar(wchar_t c) const
 {
-    return m_text;
+    if (!m_config.isEditable)
+        return false;
+
+    if (c == L'\r' || c == L'\n')
+        return false;
+
+    switch (m_config.inputMode)
+    {
+    case InputMode::Any:
+        return (c >= 32);
+
+    case InputMode::NumericInteger:
+        return (std::iswdigit(c) || c == L'-');
+
+    case InputMode::NumericFloat:
+        return (std::iswdigit(c) || c == L'-' || c == L'.');
+
+    default:
+        return false;
+    }
 }
 
 void UITextBox::OnChar(wchar_t c)
@@ -318,26 +273,6 @@ void UITextBox::OnKeyDown(WPARAM key)
 
         m_focused = false; // optional: lose focus after enter
     }
-}
-
-bool UITextBox::HitTest(float x, float y) const
-{
-    float centerX = (m_rect.left + m_rect.right) * 0.5f;
-    float centerY = (m_rect.top + m_rect.bottom) * 0.5f;
-
-    float scaledW = m_pixelWidth * m_currentScale;
-    float scaledH = m_pixelHeight * m_currentScale;
-
-    D2D1_RECT_F scaledRect = D2D1::RectF(
-        centerX - scaledW * 0.5f,
-        centerY - scaledH * 0.5f,
-        centerX + scaledW * 0.5f,
-        centerY + scaledH * 0.5f);
-
-    return x >= scaledRect.left &&
-           x <= scaledRect.right &&
-           y >= scaledRect.top &&
-           y <= scaledRect.bottom;
 }
 
 bool UITextBox::OnMouseDown(float x, float y)

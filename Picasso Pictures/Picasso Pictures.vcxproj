@@ -133,12 +133,14 @@
   <ItemGroup>
     <ClInclude Include="framework.h" />
     <ClInclude Include="AnimatedButton.h" />
+    <ClInclude Include="UIElement.h" />
     <ClInclude Include="UITextBox.h" />
     <ClInclude Include="Picasso Pictures.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="targetver.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="UIElement.cpp" />
     <ClCompile Include="UITextBox.cpp" />
     <ClCompile Include="Picasso Pictures.cpp" />
     <ClCompile Include="AnimatedButton.cpp" />
