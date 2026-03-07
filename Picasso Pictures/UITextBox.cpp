@@ -12,77 +12,15 @@ bool UITextBox::Initialize( IDWriteFactory* factory,
     if (!factory)
         return false;
 
-    m_config = config;
-    m_callback = std::move(callback);
-    m_factory = factory;
+    m_config        = config;
+    m_callback      = std::move(callback);
+    m_dwriteFactory = factory;
 
     SetLayout(m_config.layout);
-
-    // Pixel sizes from uiPixelScale (matches your current approach)
-    const float wPx = m_config.layout.uiPixelScale * m_config.layout.width;
-    const float hPx = m_config.layout.uiPixelScale * m_config.layout.height;
-    SetPixelSize(wPx, hPx);
-
-    // capture anchor offsets once, from reference size
-    const auto rtSize = renderTarget->GetSize();
-    m_lastRTW = rtSize.width;
-    m_lastRTH = rtSize.height;
-
-    // Capture anchors based on reference size (only once)
-    CaptureAnchorsOnce(m_lastRTW, m_lastRTH);
     m_pixelFontSize = m_config.layout.uiPixelScale * m_config.relativeFontSize;
-    UpdateLayout(renderTarget);
-    EnsureTextFormat();
+    InitializeLayout(renderTarget);
 
     return true;
-}
-
-void UITextBox::EnsureTextFormat()
-{
-    if (!m_factory)
-        return;
-
-    m_textFormat.Reset();
-
-    HRESULT hr = m_factory->CreateTextFormat(
-        L"Segoe UI",
-        nullptr,
-        DWRITE_FONT_WEIGHT_SEMI_BOLD,
-        DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL,
-        m_pixelFontSize,
-        L"",
-        m_textFormat.GetAddressOf());
-
-    if (FAILED(hr) || !m_textFormat)
-        return;
-
-    m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-}
-
-void UITextBox::UpdateLayout(ID2D1RenderTarget* renderTarget)
-{
-    if (!renderTarget)
-        return;
-
-    const auto rtSize = renderTarget->GetSize();
-
-    // If uiPixelScale changed (e.g. different monitor or orientation),
-    // update pixel size + text format.
-    const float wPx = m_config.layout.uiPixelScale * m_config.layout.width;
-    const float hPx = m_config.layout.uiPixelScale * m_config.layout.height;
-
-    if (std::fabs(wPx - GetPixelWidth()) > 0.5f || std::fabs(hPx - GetPixelHeight()) > 0.5f)
-    {
-        SetPixelSize(wPx, hPx);
-        EnsureTextFormat();
-    }
-    if (!m_xCache.captured || !m_yCache.captured)
-    {
-        CaptureAnchorsOnce(rtSize.width, rtSize.height);
-    }
-    UpdateLayoutForSize(rtSize.width, rtSize.height);
 }
 
 void UITextBox::Draw(ID2D1RenderTarget* rt)

@@ -88,6 +88,69 @@ void UIElement::CaptureAnchorsOnce(float rtWidth, float rtHeight)
     CaptureAxis(m_yCache, refH, cy, m_layout.y);
 }
 
+void UIElement::EnsureTextFormat()
+{
+    if (!m_dwriteFactory)
+        return;
+
+    m_textFormat.Reset();
+
+    HRESULT hr = m_dwriteFactory->CreateTextFormat(
+        L"Segoe UI",
+        nullptr,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        m_pixelFontSize,
+        L"",
+        m_textFormat.GetAddressOf());
+
+    if (FAILED(hr) || !m_textFormat)
+        return;
+
+    m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+}
+
+void UIElement::InitializeLayout(ID2D1RenderTarget* renderTarget)
+{
+    if (!renderTarget)
+        return;
+
+    const float wPx = m_layout.uiPixelScale * m_layout.width;
+    const float hPx = m_layout.uiPixelScale * m_layout.height;
+    SetPixelSize(wPx, hPx);
+
+    const auto rtSize = renderTarget->GetSize();
+    m_lastRTW = rtSize.width;
+    m_lastRTH = rtSize.height;
+    CaptureAnchorsOnce(m_lastRTW, m_lastRTH);
+    UpdateLayoutForSize(m_lastRTW, m_lastRTH);
+    EnsureTextFormat();
+}
+
+void UIElement::UpdateLayout(ID2D1RenderTarget* renderTarget)
+{
+    if (!renderTarget)
+        return;
+
+    const auto rtSize = renderTarget->GetSize();
+
+    const float wPx = m_layout.uiPixelScale * m_layout.width;
+    const float hPx = m_layout.uiPixelScale * m_layout.height;
+
+    if (std::fabs(wPx - m_pixelWidth) > 0.5f || std::fabs(hPx - m_pixelHeight) > 0.5f)
+    {
+        SetPixelSize(wPx, hPx);
+        EnsureTextFormat();
+    }
+
+    if (!m_xCache.captured || !m_yCache.captured)
+        CaptureAnchorsOnce(rtSize.width, rtSize.height);
+
+    UpdateLayoutForSize(rtSize.width, rtSize.height);
+}
+
 void UIElement::UpdateLayoutForSize(float rtWidth, float rtHeight)
 {
     if (rtWidth <= 0.f || rtHeight <= 0.f)

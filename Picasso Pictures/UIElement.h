@@ -1,5 +1,6 @@
 #pragma once
 #include <d2d1.h>
+#include <dwrite.h>
 #include <wrl/client.h>
 #include <algorithm>
 
@@ -72,6 +73,14 @@ public:
     // Update for the current render target size
     void UpdateLayoutForSize(float rtWidth, float rtHeight);
 
+    // Handles pixel-size change detection, anchor capture, and layout update.
+    // Calls EnsureTextFormat() when the pixel size changes.
+    void UpdateLayout(ID2D1RenderTarget* renderTarget);
+
+    // Convenience for Initialize: sets pixel size, captures anchors, runs UpdateLayout + EnsureTextFormat.
+    // Derived class must set m_pixelFontSize and call SetLayout() before calling this.
+    void InitializeLayout(ID2D1RenderTarget* renderTarget);
+
     // Rects / hit testing
     D2D1_RECT_F GetRect() const { return m_rect; }
     D2D1_RECT_F GetActivationRect() const { return m_activationRect; }
@@ -93,6 +102,21 @@ protected:
 
     float GetPixelWidth() const { return m_pixelWidth; }
     float GetPixelHeight() const { return m_pixelHeight; }
+
+    // Rebuilds m_textFormat from m_dwriteFactory and m_pixelFontSize.
+    // Called automatically by UpdateLayout on scale change and by InitializeLayout.
+    void EnsureTextFormat();
+
+    // Shared DWrite factory — set by derived class during Initialize.
+    Microsoft::WRL::ComPtr<IDWriteFactory>     m_dwriteFactory;
+    Microsoft::WRL::ComPtr<IDWriteTextFormat>  m_textFormat;
+
+    // Set by derived class before calling InitializeLayout / UpdateLayout.
+    float m_pixelFontSize = 16.f;
+
+    // Cached RT size (updated by UpdateLayout).
+    float m_lastRTW = 0.f;
+    float m_lastRTH = 0.f;
 
     // Common animation knobs
     float m_currentScale = 1.f;
