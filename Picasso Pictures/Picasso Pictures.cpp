@@ -68,6 +68,7 @@ int BUTTON_ROTATE_RIGHT = 4;
 int BUTTON_PREVIOUS = 5;
 int BUTTON_NEXT = 6;
 int BUTTON_EXIT = 7;
+int BUTTON_SLIDESHOW = 8;
 
 // Global Variables:
 HINSTANCE                                           hInst;                              // current instance
@@ -134,6 +135,23 @@ ComPtr<ID2D1Effect>                                 g_shadowEffect;
 std::unordered_map<int, UITextBox>                  g_textBoxes;
 std::unordered_map<int, AnimatedButton>             g_buttons;
 
+// ---- Slideshow mode ----
+bool                                                g_isSlideshowMode            = false;
+ComPtr<ID2D1Bitmap>                                 g_slideshowBgBitmap;         // 25 %-size blurred bg for current image
+ComPtr<ID2D1Bitmap>                                 g_prevSlideshowBgBitmap;     // blurred bg fading out
+ComPtr<ID2D1Bitmap>                                 g_prevD2DBitmap;             // image bitmap fading out
+ComPtr<ID2D1Effect>                                 g_blurEffect;                // reusable Gaussian blur effect
+float                                               g_slideshowTransitionAlpha   = 1.0f;  // 0 = show prev, 1 = show new
+float                                               g_slideshowTargetAlpha       = 1.0f;
+float                                               g_prevImageZoom              = 1.0f;
+float                                               g_prevImageOffX              = 0.0f;
+float                                               g_prevImageOffY              = 0.0f;
+float                                               g_prevImageRotation          = 0.0f;
+constexpr UINT_PTR                                  SLIDESHOW_TIMER_ID           = 999;
+constexpr UINT                                      SLIDESHOW_INTERVAL_MS        = 7000;  // ms between pictures
+bool                                                g_slideshowPreFade           = false;
+float                                               g_slideshowPreFadeAlpha      = 0.0f;  // 0=current view, 1=fully black
+
 // Forward declarations of functions included in this code module:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
 ATOM                RegisterOverlayClass(HINSTANCE hInstance);
@@ -163,6 +181,9 @@ void InitializeImageInfoLabel();
 void UpdateTargetZoom(float newZoom);
 void EnterFullscreen(bool preserveView, bool needsDelay);
 void ExitFullscreen();
+void EnterSlideshowMode();
+void ExitSlideshowMode();
+void CreateSlideshowBgBitmap();
 void CreateRenderTarget(HWND hWnd);
 void RecreateImageBitmap();
 void InitializeImageLayout(HWND hWnd, bool hard);
@@ -567,6 +588,9 @@ void DiscardDeviceResources()
     g_backgroundBitmap.Reset();
     g_defaultBackgroundBitmap.Reset();
     g_d2dTargetBitmap.Reset();
+    g_slideshowBgBitmap.Reset();
+    g_prevSlideshowBgBitmap.Reset();
+    g_prevD2DBitmap.Reset();
 
     // D2D context
     g_renderTarget.Reset();
@@ -577,6 +601,7 @@ void DiscardDeviceResources()
     g_d3dDevice.Reset();
     g_d2dDevice.Reset();
     g_shadowEffect.Reset();
+    g_blurEffect.Reset();
     g_renderTargetWindow = nullptr;
 }
 
@@ -611,6 +636,39 @@ void UpdateEngine(float dt)
     }
     float overlayTarget = g_isExiting ? 0.0f : 1.0f;
     g_overlayAlpha += (overlayTarget - g_overlayAlpha) * 0.15f;
+
+    // Slideshow pre-fade (current view → black) then image cross-fade (black → first image)
+    if (g_slideshowPreFade)
+    {
+        g_slideshowPreFadeAlpha += (1.0f - g_slideshowPreFadeAlpha) * 0.04f;
+        if (g_slideshowPreFadeAlpha > 0.995f)
+        {
+            g_slideshowPreFadeAlpha = 1.0f;
+            g_slideshowPreFade      = false;
+
+            // Screen is now black — do the actual window transition (invisible to the user)
+            if (g_isFullscreen) ExitFullscreen();
+            g_isSlideshowMode = true;
+            g_prevD2DBitmap.Reset();
+            g_prevSlideshowBgBitmap.Reset();
+            g_slideshowTransitionAlpha = 0.0f;
+            g_slideshowTargetAlpha     = 1.0f;
+            EnterFullscreen(false, true);
+            SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
+        }
+    }
+    else if (g_isSlideshowMode && g_slideshowTransitionAlpha < g_slideshowTargetAlpha)
+    {
+        g_slideshowTransitionAlpha +=
+            (g_slideshowTargetAlpha - g_slideshowTransitionAlpha) * 0.02f;
+
+        if (g_slideshowTransitionAlpha > 0.995f)
+        {
+            g_slideshowTransitionAlpha = 1.0f;
+            g_prevD2DBitmap.Reset();
+            g_prevSlideshowBgBitmap.Reset();
+        }
+    }
 
     g_zoom     += (g_targetZoom     - g_zoom)     * g_smooth;
     g_offsetX  += (g_targetOffsetX  - g_offsetX)  * g_smooth;
@@ -747,10 +805,15 @@ HWND CreateOverlayWindow(HWND parent)
         MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST),
         &mi);
 
-    RECT rc = mi.rcWork;
+    // Slideshow covers the taskbar; normal fullscreen only covers the work area.
+    RECT rc = g_isSlideshowMode ? mi.rcMonitor : mi.rcWork;
+
+    DWORD exStyle = WS_EX_TOOLWINDOW;
+    if (g_isSlideshowMode)
+        exStyle |= WS_EX_TOPMOST;
 
     HWND overlay = CreateWindowEx(
-        WS_EX_TOOLWINDOW,
+        exStyle,
         L"OverlayWindowClass",
         L"",
         WS_POPUP,
@@ -918,6 +981,104 @@ void UpdateTargetZoom(float newZoom)
 {
     if (!g_d2dBitmap) return;
     g_targetZoom = newZoom;
+}
+
+// -----------------------------------------------------------------------
+// Builds a small (25 %) D2D bitmap that has been blurred through the
+// Gaussian-blur effect and stored off-screen, ready for DrawBitmap.
+// Must be called outside BeginDraw/EndDraw (or before BeginDraw in Render).
+// -----------------------------------------------------------------------
+void CreateSlideshowBgBitmap()
+{
+    g_slideshowBgBitmap.Reset();
+
+    if (!g_renderTarget || !g_wicBitmapSource || !g_blurEffect || !g_wicFactory)
+        return;
+
+    UINT fullW = 0, fullH = 0;
+    if (FAILED(g_wicBitmapSource->GetSize(&fullW, &fullH)) || fullW == 0 || fullH == 0)
+        return;
+
+    // ----- 1. Create 25 % WIC scaler -----
+    const UINT smallW = max(1u, fullW / 4);
+    const UINT smallH = max(1u, fullH / 4);
+
+    ComPtr<IWICBitmapScaler> scaler;
+    if (FAILED(g_wicFactory->CreateBitmapScaler(&scaler))) return;
+    if (FAILED(scaler->Initialize(g_wicBitmapSource.Get(), smallW, smallH,
+                                   WICBitmapInterpolationModeHighQualityCubic))) return;
+
+    ComPtr<IWICFormatConverter> conv;
+    if (FAILED(g_wicFactory->CreateFormatConverter(&conv))) return;
+    if (FAILED(conv->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
+                                 WICBitmapDitherTypeNone, nullptr, 0.f,
+                                 WICBitmapPaletteTypeCustom))) return;
+
+    // ----- 2. Create small D2D source bitmap -----
+    ComPtr<ID2D1Bitmap> smallBmp;
+    if (FAILED(g_renderTarget->CreateBitmapFromWicBitmap(
+            conv.Get(), nullptr, &smallBmp))) return;
+
+    // ----- 3. Create off-screen render target at the same small size -----
+    D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+    ComPtr<ID2D1Bitmap1> offscreenBmp;
+    if (FAILED(g_renderTarget->CreateBitmap(
+            D2D1::SizeU(smallW, smallH), nullptr, 0, bmpProps, &offscreenBmp))) return;
+
+    // ----- 4. Render blur to the off-screen bitmap -----
+    g_blurEffect->SetInput(0, smallBmp.Get());
+
+    ComPtr<ID2D1Image> prevTarget;
+    g_renderTarget->GetTarget(&prevTarget);
+    g_renderTarget->SetTarget(offscreenBmp.Get());
+
+    g_renderTarget->BeginDraw();
+    g_renderTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
+    g_renderTarget->DrawImage(g_blurEffect.Get(), D2D1::Point2F(0.f, 0.f));
+    g_renderTarget->EndDraw();
+
+    g_renderTarget->SetTarget(prevTarget.Get());
+
+    // ----- 5. Store — ID2D1Bitmap1 is a ID2D1Bitmap -----
+    g_slideshowBgBitmap = offscreenBmp;
+}
+
+void EnterSlideshowMode()
+{
+    if (g_isSlideshowMode || g_slideshowPreFade) return;
+
+    // Just start fading the current view (windowed or fullscreen) to black.
+    // The actual window transition fires in UpdateEngine once the screen is black,
+    // so nothing glitchy is ever visible.
+    g_slideshowPreFade      = true;
+    g_slideshowPreFadeAlpha = 0.0f;
+}
+
+void ExitSlideshowMode()
+{
+    // Cancel pre-fade if it hasn't finished yet
+    if (g_slideshowPreFade)
+    {
+        g_slideshowPreFade      = false;
+        g_slideshowPreFadeAlpha = 0.0f;
+        return; // never fully entered slideshow, nothing more to undo
+    }
+
+    if (!g_isSlideshowMode) return;
+
+    KillTimer(g_mainWindow, SLIDESHOW_TIMER_ID);
+
+    // Clear transition state first so Render doesn't try to use
+    // bitmaps that are about to be discarded.
+    g_prevD2DBitmap.Reset();
+    g_prevSlideshowBgBitmap.Reset();
+    g_slideshowTransitionAlpha = 1.0f;
+
+    g_isSlideshowMode = false;
+    ExitFullscreen();
 }
 
 void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
@@ -1298,6 +1459,21 @@ void CreateRenderTarget(HWND hWnd)
                 25.0f);   // softness
         }
     }
+
+    if (!g_blurEffect)
+    {
+        HRESULT hr = g_renderTarget->CreateEffect(
+            CLSID_D2D1GaussianBlur,
+            &g_blurEffect);
+
+        if (SUCCEEDED(hr))
+        {
+            // 20 px on a 25 %-size image ≈ 80 px of blur on the original
+            g_blurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, 20.0f);
+            // Mirror edges so the fill has no dark border
+            g_blurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
+        }
+    }
 }
 
 void RecreateImageBitmap()
@@ -1324,7 +1500,7 @@ void RecreateImageBitmap()
 void InitializeImageLayout(HWND hWnd, bool hard = false)
 {
     if (!g_d2dBitmap) return;
-    if (g_restoredStateThisLoad)
+    if (g_restoredStateThisLoad && !g_isSlideshowMode)
     return;
     RECT rc;
     GetClientRect(hWnd, &rc);
@@ -1342,10 +1518,10 @@ void InitializeImageLayout(HWND hWnd, bool hard = false)
         g_overlayAlpha = 0.0f;
 
     // If image is larger than screen, scale down to ~92% of screen
-    if (imgSize.width > windowWidth || imgSize.height > windowHeight)
+    if (g_isSlideshowMode || imgSize.width > windowWidth || imgSize.height > windowHeight)
     {
-        float scaleX = (windowWidth  * 0.92f) / imgSize.width;
-        float scaleY = (windowHeight * 0.92f) / imgSize.height;
+        float scaleX = (windowWidth  * 0.95f) / imgSize.width;
+        float scaleY = (windowHeight * 0.95f) / imgSize.height;
 
         scale = min(scaleX, scaleY);
     }
@@ -1407,7 +1583,7 @@ void InitializeButtons()
     // -------------------------
     AnimatedButton::Config buttonConfig;
 
-    buttonConfig.layout.x.value = 0.5f;
+    buttonConfig.layout.x.value = 0.49f;
     buttonConfig.layout.x.anchor = AnimatedButton::Anchor::OffsetFromCenter;
     buttonConfig.layout.x.mode = AnimatedButton::PosMode::Normalized;
     buttonConfig.layout.y.value = 0.96f;
@@ -1438,9 +1614,27 @@ void InitializeButtons()
 
  
     // -------------------------
+    // Slide-show Button
+    // -------------------------
+    buttonConfig.layout.x.value = 0.51f;
+    buttonConfig.fontSize = fontSize;
+    buttonConfig.text = L"\u25B6";
+
+    g_buttons[BUTTON_SLIDESHOW].Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        buttonConfig,
+        []()
+        {
+            EnterSlideshowMode();
+        });
+    g_buttons[BUTTON_SLIDESHOW].UpdateLayout(g_renderTarget.Get());
+
+
+    // -------------------------
     // Zoom In Button
     // -------------------------
-    buttonConfig.layout.x.value = 0.52f;
+    buttonConfig.layout.x.value = 0.53f;
     buttonConfig.fontSize = fontSize;
     buttonConfig.text = L"\u2795";
 
@@ -1460,7 +1654,7 @@ void InitializeButtons()
     // Zoom Out Button
     // -------------------------
 
-    buttonConfig.layout.x.value = 0.48f;
+    buttonConfig.layout.x.value = 0.47f;
     buttonConfig.text = L"\u2796";
 
     g_buttons[BUTTON_ZOOM_OUT].Initialize(
@@ -1478,7 +1672,7 @@ void InitializeButtons()
     // Rotate Left Button
     // -------------------------
 
-    buttonConfig.layout.x.value = 0.46f;
+    buttonConfig.layout.x.value = 0.45f;
     buttonConfig.fontSize = fontSize * 1.2f;
     buttonConfig.text = L"\u2B6F";
 
@@ -1496,7 +1690,7 @@ void InitializeButtons()
     // Rotate Right Button
     // -------------------------
 
-    buttonConfig.layout.x.value = 0.54f;
+    buttonConfig.layout.x.value = 0.55f;
     buttonConfig.text = L"\u2B6E";
 
     g_buttons[BUTTON_ROTATE_RIGHT].Initialize(
@@ -1512,7 +1706,7 @@ void InitializeButtons()
     // -------------------------
     // Previous Image Button
     // -------------------------
-    buttonConfig.layout.x.value = 0.44f;
+    buttonConfig.layout.x.value = 0.43f;
     buttonConfig.fontSize = fontSize * 1.3f;
     buttonConfig.text = L"\u2B9C";
 
@@ -1522,7 +1716,9 @@ void InitializeButtons()
         buttonConfig,
         []()
         {
-            OpenPrevImage(g_renderTargetWindow );
+            OpenPrevImage(g_renderTargetWindow);
+            if (g_isSlideshowMode)
+                SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
         });
     g_buttons[BUTTON_PREVIOUS].UpdateLayout(g_renderTarget.Get());
 
@@ -1530,7 +1726,7 @@ void InitializeButtons()
     // Next Image Button
     // -------------------------
 
-    buttonConfig.layout.x.value = 0.56f;
+    buttonConfig.layout.x.value = 0.57f;
     buttonConfig.text = L"\u2B9E";
     
     g_buttons[BUTTON_NEXT].Initialize(
@@ -1539,7 +1735,9 @@ void InitializeButtons()
         buttonConfig,
         []()
         {
-            OpenNextImage(g_renderTargetWindow );
+            OpenNextImage(g_renderTargetWindow);
+            if (g_isSlideshowMode)
+                SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
         });
     g_buttons[BUTTON_NEXT].UpdateLayout(g_renderTarget.Get());
 
@@ -1708,6 +1906,10 @@ void Render(HWND hWnd)
     if (g_isFullscreen && g_wicBackground && !g_backgroundBitmap)
         CreateBackgroundBitmap();
 
+    // Slideshow blurred-bg: build lazily (off-screen render, must be before BeginDraw)
+    if (g_isSlideshowMode && g_wicBitmapSource && !g_slideshowBgBitmap && g_blurEffect)
+        CreateSlideshowBgBitmap();
+
     g_renderTarget->BeginDraw();
 
     // Clear background
@@ -1725,13 +1927,52 @@ void Render(HWND hWnd)
             CreateBackgroundBitmap();
 
         // Initialize layout AFTER everything exists
-        InitializeImageLayout(hWnd);
+        InitializeImageLayout(hWnd, g_isSlideshowMode);
 
         g_needsFullscreenInit = false;
     }
 
-    // Draw dimmed desktop background
-    if (g_isFullscreen && g_backgroundBitmap)
+    // ---- Background ----
+    if (g_isSlideshowMode)
+    {
+        // Helper: draw a small bitmap stretched to cover the full screen at given opacity
+        auto DrawCoverBg = [&](ID2D1Bitmap* bmp, float alpha)
+        {
+            if (!bmp || alpha <= 0.01f) return;
+
+            D2D1_SIZE_F sz = bmp->GetSize();
+            D2D1_SIZE_F rt = g_renderTarget->GetSize();
+
+            float scaleX     = rt.width  / sz.width;
+            float scaleY     = rt.height / sz.height;
+            float coverScale = max(scaleX, scaleY);
+
+            float destW = sz.width  * coverScale;
+            float destH = sz.height * coverScale;
+            float destX = (rt.width  - destW) * 0.5f;
+            float destY = (rt.height - destH) * 0.5f;
+
+            g_renderTarget->DrawBitmap(
+                bmp,
+                D2D1::RectF(destX, destY, destX + destW, destY + destH),
+                alpha,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        };
+
+        // Fade out old blurred bg, fade in new one
+        DrawCoverBg(g_prevSlideshowBgBitmap.Get(), 1.0f - g_slideshowTransitionAlpha);
+        DrawCoverBg(g_slideshowBgBitmap.Get(),             g_slideshowTransitionAlpha);
+
+        // Uniform dim overlay on top of the blurred fill
+        D2D1_SIZE_F rt = g_renderTarget->GetSize();
+        ComPtr<ID2D1SolidColorBrush> dimBrush;
+        g_renderTarget->CreateSolidColorBrush(
+            D2D1::ColorF(0.f, 0.f, 0.f, 0.45f * g_overlayAlpha), &dimBrush);
+        if (dimBrush)
+            g_renderTarget->FillRectangle(
+                D2D1::RectF(0, 0, rt.width, rt.height), dimBrush.Get());
+    }
+    else if (g_isFullscreen && g_backgroundBitmap)
     {
         D2D1_SIZE_F size = g_backgroundBitmap->GetSize();
 
@@ -1760,10 +2001,36 @@ void Render(HWND hWnd)
     {        
         D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
 
+        // ---- Draw previous image fading out (slideshow only) ----
+        if (g_isSlideshowMode && g_prevD2DBitmap && g_slideshowTransitionAlpha < 0.99f)
+        {
+            D2D1_SIZE_F prevSize = g_prevD2DBitmap->GetSize();
+
+            D2D1::Matrix3x2F prevScale =
+                D2D1::Matrix3x2F::Scale(g_prevImageZoom, g_prevImageZoom);
+            D2D1::Matrix3x2F prevTranslate =
+                D2D1::Matrix3x2F::Translation(g_prevImageOffX, g_prevImageOffY);
+            D2D1::Matrix3x2F prevBase = prevScale * prevTranslate;
+
+            D2D1_POINT_2F prevCenter = prevBase.TransformPoint(
+                D2D1::Point2F(prevSize.width * 0.5f, prevSize.height * 0.5f));
+
+            D2D1::Matrix3x2F prevRot =
+                D2D1::Matrix3x2F::Rotation(g_prevImageRotation, prevCenter);
+
+            g_renderTarget->SetTransform(prevBase * prevRot);
+            g_renderTarget->DrawBitmap(
+                g_prevD2DBitmap.Get(),
+                D2D1::RectF(0, 0, prevSize.width, prevSize.height),
+                1.0f - g_slideshowTransitionAlpha,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+            g_renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
+        }
+
+        // ---- Draw current image (with fade-in alpha in slideshow) ----
         float imgCenterX = imgSize.width * 0.5f;
         float imgCenterY = imgSize.height * 0.5f;
 
-        // First build scale + translation
         D2D1::Matrix3x2F scale =
             D2D1::Matrix3x2F::Scale(g_zoom, g_zoom);
 
@@ -1772,34 +2039,32 @@ void Render(HWND hWnd)
 
         D2D1::Matrix3x2F baseTransform = scale * translate;
      
-        // Now compute actual on-screen center AFTER scale+translate
         D2D1_POINT_2F screenCenter =
             baseTransform.TransformPoint(D2D1::Point2F(imgCenterX, imgCenterY));
 
-        // Rotate around that screen-space center
         D2D1::Matrix3x2F rotation =
             D2D1::Matrix3x2F::Rotation(g_imageRotationAngle, screenCenter);
 
-        // Final transform
         g_renderTarget->SetTransform(baseTransform * rotation);
+
+        const float imgOpacity = g_isSlideshowMode ? g_slideshowTransitionAlpha : 1.0f;
         
-        // ---- DRAW SHADOW ----
         if (g_shadowEffect && g_d2dBitmap)
         {
             g_shadowEffect->SetInput(0, g_d2dBitmap.Get());
-
-            // Slight offset for shadow
-            D2D1_POINT_2F shadowOffset = D2D1::Point2F(0.0f,0.0f);
-
-            g_renderTarget->DrawImage(
-                g_shadowEffect.Get(),
-                shadowOffset);
+            g_renderTarget->PushLayer(
+                D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
+                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    D2D1::IdentityMatrix(), imgOpacity),
+                nullptr);
+            g_renderTarget->DrawImage(g_shadowEffect.Get(), D2D1::Point2F(0.0f, 0.0f));
+            g_renderTarget->PopLayer();
         }
 
         g_renderTarget->DrawBitmap(
             g_d2dBitmap.Get(),
             D2D1::RectF(0, 0, imgSize.width, imgSize.height),
-            1.0f,
+            imgOpacity,
             D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
         );
 
@@ -1825,6 +2090,18 @@ void Render(HWND hWnd)
         );
     }
     D2D1_SIZE_F rtSize = g_renderTarget->GetSize();
+
+    // Pre-fade: black overlay drawn on top of whatever is currently showing.
+    // Works identically in windowed and fullscreen mode.
+    if (g_slideshowPreFade && g_slideshowPreFadeAlpha > 0.01f)
+    {
+        ComPtr<ID2D1SolidColorBrush> blackBrush;
+        g_renderTarget->CreateSolidColorBrush(
+            D2D1::ColorF(0.f, 0.f, 0.f, g_slideshowPreFadeAlpha), &blackBrush);
+        if (blackBrush)
+            g_renderTarget->FillRectangle(
+                D2D1::RectF(0, 0, rtSize.width, rtSize.height), blackBrush.Get());
+    }
 
     // Draw UI buttons
 
@@ -1864,6 +2141,24 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 {
     if (!g_wicFactory || !filename || !*filename)
         return false;
+
+    // ---- Slideshow: snapshot current bitmap + bg before we clobber them ----
+    if (g_isSlideshowMode && g_d2dBitmap)
+    {
+        g_prevD2DBitmap         = g_d2dBitmap;
+        g_prevSlideshowBgBitmap = g_slideshowBgBitmap;
+        g_prevImageZoom         = g_zoom;
+        g_prevImageOffX         = g_offsetX;
+        g_prevImageOffY         = g_offsetY;
+        g_prevImageRotation     = g_imageRotationAngle;
+
+        // Reset so Render recreates it for the new image
+        g_slideshowBgBitmap.Reset();
+
+        // Kick off the fade-in
+        g_slideshowTransitionAlpha = 0.0f;
+        g_slideshowTargetAlpha     = 1.0f;
+    }
         
     // ------------------------------------------------------------
     // Save previous image state
@@ -2672,7 +2967,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (LOWORD(wParam) == WA_INACTIVE)
         {
-            if (g_isFullscreen && g_fullScreenInitDone)
+            if (g_isFullscreen && g_fullScreenInitDone && !g_isSlideshowMode)
             {
                 ExitFullscreen();
             }
@@ -2853,7 +3148,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         bool wasReallyDragging = (abs(x - g_mouseFromDown.x) > 5) || (abs(y - g_mouseFromDown.y) > 5);
 
-        if (g_isFullscreen && !overImage && !wasReallyDragging)
+        if (g_isFullscreen && !g_isSlideshowMode && !overImage && !wasReallyDragging)
         {
             ExitFullscreen();
         }
@@ -2981,6 +3276,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 KillTimer(hWnd, 666);
                 g_textBoxes[TEXTBOX_ZOOM_INPUT].SetForcedVisibility(false);
         }
+        if (wParam == SLIDESHOW_TIMER_ID)
+        {
+            if (g_isSlideshowMode && !g_imageFiles.empty())
+            {
+                // Advance only once the current transition has settled (> 80 %)
+                // so rapid fires don't pile up if the system is under load.
+                if (g_slideshowTransitionAlpha > 0.8f)
+                {
+                    OpenNextImage(g_overlayWindow ? g_overlayWindow : g_mainWindow);
+                    InitializeImageLayout(g_overlayWindow ? g_overlayWindow : g_mainWindow, true);
+                }
+                // Re-arm for next picture
+                SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
+            }
+        }
     }
     break;
 
@@ -3062,6 +3372,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     PostQuitMessage(0);
                     return 0;
                 }
+                if (g_isSlideshowMode)
+                {
+                    ExitSlideshowMode();
+                    return 0;
+                }
                 if (g_isFullscreen)
                 {
                     D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
@@ -3119,6 +3434,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             case VK_LEFT:
             {
                 OpenPrevImage(hWnd);
+                if (g_isSlideshowMode)
+                    SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
                 return 0;
             }
 
@@ -3126,6 +3443,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             case VK_RIGHT:
             {
                 OpenNextImage(hWnd);
+                if (g_isSlideshowMode)
+                    SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
                 return 0;
             }
 
@@ -3144,6 +3463,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 {
                     g_targetRotationAngle += 90.0f;
                 }
+                return 0;
+            }
+
+            case VK_F5: // F5 — toggle slideshow mode
+            {
+                if (!g_d2dBitmap) break;
+                if (g_isSlideshowMode)
+                    ExitSlideshowMode();
+                else
+                    EnterSlideshowMode();
                 return 0;
             }
         }
