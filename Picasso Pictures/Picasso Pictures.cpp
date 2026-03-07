@@ -1558,11 +1558,18 @@ void InitializeButtons()
     AnimatedButton::Config exitConfig;
     exitConfig.layout.x.value = right;
     exitConfig.layout.y.value = top;
+    exitConfig.layout.x.anchor = AnimatedButton::Anchor::OffsetFromEnd;
+    exitConfig.layout.y.anchor = AnimatedButton::Anchor::OffsetFromStart;
+    exitConfig.layout.x.mode = AnimatedButton::PosMode::Normalized;
+    exitConfig.layout.y.mode = AnimatedButton::PosMode::Normalized;
     exitConfig.layout.width = 0.036f;
     exitConfig.layout.height = 0.036f;
     exitConfig.fontSize = 0.016f;
     exitConfig.text = L"\u274C";
     exitConfig.layout.activationZone = topRightActivationZone;
+    exitConfig.layout.referenceWidth  = size.width;
+    exitConfig.layout.referenceHeight = size.height;
+    exitConfig.layout.uiPixelScale = min(size.width, size.height);
 
     g_buttons[BUTTON_EXIT].Initialize(
         g_renderTarget.Get(),
