@@ -21,6 +21,7 @@
 #include <shellapi.h>
 #include <filesystem>
 #include <dwmapi.h>
+#include <uxtheme.h>
 #include <wrl/client.h>
 #include <cmath>
 #include <functional>
@@ -40,6 +41,7 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dxguid.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -149,8 +151,9 @@ float                                               g_prevImageOffY             
 float                                               g_prevImageRotation          = 0.0f;
 constexpr UINT_PTR                                  SLIDESHOW_TIMER_ID           = 999;
 constexpr UINT                                      SLIDESHOW_INTERVAL_MS        = 7000;  // ms between pictures
-bool                                                g_slideshowPreFade           = false;
-float                                               g_slideshowPreFadeAlpha      = 0.0f;  // 0=current view, 1=fully black
+bool                                                g_slideshowPreFade           = false; // true from button-press until first overlay Present()
+float                                               g_slideshowPreFadeAlpha      = 0.0f;  // 0=current view visible, 1=fully black
+HWND                                                g_blackCoverWindow           = nullptr;
 
 // Forward declarations of functions included in this code module:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -184,6 +187,9 @@ void ExitFullscreen();
 void EnterSlideshowMode();
 void ExitSlideshowMode();
 void CreateSlideshowBgBitmap();
+void RegisterBlackCoverClass(HINSTANCE hInstance);
+void CreateBlackCoverWindow();
+void DestroyBlackCoverWindow();
 void CreateRenderTarget(HWND hWnd);
 void RecreateImageBitmap();
 void InitializeImageLayout(HWND hWnd, bool hard);
@@ -371,6 +377,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     LoadStringW(hInstance, IDC_PICASSOPICTURES, szWindowClass, MAX_LOADSTRING);
     MyRegisterClass(hInstance);
     RegisterOverlayClass(hInstance);
+    RegisterBlackCoverClass(hInstance);
 
     // Create window
     if (!InitInstance(hInstance, nCmdShow))
@@ -543,6 +550,35 @@ void EnableDarkTitleBar(HWND hwnd)
         DWMWA_USE_IMMERSIVE_DARK_MODE,
         &useDark,
         sizeof(useDark));
+
+    // Dark menu bar via UxTheme ordinals (Windows 10 1903+, stable but undocumented).
+    // Loaded dynamically so nothing breaks on older systems.
+    HMODULE ux = LoadLibraryW(L"uxtheme.dll");
+    if (ux)
+    {
+        // Ordinal 135 — SetPreferredAppMode(1 = AllowDark)
+        using FnSetPreferredAppMode = int (WINAPI*)(int);
+        if (auto fn = reinterpret_cast<FnSetPreferredAppMode>(
+                GetProcAddress(ux, MAKEINTRESOURCEA(135))))
+            fn(1);
+
+        // Ordinal 133 — AllowDarkModeForWindow(hwnd, true)
+        using FnAllowDark = bool (WINAPI*)(HWND, bool);
+        if (auto fn = reinterpret_cast<FnAllowDark>(
+                GetProcAddress(ux, MAKEINTRESOURCEA(133))))
+            fn(hwnd, true);
+
+        // Ordinal 136 — FlushMenuThemes() — applies changes immediately
+        using FnFlushMenuThemes = void (WINAPI*)();
+        if (auto fn = reinterpret_cast<FnFlushMenuThemes>(
+                GetProcAddress(ux, MAKEINTRESOURCEA(136))))
+            fn();
+
+        FreeLibrary(ux);
+    }
+
+    SetWindowTheme(hwnd, L"Explorer", nullptr);
+    SendMessage(hwnd, WM_THEMECHANGED, 0, 0);
 }
 
 ATOM MyRegisterClass(HINSTANCE hInstance)
@@ -579,6 +615,52 @@ ATOM RegisterOverlayClass(HINSTANCE hInstance)
     wcex.lpszClassName = L"OverlayWindowClass";
 
     return RegisterClassExW(&wcex);
+}
+
+// A plain black popup window used to hide D3D device recreation.
+// No D2D involved — just a black HBRUSH painted by DefWindowProc.
+void RegisterBlackCoverClass(HINSTANCE hInstance)
+{
+    WNDCLASSEXW wcex   = {};
+    wcex.cbSize        = sizeof(WNDCLASSEX);
+    wcex.lpfnWndProc   = DefWindowProcW;
+    wcex.hInstance     = hInstance;
+    wcex.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wcex.lpszClassName = L"BlackCoverClass";
+    RegisterClassExW(&wcex);
+}
+
+void CreateBlackCoverWindow()
+{
+    if (g_blackCoverWindow) return;
+
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(MonitorFromWindow(g_mainWindow, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT rc = mi.rcMonitor;
+
+    g_blackCoverWindow = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"BlackCoverClass", L"", WS_POPUP,
+        rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+        nullptr, nullptr, hInst, nullptr);
+
+    if (g_blackCoverWindow)
+    {
+        ShowWindow(g_blackCoverWindow, SW_SHOWNOACTIVATE);
+        UpdateWindow(g_blackCoverWindow);
+        // Block until DWM has composited this window onto the screen.
+        // Without this, the cover may not be visible before we destroy the render target.
+        DwmFlush();
+    }
+}
+
+void DestroyBlackCoverWindow()
+{
+    if (g_blackCoverWindow)
+    {
+        DestroyWindow(g_blackCoverWindow);
+        g_blackCoverWindow = nullptr;
+    }
 }
 
 void DiscardDeviceResources()
@@ -637,27 +719,36 @@ void UpdateEngine(float dt)
     float overlayTarget = g_isExiting ? 0.0f : 1.0f;
     g_overlayAlpha += (overlayTarget - g_overlayAlpha) * 0.15f;
 
-    // Slideshow pre-fade (current view → black) then image cross-fade (black → first image)
-    if (g_slideshowPreFade)
+    // ---- Slideshow pre-fade (current view → black, then window transition) ----
+    // g_slideshowPreFade stays true until Render() confirms the overlay's first Present().
+    if (g_slideshowPreFade && !g_isSlideshowMode)
     {
+        // Phase 1: fade the current render target to black (slow ease-out)
         g_slideshowPreFadeAlpha += (1.0f - g_slideshowPreFadeAlpha) * 0.04f;
+
         if (g_slideshowPreFadeAlpha > 0.995f)
         {
             g_slideshowPreFadeAlpha = 1.0f;
-            g_slideshowPreFade      = false;
 
-            // Screen is now black — do the actual window transition (invisible to the user)
+            // Phase 2: screen is provably black in D2D — now raise the cover
+            // window and flush DWM so it is physically on screen before we
+            // destroy the render target.
+            CreateBlackCoverWindow();
+
             if (g_isFullscreen) ExitFullscreen();
-            g_isSlideshowMode = true;
+            g_isSlideshowMode          = true;
             g_prevD2DBitmap.Reset();
             g_prevSlideshowBgBitmap.Reset();
             g_slideshowTransitionAlpha = 0.0f;
             g_slideshowTargetAlpha     = 1.0f;
             EnterFullscreen(false, true);
             SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
+            // g_slideshowPreFade remains true — Render() clears it after first Present().
         }
     }
-    else if (g_isSlideshowMode && g_slideshowTransitionAlpha < g_slideshowTargetAlpha)
+
+    // ---- Slideshow cross-fade (image-to-image transition) ----
+    if (g_isSlideshowMode && g_slideshowTransitionAlpha < g_slideshowTargetAlpha)
     {
         g_slideshowTransitionAlpha +=
             (g_slideshowTargetAlpha - g_slideshowTransitionAlpha) * 0.02f;
@@ -1049,22 +1140,22 @@ void CreateSlideshowBgBitmap()
 void EnterSlideshowMode()
 {
     if (g_isSlideshowMode || g_slideshowPreFade) return;
-
-    // Just start fading the current view (windowed or fullscreen) to black.
-    // The actual window transition fires in UpdateEngine once the screen is black,
-    // so nothing glitchy is ever visible.
+    // Only start the fade-to-black. UpdateEngine handles everything else once
+    // the screen is fully black, so no window transitions happen visibly.
     g_slideshowPreFade      = true;
     g_slideshowPreFadeAlpha = 0.0f;
 }
 
 void ExitSlideshowMode()
 {
-    // Cancel pre-fade if it hasn't finished yet
+    DestroyBlackCoverWindow();
+
     if (g_slideshowPreFade)
     {
+        // Cancelled mid-fade before the slideshow actually started.
         g_slideshowPreFade      = false;
         g_slideshowPreFadeAlpha = 0.0f;
-        return; // never fully entered slideshow, nothing more to undo
+        return;
     }
 
     if (!g_isSlideshowMode) return;
@@ -2091,8 +2182,9 @@ void Render(HWND hWnd)
     }
     D2D1_SIZE_F rtSize = g_renderTarget->GetSize();
 
-    // Pre-fade: black overlay drawn on top of whatever is currently showing.
-    // Works identically in windowed and fullscreen mode.
+    // Pre-fade overlay: full-screen opaque black drawn on top of everything,
+    // including UI, until the slideshow overlay has presented its first frame.
+    // This hides both the fade-to-black transition AND the device recreation gap.
     if (g_slideshowPreFade && g_slideshowPreFadeAlpha > 0.01f)
     {
         ComPtr<ID2D1SolidColorBrush> blackBrush;
@@ -2128,6 +2220,16 @@ void Render(HWND hWnd)
     if (SUCCEEDED(hr) && g_swapChain)
     {
         g_swapChain->Present(1, 0);
+
+        // The slideshow overlay has now presented its first frame (which is solid black
+        // due to the pre-fade overlay above). It is safe to remove the cover window and
+        // release the pre-fade flag — the overlay owns the screen from this point on.
+        if (g_slideshowPreFade && g_isSlideshowMode && g_overlayWindow)
+        {
+            DestroyBlackCoverWindow();
+            g_slideshowPreFade      = false;
+            g_slideshowPreFadeAlpha = 0.0f;
+        }
     }
 
     if (hr == D2DERR_RECREATE_TARGET)
