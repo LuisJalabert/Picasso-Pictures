@@ -6,7 +6,7 @@ Built with Direct2D, Direct3D 11, and WIC (Windows Imaging Component).
 
 Download (Win10 x86) [here](Picasso%20Pictures.exe)
 
-[Bug reports](mailto:luisjalaber@gmail.com)
+[Bug reports](mailto:luisjalabert@gmail.com)
 
 ![Picasso Pictures](screenshot.png)
 
