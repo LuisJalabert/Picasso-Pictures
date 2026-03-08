@@ -1470,6 +1470,10 @@ void ExitFullscreen()
 
     g_fullScreenInitDone = false;
     g_renderTargetWindow = g_mainWindow;
+    if (g_isSlideshowMode)
+    {
+        ExitSlideshowMode();
+    }
 }
 
 void CreateRenderTarget(HWND hWnd)
@@ -1615,15 +1619,42 @@ void RecreateImageBitmap()
 
     g_d2dBitmap.Reset();
 
+    // D3D11 maximum texture dimension is 16384. If the source exceeds this,
+    // downscale via WIC before creating the D2D bitmap.
+    const UINT D3D_MAX = 16384u;
+    UINT srcW = 0, srcH = 0;
+    g_wicBitmapSource->GetSize(&srcW, &srcH);
+
+    ComPtr<IWICBitmapSource> bitmapSourceForD2D = g_wicBitmapSource;
+
+    if (srcW > D3D_MAX || srcH > D3D_MAX)
+    {
+        float ratio = min((float)D3D_MAX / srcW, (float)D3D_MAX / srcH);
+        UINT scaledW = max(1u, (UINT)(srcW * ratio));
+        UINT scaledH = max(1u, (UINT)(srcH * ratio));
+
+        ComPtr<IWICBitmapScaler> scaler;
+        ComPtr<IWICFormatConverter> conv;
+        if (SUCCEEDED(g_wicFactory->CreateBitmapScaler(&scaler)) &&
+            SUCCEEDED(scaler->Initialize(g_wicBitmapSource.Get(), scaledW, scaledH,
+                                         WICBitmapInterpolationModeHighQualityCubic)) &&
+            SUCCEEDED(g_wicFactory->CreateFormatConverter(&conv)) &&
+            SUCCEEDED(conv->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
+                                        WICBitmapDitherTypeNone, nullptr, 0.f,
+                                        WICBitmapPaletteTypeCustom)))
+        {
+            bitmapSourceForD2D = conv;
+        }
+    }
+
     HRESULT hr = g_renderTarget->CreateBitmapFromWicBitmap(
-        g_wicBitmapSource.Get(),
+        bitmapSourceForD2D.Get(),
         nullptr,
         g_d2dBitmap.GetAddressOf()
     );
 
     if (FAILED(hr))
-    {
-           
+    {           
         OutputDebugString(L"RecreateImageBitmap failed\n");
         g_d2dBitmap.Reset();
     }
@@ -3201,7 +3232,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (LOWORD(wParam) == WA_INACTIVE)
         {
-            if (g_isFullscreen && g_fullScreenInitDone && !g_isSlideshowMode)
+            if (g_isFullscreen && g_fullScreenInitDone)
             {
                 ExitFullscreen();
             }
@@ -3379,10 +3410,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         if (g_isFullscreen && !overImage && !wasReallyDragging)
         {
-            if (g_isSlideshowMode)
-            {
-                ExitSlideshowMode();
-            }
             ExitFullscreen();
         }
 
