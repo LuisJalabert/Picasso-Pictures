@@ -8,6 +8,8 @@ Download (Win10 x86) [here](Picasso%20Pictures.exe)
 
 ![Picasso Pictures](screenshot.png)
 
+[Bug reports](luisjalaber@gmail.com)
+
 ---
 
 ## Features
