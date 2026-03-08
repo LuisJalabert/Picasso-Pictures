@@ -109,16 +109,20 @@ bool AnimatedButton::OnMouseDown(float x, float y)
     if (!HitTest(x, y))
         return false;
 
+    m_pressed = true;
+    m_holdActive = m_config.holdEnabled;
+    m_holdTime = 0.0f;
+
+    if (m_config.pressAnimation)
+    {
+        m_targetScale   = 0.92f;
+        m_targetOpacity = 0.65f;
+    }
+
     // click
     if (m_callback)
         m_callback();
 
-    m_pressed = true;
-    m_holdActive = true;
-    m_holdTime = 0.0f;
-
-    m_targetScale = 0.92f;
-    m_targetOpacity = 0.65f;
     return true;
 }
 

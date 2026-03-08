@@ -11,15 +11,12 @@ public:
     struct Config
     {
         std::wstring text;
-
-        // Layout
         UIElement::Layout layout;
-
-        // Text
-        float fontSize = 0.02f; // relative to uiPixelScale
+        float fontSize = 0.02f;
+        bool holdEnabled = true;
+        bool pressAnimation = true;
     };
 
-public:
     bool Initialize(
         ID2D1RenderTarget* renderTarget,
         IDWriteFactory* dwriteFactory,

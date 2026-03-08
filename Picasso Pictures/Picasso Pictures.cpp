@@ -71,6 +71,8 @@ int BUTTON_PREVIOUS = 5;
 int BUTTON_NEXT = 6;
 int BUTTON_EXIT = 7;
 int BUTTON_SLIDESHOW = 8;
+int BUTTON_OPEN = 9;
+int BUTTON_HELP = 10;
 
 // Global Variables:
 HINSTANCE                                           hInst;                              // current instance
@@ -150,7 +152,7 @@ float                                               g_prevImageOffX             
 float                                               g_prevImageOffY              = 0.0f;
 float                                               g_prevImageRotation          = 0.0f;
 constexpr UINT_PTR                                  SLIDESHOW_TIMER_ID           = 999;
-constexpr UINT                                      SLIDESHOW_INTERVAL_MS        = 7000;  // ms between pictures
+constexpr UINT                                      SLIDESHOW_INTERVAL_MS        = 5000;  // ms between pictures
 bool                                                g_slideshowPreFade           = false; // true from button-press until first overlay Present()
 float                                               g_slideshowPreFadeAlpha      = 0.0f;  // 0=current view visible, 1=fully black
 HWND                                                g_blackCoverWindow           = nullptr;
@@ -179,6 +181,7 @@ void SetZoomCentered(float newZoom, HWND hWnd, bool instant, bool preserveCenter
 void CaptureDesktop(HWND hWnd);
 void FitToWindowRelative(HWND hWnd, float zoom, bool preserveCenter);
 bool CreateBackgroundBitmap();
+void InitializeMenuButtons();
 void InitializeButtons();
 void InitializeImageInfoLabel();
 void UpdateTargetZoom(float newZoom);
@@ -386,7 +389,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         if (hMutex) CloseHandle(hMutex);
         return FALSE;
     }
+    if (!g_renderTarget)
+        CreateRenderTarget(g_mainWindow);
+    // Main menu:
+    SetMenu(g_mainWindow, nullptr);
+    InitializeMenuButtons();
 
+    // If we have an initial file, load it and enter fullscreen immediately.
     if (!initialFile.empty())
     {
         BuildImageList(initialFile.c_str());
@@ -1090,9 +1099,12 @@ void CreateSlideshowBgBitmap()
     if (FAILED(g_wicBitmapSource->GetSize(&fullW, &fullH)) || fullW == 0 || fullH == 0)
         return;
 
-    // ----- 1. Create 25 % WIC scaler -----
-    const UINT smallW = max(1u, fullW / 4);
-    const UINT smallH = max(1u, fullH / 4);
+    // ----- 1. Downscale to a fixed max size so blur always produces
+    //          an indistinct color wash regardless of source resolution -----
+    const UINT TARGET_MAX = 400u;
+    float scaleRatio = min((float)TARGET_MAX / fullW, (float)TARGET_MAX / fullH);
+    const UINT smallW = max(1u, (UINT)(fullW * scaleRatio));
+    const UINT smallH = max(1u, (UINT)(fullH * scaleRatio));
 
     ComPtr<IWICBitmapScaler> scaler;
     if (FAILED(g_wicFactory->CreateBitmapScaler(&scaler))) return;
@@ -1244,6 +1256,7 @@ void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
     RecreateImageBitmap();
     InitializeButtons();
     InitializeImageInfoLabel();
+        
 
     g_overlayAlpha = 0.0f;
 
@@ -1297,6 +1310,11 @@ void ExitFullscreen()
     if (!g_isFullscreen)
         return;
 
+    // Kill the zoom-display timer and hide the textbox in case it was visible
+    KillTimer(g_mainWindow, 666);
+    if (!g_textBoxes.empty())
+        g_textBoxes[TEXTBOX_ZOOM_INPUT].SetForcedVisibility(false);
+
     if (!g_d2dBitmap)
     {
         // No bitmap? Just bail out safely.
@@ -1338,8 +1356,8 @@ void ExitFullscreen()
     float clientWidth  = visibleRight  - visibleLeft;
     float clientHeight = visibleBottom - visibleTop;
 
-    const float MIN_CLIENT_W = 600.0f;
-    const float MIN_CLIENT_H = 400.0f;
+    const float MIN_CLIENT_W = 800.0f;
+    const float MIN_CLIENT_H = 600.0f;
     
     float oldClientW = clientWidth;
     float oldClientH = clientHeight;
@@ -1351,6 +1369,10 @@ void ExitFullscreen()
 
     visibleLeft -= extraW * 0.5f;
     visibleTop  -= extraH * 0.5f;
+
+    // Account for the window expanding around the image
+    offsetCorrectionX += extraW * 0.5f;
+    offsetCorrectionY += extraH * 0.5f;
 
     // Adjust new position using visible region
     int newX = overlayRect.left + (int)visibleLeft;
@@ -1371,32 +1393,51 @@ void ExitFullscreen()
     // This is crucial to avoid drawing one frame using bitmaps created on the old render target.
     DiscardDeviceResources();
 
-    // Calculate window rect BEFORE showing
-    RECT adj = { 0,0,(LONG)clientWidth,(LONG)clientHeight };
-    AdjustWindowRect(&adj, WS_OVERLAPPEDWINDOW, TRUE);
+    // Calculate window rect BEFORE showing.
+    // FALSE = no menu bar (we removed it with SetMenu(nullptr)).
+    RECT adj = { 0, 0, (LONG)clientWidth, (LONG)clientHeight };
+    AdjustWindowRect(&adj, WS_OVERLAPPEDWINDOW, FALSE);
 
     int nonClientOffsetY = -adj.top;
     int nonClientOffsetX = -adj.left;
+
+    int winX = newX - nonClientOffsetX;
+    int winY = newY - nonClientOffsetY;
+    int winW = adj.right  - adj.left;
+    int winH = adj.bottom - adj.top;
+
+    // Clamp so the window stays fully within the monitor's work area.
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(MonitorFromPoint({ newX, newY }, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT& wa = mi.rcWork;
+
+    if (winX + winW > wa.right)  winX = wa.right  - winW;
+    if (winY + winH > wa.bottom) winY = wa.bottom - winH;
+    if (winX < wa.left)          winX = wa.left;
+    if (winY < wa.top)           winY = wa.top;
 
     // Resize/move window WITHOUT triggering redraw yet (prevents a "wrong size" first frame)
     SetWindowPos(
         g_mainWindow,
         nullptr,
-        newX - nonClientOffsetX,
-        newY - nonClientOffsetY,
-        adj.right - adj.left,
-        adj.bottom - adj.top,
-        SWP_NOZORDER | SWP_NOACTIVATE 
+        winX, winY, winW, winH,
+        SWP_NOZORDER | SWP_NOACTIVATE
     );
 
     // Snap offsets/targets to final state for the new (cropped) client area
+    int preClampWinX = winX;
+    int preClampWinY = winY;
 
-    g_offsetX = offsetCorrectionX;
-    g_offsetY = offsetCorrectionY;
+    if (winX + winW > wa.right)  winX = wa.right  - winW;
+    if (winY + winH > wa.bottom) winY = wa.bottom - winH;
+    if (winX < wa.left)          winX = wa.left;
+    if (winY < wa.top)           winY = wa.top;
 
-    
-    g_offsetX = (clientWidth  - imgSize.width  * g_zoom) * 0.5f;
-    g_offsetY = (clientHeight - imgSize.height * g_zoom) * 0.5f;
+    int clampShiftX = winX - preClampWinX;
+    int clampShiftY = winY - preClampWinY;
+
+    g_offsetX = offsetCorrectionX - (float)clampShiftX;
+    g_offsetY = offsetCorrectionY - (float)clampShiftY;
 
     g_targetOffsetX = g_offsetX;
     g_targetOffsetY = g_offsetY;
@@ -1652,10 +1693,73 @@ void InitializeImageLayout(HWND hWnd, bool hard = false)
     g_targetRotationAngle = 0.0f;
 }
 
+void InitializeMenuButtons()
+{
+    // -------------------------
+    // Open File Button
+    // -------------------------
+    AnimatedButton::ActivationZone topLeftActivationZone;
+    topLeftActivationZone.left   = 0.0f;
+    topLeftActivationZone.top    = 0.0f;
+    topLeftActivationZone.right  = 0.2f;
+    topLeftActivationZone.bottom = 0.2f;
+
+    AnimatedButton::Config openConfig;
+    D2D1_SIZE_F size = g_renderTarget->GetSize();
+    float width = 0.07f;
+    float height = 0.07f;
+    openConfig.layout.x.value = 0.05f*float(size.height)/float(size.width);
+    openConfig.layout.y.value = 0.05f;
+    openConfig.layout.x.anchor = AnimatedButton::Anchor::OffsetFromStart;
+    openConfig.layout.y.anchor = AnimatedButton::Anchor::OffsetFromStart;
+    openConfig.layout.x.mode = AnimatedButton::PosMode::Normalized;
+    openConfig.layout.y.mode = AnimatedButton::PosMode::Normalized;
+    openConfig.layout.width = width;
+    openConfig.layout.height = height;
+    openConfig.fontSize = 0.04f;
+    openConfig.text = L"\U0001F4C2";
+    openConfig.layout.activationZone = topLeftActivationZone;
+    openConfig.layout.referenceWidth  = size.width;
+    openConfig.layout.referenceHeight = size.height;
+    openConfig.layout.uiPixelScale = min(size.width, size.height);
+    openConfig.holdEnabled = false;
+    openConfig.pressAnimation = false;
+    g_buttons[BUTTON_OPEN].Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        openConfig,
+        []()
+        {
+            OpenImageFile(g_mainWindow);
+        });
+    g_buttons[BUTTON_OPEN].UpdateLayout(g_renderTarget.Get());
+    g_buttons[BUTTON_OPEN].SetForcedVisibility(true);
+    
+
+    // -------------------------
+    // Help Button
+    // -------------------------
+
+    openConfig.layout.x.value += 0.056;
+    openConfig.text = L"\U0000FF1F";
+    g_buttons[BUTTON_HELP].Initialize(
+        g_renderTarget.Get(),
+        g_dwriteFactory.Get(),
+        openConfig,
+        []()
+        {
+            { DialogBox(hInst, MAKEINTRESOURCE(IDD_COMMANDBOX),  g_mainWindow, About); }
+        });
+    g_buttons[BUTTON_HELP].UpdateLayout(g_renderTarget.Get());
+    g_buttons[BUTTON_HELP].SetForcedVisibility(true);
+
+}
+
 void InitializeButtons()
 {
-    g_buttons.clear();
-
+    //g_buttons.clear();
+    g_buttons[BUTTON_OPEN].SetForcedVisibility(false);
+    g_buttons[BUTTON_HELP].SetForcedVisibility(false);
     float width = 0.025f;
     float height = 0.025f;
     float fontSize = 0.011f;
@@ -1998,7 +2102,7 @@ void Render(HWND hWnd)
         CreateBackgroundBitmap();
 
     // Slideshow blurred-bg: build lazily (off-screen render, must be before BeginDraw)
-    if (g_isSlideshowMode && g_wicBitmapSource && !g_slideshowBgBitmap && g_blurEffect)
+    if (g_wicBitmapSource && !g_slideshowBgBitmap && g_blurEffect)
         CreateSlideshowBgBitmap();
 
     g_renderTarget->BeginDraw();
@@ -2085,6 +2189,34 @@ void Render(HWND hWnd)
                 D2D1::RectF(0, 0, size.width, size.height),
                 brush.Get()
             );
+        }
+    }    
+    else if (!g_isFullscreen && g_slideshowBgBitmap)
+    {
+        // Blurred image fills the windowed background
+        D2D1_SIZE_F sz = g_slideshowBgBitmap->GetSize();
+        D2D1_SIZE_F rt = g_renderTarget->GetSize();
+        float scaleX     = rt.width  / sz.width;
+        float scaleY     = rt.height / sz.height;
+        float coverScale = max(scaleX, scaleY);
+        float destW = sz.width  * coverScale;
+        float destH = sz.height * coverScale;
+        float destX = (rt.width  - destW) * 0.5f;
+        float destY = (rt.height - destH) * 0.5f;
+        g_renderTarget->DrawBitmap(
+            g_slideshowBgBitmap.Get(),
+            D2D1::RectF(destX, destY, destX + destW, destY + destH),
+            1.0f,
+            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+
+        // Slight dim so the image on top has contrast
+        ComPtr<ID2D1SolidColorBrush> dimBrush;
+        g_renderTarget->CreateSolidColorBrush(
+            D2D1::ColorF(0.f, 0.f, 0.f, 0.35f), &dimBrush);
+        if (dimBrush)
+        {
+            D2D1_SIZE_F r = g_renderTarget->GetSize();
+            g_renderTarget->FillRectangle(D2D1::RectF(0, 0, r.width, r.height), dimBrush.Get());
         }
     }
 
@@ -2205,7 +2337,6 @@ void Render(HWND hWnd)
     {
         if (!g_isFullscreen && id == BUTTON_EXIT)
             continue;
-
         btn.Draw(g_renderTarget.Get());
     }
 
@@ -2294,7 +2425,8 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     g_isAnimatedGif = false;
     g_currentGifFrame = 0;
     g_lastGifFrameTime = 0;
-    
+    g_slideshowBgBitmap.Reset();
+
     // --------------------------------------------
     // Decode container
     // --------------------------------------------
@@ -3206,14 +3338,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
     case WM_LBUTTONDOWN:
     {
-        if (!g_d2dBitmap)
-            break;
-
         float x = GET_X_LPARAM(lParam);
         float y = GET_Y_LPARAM(lParam);
-
         for (auto& [id, btn] : g_buttons)
-
         {
             if (btn.OnMouseDown(x, y))
                 return 0;  // STOP — button handled it
@@ -3222,7 +3349,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         for (auto& [id, box] : g_textBoxes)
         {
             if (box.OnMouseDown(x, y))
-                return 0;
+                return 0;  // STOP — message box handled it
         }
         g_isDragging = true;
         SetCapture(hWnd);
@@ -3250,8 +3377,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         bool wasReallyDragging = (abs(x - g_mouseFromDown.x) > 5) || (abs(y - g_mouseFromDown.y) > 5);
 
-        if (g_isFullscreen && !g_isSlideshowMode && !overImage && !wasReallyDragging)
+        if (g_isFullscreen && !overImage && !wasReallyDragging)
         {
+            if (g_isSlideshowMode)
+            {
+                ExitSlideshowMode();
+            }
             ExitFullscreen();
         }
 
@@ -3516,6 +3647,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
             break;
 
+            case 0x4F: // 'O' key
+                OpenImageFile(hWnd);
+            break;
+
             case 0x57: // 'W' key
             case VK_UP:
             {
@@ -3542,6 +3677,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             }
 
             case 0x44: // 'D' key
+            case VK_SPACE:
             case VK_RIGHT:
             {
                 OpenNextImage(hWnd);
