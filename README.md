@@ -90,7 +90,7 @@ Buttons appear when your mouse moves near the bottom of the screen (or the top-r
 Press `F5` or click `▶` to enter slideshow mode. The screen fades to black, then the viewer enters fullscreen and begins automatically advancing through all images in the folder.
 
 - Images cross-fade with a blurred, cover-scaled background
-- Default interval: **7 seconds**
+- Default interval: **5 seconds**
 - Manual navigation with `A`/`D` or the arrow buttons resets the timer
 - Press `Escape` or `F5` to exit
 
