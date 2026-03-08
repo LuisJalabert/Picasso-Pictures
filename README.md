@@ -114,4 +114,6 @@ Open `Picasso Pictures.sln` in Visual Studio and build in Release x64.
 
 ## License
 
-MIT
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/)
+
+Free to use, share, and modify for non-commercial purposes.
