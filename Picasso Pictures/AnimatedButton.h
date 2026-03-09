@@ -28,11 +28,11 @@ public:
 
     bool OnMouseDown(float x, float y);
     bool OnMouseUp(float x, float y);
+    void SetText(const std::wstring& text) { m_config.text = text; }
 
-private:
     Config   m_config{};
     Callback m_callback{};
-
+    private:
     bool  m_pressed    = false;
     bool  m_holdActive = false;
     float m_holdTime      = 0.0f;

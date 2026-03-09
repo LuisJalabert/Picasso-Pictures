@@ -7,7 +7,6 @@
 #include "resource.h"
 #include "AnimatedButton.h"
 #include "UITextBox.h"
-#include <chrono>
 #include <windows.h>
 #include <objidl.h>
 #include <commdlg.h>
@@ -37,7 +36,6 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dxguid.lib")
@@ -57,22 +55,21 @@ struct ImageViewState {
 };
 
 // Control IDs for text boxes
-int TEXTBOX_FILE_NAME = 0;
-int TEXTBOX_ZOOM_INPUT = 1;
+constexpr int TEXTBOX_FILE_NAME  = 0;
+constexpr int TEXTBOX_ZOOM_INPUT = 1;
 
 // Control IDs for buttons
-
-int BUTTON_ZOOM_11 = 0;
-int BUTTON_ZOOM_IN = 1;
-int BUTTON_ZOOM_OUT = 2;
-int BUTTON_ROTATE_LEFT = 3;
-int BUTTON_ROTATE_RIGHT = 4;
-int BUTTON_PREVIOUS = 5;
-int BUTTON_NEXT = 6;
-int BUTTON_EXIT = 7;
-int BUTTON_SLIDESHOW = 8;
-int BUTTON_OPEN = 9;
-int BUTTON_HELP = 10;
+constexpr int BUTTON_ZOOM_11     = 0;
+constexpr int BUTTON_ZOOM_IN     = 1;
+constexpr int BUTTON_ZOOM_OUT    = 2;
+constexpr int BUTTON_ROTATE_LEFT = 3;
+constexpr int BUTTON_ROTATE_RIGHT= 4;
+constexpr int BUTTON_PREVIOUS    = 5;
+constexpr int BUTTON_NEXT        = 6;
+constexpr int BUTTON_EXIT        = 7;
+constexpr int BUTTON_SLIDESHOW   = 8;
+constexpr int BUTTON_OPEN        = 9;
+constexpr int BUTTON_HELP        = 10;
 
 // Global Variables:
 HINSTANCE                                           hInst;                              // current instance
@@ -117,20 +114,17 @@ std::unordered_map<std::wstring, ImageViewState>    g_imageStates;
 bool                                                g_restoredStateThisLoad = false;
 ComPtr<IDWriteFactory>                              g_dwriteFactory;
 ComPtr<IDWriteTextFormat>                           g_textFormat;
-LONG                                                g_lastFrameTime = 0;
-DWORD                                               g_zoomHideStartTime = 0;
 bool                                                g_launchedWithFile = false;
-D2D1_RECT_F                                         g_exitButtonRect = {};
 float                                               g_smooth = 0.13f;
 bool                                                g_pendingPreserveView = false;
 std::vector<ComPtr<IWICBitmapSource>>               g_gifFrames;
+std::vector<ComPtr<ID2D1Bitmap>>                    g_gifD2DBitmaps;         // pre-uploaded GPU bitmaps for each GIF frame
 DWORD                                               g_lastGifFrameTime = 0;
 std::vector<UINT>                                   g_gifFrameDelays;
 UINT                                                g_currentGifFrame = 0;
 bool                                                g_isAnimatedGif = false;
 ComPtr<ID3D11Device>                                g_d3dDevice;
 ComPtr<ID3D11DeviceContext>                         g_d3dContext;
-ComPtr<IDXGIDevice>                                 g_dxgiDevice;
 ComPtr<ID2D1Device>                                 g_d2dDevice;
 ComPtr<ID2D1DeviceContext>                          g_renderTarget;
 ComPtr<IDXGISwapChain1>                             g_swapChain;
@@ -138,6 +132,10 @@ ComPtr<ID2D1Bitmap1>                                g_d2dTargetBitmap;
 ComPtr<ID2D1Effect>                                 g_shadowEffect;
 std::unordered_map<int, UITextBox>                  g_textBoxes;
 std::unordered_map<int, AnimatedButton>             g_buttons;
+
+// Cached solid-color brushes (created once, reused every frame)
+ComPtr<ID2D1SolidColorBrush>                        g_dimBrush;
+ComPtr<ID2D1SolidColorBrush>                        g_blackBrush;
 
 // ---- Slideshow mode ----
 bool                                                g_isSlideshowMode            = false;
@@ -158,12 +156,6 @@ float                                               g_slideshowPreFadeAlpha     
 HWND                                                g_blackCoverWindow           = nullptr;
 
 // Forward declarations of functions included in this code module:
-ATOM                MyRegisterClass(HINSTANCE hInstance);
-ATOM                RegisterOverlayClass(HINSTANCE hInstance);
-BOOL                InitInstance(HINSTANCE, int);
-LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
-INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
-
 static std::wstring GetInitialFileFromCommandLine();
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow);
 int GetMonitorRefreshRate(HWND hWnd);
@@ -195,6 +187,7 @@ void CreateBlackCoverWindow();
 void DestroyBlackCoverWindow();
 void CreateRenderTarget(HWND hWnd);
 void RecreateImageBitmap();
+static D2D1_BITMAP_PROPERTIES1 SwapChainBitmapProps();
 void InitializeImageLayout(HWND hWnd, bool hard);
 void Render(HWND hWnd);
 bool LoadImageD2D(HWND hWnd, const wchar_t* filename);
@@ -206,6 +199,8 @@ bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt);
 void MakeZoomVisible(HWND hWnd);
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
+
+static std::wstring GetInitialFileFromCommandLine();
 
 static std::wstring GetInitialFileFromCommandLine()
 {
@@ -682,6 +677,11 @@ void DiscardDeviceResources()
     g_slideshowBgBitmap.Reset();
     g_prevSlideshowBgBitmap.Reset();
     g_prevD2DBitmap.Reset();
+    g_gifD2DBitmaps.clear();
+
+    // Cached brushes
+    g_dimBrush.Reset();
+    g_blackBrush.Reset();
 
     // D2D context
     g_renderTarget.Reset();
@@ -698,17 +698,22 @@ void DiscardDeviceResources()
 
 void UpdateEngine(float dt)
 {
-    LONG now = GetTickCount64();
-
     if (g_isAnimatedGif && !g_gifFrames.empty())
     {
+        LONG now = GetTickCount64();
         if (now - g_lastGifFrameTime >= g_gifFrameDelays[g_currentGifFrame])
         {
             g_currentGifFrame =
                 (g_currentGifFrame + 1) % g_gifFrames.size();
 
-            g_wicBitmapSource = g_gifFrames[g_currentGifFrame];
-            RecreateImageBitmap();
+            // If all frames are pre-uploaded, just swap the D2D pointer (no CPU→GPU upload)
+            if (g_currentGifFrame < g_gifD2DBitmaps.size() && g_gifD2DBitmaps[g_currentGifFrame])
+                g_d2dBitmap = g_gifD2DBitmaps[g_currentGifFrame];
+            else
+            {
+                g_wicBitmapSource = g_gifFrames[g_currentGifFrame];
+                RecreateImageBitmap();
+            }
 
             g_lastGifFrameTime = now;
         }
@@ -779,12 +784,8 @@ void UpdateEngine(float dt)
         : g_mainWindow;
 
     // Update button animations
-    static auto previousTime = std::chrono::high_resolution_clock::now();
-    auto currentTime = std::chrono::high_resolution_clock::now();
-    float deltaTime = std::chrono::duration<float>(currentTime - previousTime).count();
-    previousTime = currentTime;
     for (auto& [id, btn] : g_buttons)
-        btn.Update(deltaTime);
+        btn.Update(dt);
 
     for (auto& [id, txt] : g_textBoxes)
         txt.UpdateVisibility();
@@ -894,7 +895,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
         ShowWindow(hWnd, SW_HIDE);
     }
 
-    g_lastFrameTime = GetTickCount64();
+    g_renderTargetWindow = nullptr; // will be set once render target is created
     return TRUE;
 }
 
@@ -1509,13 +1510,14 @@ void CreateRenderTarget(HWND hWnd)
     if (FAILED(hr))
         return;
 
-    // 2. Get DXGI device
-    hr = g_d3dDevice.As(&g_dxgiDevice);
+    // 2. Get DXGI device (local — only needed here to create the swap chain)
+    ComPtr<IDXGIDevice> dxgiDevice;
+    hr = g_d3dDevice.As(&dxgiDevice);
     if (FAILED(hr))
         return;
 
     // 3. Create D2D device + context
-    hr = g_d2dFactory->CreateDevice(g_dxgiDevice.Get(), &g_d2dDevice);
+    hr = g_d2dFactory->CreateDevice(dxgiDevice.Get(), &g_d2dDevice);
     if (FAILED(hr))
         return;
 
@@ -1527,7 +1529,7 @@ void CreateRenderTarget(HWND hWnd)
 
     // 4. Create DXGI factory
     ComPtr<IDXGIAdapter> adapter;
-    hr = g_dxgiDevice->GetAdapter(&adapter);
+    hr = dxgiDevice->GetAdapter(&adapter);
     if (FAILED(hr))
         return;
 
@@ -1565,13 +1567,7 @@ void CreateRenderTarget(HWND hWnd)
     if (FAILED(hr))
         return;
 
-    D2D1_BITMAP_PROPERTIES1 props =
-        D2D1::BitmapProperties1(
-            D2D1_BITMAP_OPTIONS_TARGET |
-            D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-            D2D1::PixelFormat(
-                DXGI_FORMAT_B8G8R8A8_UNORM,
-                D2D1_ALPHA_MODE_PREMULTIPLIED));
+    D2D1_BITMAP_PROPERTIES1 props = SwapChainBitmapProps();
 
     hr = g_renderTarget->CreateBitmapFromDxgiSurface(
         surface.Get(),
@@ -1610,6 +1606,18 @@ void CreateRenderTarget(HWND hWnd)
             g_blurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
         }
     }
+
+    // Create cached brushes (reused every frame — avoids per-frame COM allocations)
+    g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &g_dimBrush);
+    g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &g_blackBrush);
+}
+
+// Returns the standard D2D1_BITMAP_PROPERTIES1 used for swap-chain target bitmaps.
+static D2D1_BITMAP_PROPERTIES1 SwapChainBitmapProps()
+{
+    return D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
 }
 
 void RecreateImageBitmap()
@@ -1944,6 +1952,7 @@ void InitializeButtons()
         {
             OpenPrevImage(g_renderTargetWindow);
             if (g_isSlideshowMode)
+                KillTimer(g_mainWindow, SLIDESHOW_TIMER_ID);
                 SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
         });
     g_buttons[BUTTON_PREVIOUS].UpdateLayout(g_renderTarget.Get());
@@ -1963,6 +1972,7 @@ void InitializeButtons()
         {
             OpenNextImage(g_renderTargetWindow);
             if (g_isSlideshowMode)
+                KillTimer(g_mainWindow, SLIDESHOW_TIMER_ID);
                 SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
         });
     g_buttons[BUTTON_NEXT].UpdateLayout(g_renderTarget.Get());
@@ -2109,6 +2119,30 @@ void InitializeImageInfoLabel()
     g_textBoxes[TEXTBOX_ZOOM_INPUT].UpdateLayout(g_renderTarget.Get());
 }
 
+// Stretches a bitmap to cover the full render target at the given opacity.
+static void DrawCoverBg(ID2D1Bitmap* bmp, float alpha)
+{
+    if (!bmp || !g_renderTarget || alpha <= 0.01f) return;
+
+    D2D1_SIZE_F sz = bmp->GetSize();
+    D2D1_SIZE_F rt = g_renderTarget->GetSize();
+
+    float scaleX     = rt.width  / sz.width;
+    float scaleY     = rt.height / sz.height;
+    float coverScale = max(scaleX, scaleY);
+
+    float destW = sz.width  * coverScale;
+    float destH = sz.height * coverScale;
+    float destX = (rt.width  - destW) * 0.5f;
+    float destY = (rt.height - destH) * 0.5f;
+
+    g_renderTarget->DrawBitmap(
+        bmp,
+        D2D1::RectF(destX, destY, destX + destW, destY + destH),
+        alpha,
+        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+}
+
 void Render(HWND hWnd)
 {
     // Only render into the currently active window to avoid accidentally
@@ -2126,6 +2160,20 @@ void Render(HWND hWnd)
     if (g_wicBitmapSource && !g_d2dBitmap)
         RecreateImageBitmap();
 
+    // On device loss, GIF D2D bitmaps are cleared — re-upload all frames.
+    if (g_isAnimatedGif && !g_gifFrames.empty() && g_gifD2DBitmaps.empty())
+    {
+        g_gifD2DBitmaps.reserve(g_gifFrames.size());
+        for (auto& wicFrame : g_gifFrames)
+        {
+            ComPtr<ID2D1Bitmap> bmp;
+            g_renderTarget->CreateBitmapFromWicBitmap(wicFrame.Get(), nullptr, &bmp);
+            g_gifD2DBitmaps.push_back(bmp);
+        }
+        if (g_currentGifFrame < g_gifD2DBitmaps.size() && g_gifD2DBitmaps[g_currentGifFrame])
+            g_d2dBitmap = g_gifD2DBitmaps[g_currentGifFrame];
+    }
+
     if (!g_d2dBitmap && g_wicDefaultBackground && !g_defaultBackgroundBitmap)
         CreateDefaultBackgroundBitmap();
 
@@ -2137,6 +2185,9 @@ void Render(HWND hWnd)
         CreateSlideshowBgBitmap();
 
     g_renderTarget->BeginDraw();
+
+    // Cache the render-target size once — used throughout this function.
+    const D2D1_SIZE_F rtSize = g_renderTarget->GetSize();
 
     // Clear background
     if (g_isFullscreen)
@@ -2161,42 +2212,16 @@ void Render(HWND hWnd)
     // ---- Background ----
     if (g_isSlideshowMode)
     {
-        // Helper: draw a small bitmap stretched to cover the full screen at given opacity
-        auto DrawCoverBg = [&](ID2D1Bitmap* bmp, float alpha)
-        {
-            if (!bmp || alpha <= 0.01f) return;
-
-            D2D1_SIZE_F sz = bmp->GetSize();
-            D2D1_SIZE_F rt = g_renderTarget->GetSize();
-
-            float scaleX     = rt.width  / sz.width;
-            float scaleY     = rt.height / sz.height;
-            float coverScale = max(scaleX, scaleY);
-
-            float destW = sz.width  * coverScale;
-            float destH = sz.height * coverScale;
-            float destX = (rt.width  - destW) * 0.5f;
-            float destY = (rt.height - destH) * 0.5f;
-
-            g_renderTarget->DrawBitmap(
-                bmp,
-                D2D1::RectF(destX, destY, destX + destW, destY + destH),
-                alpha,
-                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
-        };
-
         // Fade out old blurred bg, fade in new one
         DrawCoverBg(g_prevSlideshowBgBitmap.Get(), 1.0f - g_slideshowTransitionAlpha);
         DrawCoverBg(g_slideshowBgBitmap.Get(),             g_slideshowTransitionAlpha);
 
         // Uniform dim overlay on top of the blurred fill
-        D2D1_SIZE_F rt = g_renderTarget->GetSize();
-        ComPtr<ID2D1SolidColorBrush> dimBrush;
-        g_renderTarget->CreateSolidColorBrush(
-            D2D1::ColorF(0.f, 0.f, 0.f, 0.45f * g_overlayAlpha), &dimBrush);
-        if (dimBrush)
-            g_renderTarget->FillRectangle(
-                D2D1::RectF(0, 0, rt.width, rt.height), dimBrush.Get());
+        if (g_dimBrush)
+        {
+            g_dimBrush->SetColor(D2D1::ColorF(0.f, 0.f, 0.f, 0.45f * g_overlayAlpha));
+            g_renderTarget->FillRectangle(D2D1::RectF(0, 0, rtSize.width, rtSize.height), g_dimBrush.Get());
+        }
     }
     else if (g_isFullscreen && g_backgroundBitmap)
     {
@@ -2208,46 +2233,23 @@ void Render(HWND hWnd)
             1.0f
         );
 
-        ComPtr<ID2D1SolidColorBrush> brush;
-        g_renderTarget->CreateSolidColorBrush(
-            D2D1::ColorF(0, 0, 0, 0.67f * g_overlayAlpha),
-            brush.GetAddressOf()
-        );
-
-        if (brush)
+        if (g_dimBrush)
         {
+            g_dimBrush->SetColor(D2D1::ColorF(0, 0, 0, 0.67f * g_overlayAlpha));
             g_renderTarget->FillRectangle(
                 D2D1::RectF(0, 0, size.width, size.height),
-                brush.Get()
-            );
+                g_dimBrush.Get());
         }
     }    
     else if (!g_isFullscreen && g_slideshowBgBitmap)
     {
-        // Blurred image fills the windowed background
-        D2D1_SIZE_F sz = g_slideshowBgBitmap->GetSize();
-        D2D1_SIZE_F rt = g_renderTarget->GetSize();
-        float scaleX     = rt.width  / sz.width;
-        float scaleY     = rt.height / sz.height;
-        float coverScale = max(scaleX, scaleY);
-        float destW = sz.width  * coverScale;
-        float destH = sz.height * coverScale;
-        float destX = (rt.width  - destW) * 0.5f;
-        float destY = (rt.height - destH) * 0.5f;
-        g_renderTarget->DrawBitmap(
-            g_slideshowBgBitmap.Get(),
-            D2D1::RectF(destX, destY, destX + destW, destY + destH),
-            1.0f,
-            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        DrawCoverBg(g_slideshowBgBitmap.Get(), 1.0f);
 
         // Slight dim so the image on top has contrast
-        ComPtr<ID2D1SolidColorBrush> dimBrush;
-        g_renderTarget->CreateSolidColorBrush(
-            D2D1::ColorF(0.f, 0.f, 0.f, 0.35f), &dimBrush);
-        if (dimBrush)
+        if (g_dimBrush)
         {
-            D2D1_SIZE_F r = g_renderTarget->GetSize();
-            g_renderTarget->FillRectangle(D2D1::RectF(0, 0, r.width, r.height), dimBrush.Get());
+            g_dimBrush->SetColor(D2D1::ColorF(0.f, 0.f, 0.f, 0.35f));
+            g_renderTarget->FillRectangle(D2D1::RectF(0, 0, rtSize.width, rtSize.height), g_dimBrush.Get());
         }
     }
 
@@ -2343,26 +2345,31 @@ void Render(HWND hWnd)
             D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
         );
     }
-    D2D1_SIZE_F rtSize = g_renderTarget->GetSize();
+    //D2D1_SIZE_F rtSize = g_renderTarget->GetSize();
 
     // Pre-fade overlay: full-screen opaque black drawn on top of everything,
     // including UI, until the slideshow overlay has presented its first frame.
-    // This hides both the fade-to-black transition AND the device recreation gap.
-    if (g_slideshowPreFade && g_slideshowPreFadeAlpha > 0.01f)
+    if (g_slideshowPreFade && g_slideshowPreFadeAlpha > 0.01f && g_blackBrush)
     {
-        ComPtr<ID2D1SolidColorBrush> blackBrush;
-        g_renderTarget->CreateSolidColorBrush(
-            D2D1::ColorF(0.f, 0.f, 0.f, g_slideshowPreFadeAlpha), &blackBrush);
-        if (blackBrush)
-            g_renderTarget->FillRectangle(
-                D2D1::RectF(0, 0, rtSize.width, rtSize.height), blackBrush.Get());
+        g_blackBrush->SetColor(D2D1::ColorF(0.f, 0.f, 0.f, g_slideshowPreFadeAlpha));
+        g_renderTarget->FillRectangle(D2D1::RectF(0, 0, rtSize.width, rtSize.height), g_blackBrush.Get());
     }
 
     // Draw UI buttons
 
-    std::wstring text = std::to_wstring(int(std::round(g_zoom*100)));
-    if (!g_textBoxes[TEXTBOX_ZOOM_INPUT].IsFocused())
-        g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(text);
+    // Update zoom text box — only reformat when zoom value actually changes
+    {
+        static float s_lastDisplayedZoom = -1.f;
+        int zoomPct = int(std::round(g_zoom * 100));
+        if (!g_textBoxes[TEXTBOX_ZOOM_INPUT].IsFocused())
+        {
+            if (g_zoom != s_lastDisplayedZoom)
+            {
+                g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(std::to_wstring(zoomPct));
+                s_lastDisplayedZoom = g_zoom;
+            }
+        }
+    }
 
     for (auto& [id, btn] : g_buttons)
     {
@@ -2884,7 +2891,6 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         g_wicBitmapSource = g_gifFrames[0];
         g_lastGifFrameTime = GetTickCount64();
     }
-    // ============================================================
     // Static image (or non-GIF multi-frame): load frame 0
     // ============================================================
     else
@@ -2957,6 +2963,23 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     }
     // Create Direct2D Bitmap for the *current device*
     RecreateImageBitmap();
+
+    // Pre-upload all GIF frames to GPU so UpdateEngine can swap bitmaps
+    // without a CPU→GPU upload every frame.
+    if (g_isAnimatedGif && g_renderTarget)
+    {
+        g_gifD2DBitmaps.clear();
+        g_gifD2DBitmaps.reserve(g_gifFrames.size());
+        for (auto& wicFrame : g_gifFrames)
+        {
+            ComPtr<ID2D1Bitmap> bmp;
+            g_renderTarget->CreateBitmapFromWicBitmap(wicFrame.Get(), nullptr, &bmp);
+            g_gifD2DBitmaps.push_back(bmp);
+        }
+        // Point g_d2dBitmap at the first pre-uploaded frame
+        if (!g_gifD2DBitmaps.empty() && g_gifD2DBitmaps[0])
+            g_d2dBitmap = g_gifD2DBitmaps[0];
+    }
 
     // ------------------------------------------------------------
     // Restore state for new image (if exists)
@@ -3190,6 +3213,21 @@ void MakeZoomVisible(HWND hWnd)
     SetTimer(hWnd, 666, 1000, nullptr);
 }
 
+void InitFullScreenExit()
+{
+    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+    float centerX = g_offsetX + imgSize.width  * g_zoom / 2.0f;
+    float centerY = g_offsetY + imgSize.height * g_zoom / 2.0f;
+    
+    g_targetOffsetX = centerX - (imgSize.width * 0.05f) / 2.0f;
+    g_targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
+    
+    int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
+    g_smooth = 2*0.18f/((float)(refreshRate) / 60.0f);
+    g_targetZoom = 0.0005f;
+    g_isExiting = true;
+}
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 
@@ -3317,13 +3355,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         ComPtr<IDXGISurface> surface;
         if (SUCCEEDED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&surface))))
         {
-            D2D1_BITMAP_PROPERTIES1 props =
-                D2D1::BitmapProperties1(
-                    D2D1_BITMAP_OPTIONS_TARGET |
-                    D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                    D2D1::PixelFormat(
-                        DXGI_FORMAT_B8G8R8A8_UNORM,
-                        D2D1_ALPHA_MODE_PREMULTIPLIED));
+            D2D1_BITMAP_PROPERTIES1 props = SwapChainBitmapProps();
 
             if (SUCCEEDED(
                 g_renderTarget->CreateBitmapFromDxgiSurface(
@@ -3547,8 +3579,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     OpenNextImage(g_overlayWindow ? g_overlayWindow : g_mainWindow);
                     InitializeImageLayout(g_overlayWindow ? g_overlayWindow : g_mainWindow, true);
                 }
-                // Re-arm for next picture
-                SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
             }
         }
     }
@@ -3612,8 +3642,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
                     if (g_imageFiles.empty())
                     {
-                        g_currentImageIndex = -1;
-                        ExitFullscreen();
+                        InitFullScreenExit();
                         return 0;
                     }
 
@@ -3639,23 +3668,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 }
                 if (g_isFullscreen)
                 {
-                    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
-                    float centerX = g_offsetX + imgSize.width  * g_zoom / 2.0f;
-                    float centerY = g_offsetY + imgSize.height * g_zoom / 2.0f;
-
-                    g_targetOffsetX = centerX - (imgSize.width * 0.05f) / 2.0f;
-                    g_targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
-
-                    int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
-                    g_smooth = 2*0.18f/((float)(refreshRate) / 60.0f);
-                    g_targetZoom = 0.0005f;
+                    InitFullScreenExit();
+                    return 0;
                 }
-
-                g_isExiting = true;
-
-                return 0;
             }
-
+            break;
             case 0x46: // 'F' key
             {
                 if (!g_d2dBitmap)
@@ -3699,6 +3716,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             {
                 OpenPrevImage(hWnd);
                 if (g_isSlideshowMode)
+                    KillTimer(g_mainWindow, SLIDESHOW_TIMER_ID);
                     SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
                 return 0;
             }
@@ -3709,6 +3727,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             {
                 OpenNextImage(hWnd);
                 if (g_isSlideshowMode)
+                    KillTimer(g_mainWindow, SLIDESHOW_TIMER_ID);
                     SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
                 return 0;
             }
@@ -3740,28 +3759,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     EnterSlideshowMode();
                 return 0;
             }
-        }
-    }
-    break;
-
-    case WM_SYSCOMMAND:
-    {
-        switch (wParam & 0xFFF0)
-        {
-            case SC_MAXIMIZE:
-                if (!g_d2dBitmap)
-                {
-                    return DefWindowProc(hWnd, message, wParam, lParam);
-                }
-                else
-                {
-                    EnterFullscreen();
-                    return 0;
-                }
-
-            default:
-                // Let Windows handle all other system commands (menus, icon clicks, etc.)
-                return DefWindowProc(hWnd, message, wParam, lParam);
         }
     }
     break;
