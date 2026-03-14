@@ -167,6 +167,7 @@ ComPtr<ID2D1Bitmap>                                 g_slideshowBgBitmap;        
 ComPtr<ID2D1Bitmap>                                 g_prevSlideshowBgBitmap;     // blurred bg fading out
 ComPtr<ID2D1Bitmap>                                 g_prevD2DBitmap;             // image bitmap fading out
 ComPtr<ID2D1Effect>                                 g_blurEffect;                // reusable Gaussian blur effect
+ComPtr<ID2D1Bitmap>                                 g_shadowSourceBitmap;        // small mip-extracted D2D bitmap used as shadow input
 float                                               g_slideshowTransitionAlpha   = 1.0f;  // 0 = show prev, 1 = show new
 float                                               g_slideshowTargetAlpha       = 1.0f;
 float                                               g_prevImageZoom              = 1.0f;
@@ -215,6 +216,7 @@ static D2D1_BITMAP_PROPERTIES1 SwapChainBitmapProps();
 bool CreateMipTextureFromSource(IWICBitmapSource* wicSrc);
 void CreateD3DImagePipeline();
 static void RenderImageD3D11(float imgW, float imgH, float opacity, bool isPrev = false);
+static ComPtr<ID2D1Bitmap> ExtractMipAsD2DBitmap(UINT targetMaxPx);
 void InitializeImageLayout(HWND hWnd, bool hard);
 void Render(HWND hWnd);
 bool LoadImageD2D(HWND hWnd, const wchar_t* filename);
@@ -721,6 +723,7 @@ void DiscardDeviceResources()
     g_d2dDevice.Reset();
     g_shadowEffect.Reset();
     g_blurEffect.Reset();
+    g_shadowSourceBitmap.Reset();
     g_renderTargetWindow = nullptr;
 
     // D3D11 mip image pipeline
@@ -1139,54 +1142,76 @@ void UpdateTargetZoom(float newZoom)
 }
 
 // -----------------------------------------------------------------------
-// Builds a small (25 %) D2D bitmap that has been blurred through the
-// Gaussian-blur effect and stored off-screen, ready for DrawBitmap.
+// Builds a small blurred D2D bitmap used as the slideshow background fill.
+// Instead of doing an expensive CPU WIC downscale, we pull a small mip
+// level directly from the already-built GPU mip chain via a staging readback
+// — the GPU already downscaled the image for free as part of GenerateMips.
 // Must be called outside BeginDraw/EndDraw (or before BeginDraw in Render).
 // -----------------------------------------------------------------------
 void CreateSlideshowBgBitmap()
 {
     g_slideshowBgBitmap.Reset();
 
-    if (!g_renderTarget || !g_wicBitmapSource || !g_blurEffect || !g_wicFactory)
+    if (!g_renderTarget || !g_blurEffect)
         return;
 
-    UINT fullW = 0, fullH = 0;
-    if (FAILED(g_wicBitmapSource->GetSize(&fullW, &fullH)) || fullW == 0 || fullH == 0)
-        return;
-
-    // ----- 1. Downscale to a fixed max size so blur always produces
-    //          an indistinct color wash regardless of source resolution -----
-    const UINT TARGET_MAX = 400u;
-    float scaleRatio = min((float)TARGET_MAX / fullW, (float)TARGET_MAX / fullH);
-    const UINT smallW = max(1u, (UINT)(fullW * scaleRatio));
-    const UINT smallH = max(1u, (UINT)(fullH * scaleRatio));
-
-    ComPtr<IWICBitmapScaler> scaler;
-    if (FAILED(g_wicFactory->CreateBitmapScaler(&scaler))) return;
-    if (FAILED(scaler->Initialize(g_wicBitmapSource.Get(), smallW, smallH,
-                                   WICBitmapInterpolationModeHighQualityCubic))) return;
-
-    ComPtr<IWICFormatConverter> conv;
-    if (FAILED(g_wicFactory->CreateFormatConverter(&conv))) return;
-    if (FAILED(conv->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
-                                 WICBitmapDitherTypeNone, nullptr, 0.f,
-                                 WICBitmapPaletteTypeCustom))) return;
-
-    // ----- 2. Create small D2D source bitmap -----
+    // ----- 1. Get a small source bitmap -----
+    // Prefer the GPU mip chain (fast, already computed).
+    // Fall back to the WIC CPU path if the mip texture is not yet available
+    // (e.g. during the very first frame before RecreateImageBitmap finishes).
     ComPtr<ID2D1Bitmap> smallBmp;
-    if (FAILED(g_renderTarget->CreateBitmapFromWicBitmap(
-            conv.Get(), nullptr, &smallBmp))) return;
 
-    // ----- 3. Create off-screen render target at the same small size -----
+    if (g_imageMipTex)
+    {
+        // Pick a mip whose longest edge is ~400 px — enough colour detail for a blur wash.
+        smallBmp = ExtractMipAsD2DBitmap(400u);
+    }
+
+    if (!smallBmp)
+    {
+        // CPU fallback (original path): WIC downscale to ≤400 px then upload.
+        if (!g_wicBitmapSource || !g_wicFactory) return;
+
+        UINT fullW = 0, fullH = 0;
+        if (FAILED(g_wicBitmapSource->GetSize(&fullW, &fullH)) || fullW == 0 || fullH == 0)
+            return;
+
+        const UINT TARGET_MAX = 400u;
+        float scaleRatio = min((float)TARGET_MAX / fullW, (float)TARGET_MAX / fullH);
+        const UINT smallW = max(1u, (UINT)(fullW * scaleRatio));
+        const UINT smallH = max(1u, (UINT)(fullH * scaleRatio));
+
+        ComPtr<IWICBitmapScaler> scaler;
+        if (FAILED(g_wicFactory->CreateBitmapScaler(&scaler))) return;
+        if (FAILED(scaler->Initialize(g_wicBitmapSource.Get(), smallW, smallH,
+                                       WICBitmapInterpolationModeHighQualityCubic))) return;
+
+        ComPtr<IWICFormatConverter> conv;
+        if (FAILED(g_wicFactory->CreateFormatConverter(&conv))) return;
+        if (FAILED(conv->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
+                                     WICBitmapDitherTypeNone, nullptr, 0.f,
+                                     WICBitmapPaletteTypeCustom))) return;
+
+        ComPtr<ID2D1Bitmap> tmp;
+        if (FAILED(g_renderTarget->CreateBitmapFromWicBitmap(conv.Get(), nullptr, &tmp)))
+            return;
+        smallBmp = tmp;
+    }
+
+    if (!smallBmp) return;
+
+    D2D1_SIZE_U smallSz = smallBmp->GetPixelSize();
+
+    // ----- 2. Create off-screen render target at the small bitmap's size -----
     D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_TARGET,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
 
     ComPtr<ID2D1Bitmap1> offscreenBmp;
     if (FAILED(g_renderTarget->CreateBitmap(
-            D2D1::SizeU(smallW, smallH), nullptr, 0, bmpProps, &offscreenBmp))) return;
+            smallSz, nullptr, 0, bmpProps, &offscreenBmp))) return;
 
-    // ----- 4. Render blur to the off-screen bitmap -----
+    // ----- 3. Render the Gaussian blur into the off-screen bitmap -----
     g_blurEffect->SetInput(0, smallBmp.Get());
 
     ComPtr<ID2D1Image> prevTarget;
@@ -1200,7 +1225,7 @@ void CreateSlideshowBgBitmap()
 
     g_renderTarget->SetTarget(prevTarget.Get());
 
-    // ----- 5. Store — ID2D1Bitmap1 is a ID2D1Bitmap -----
+    // ----- 4. Store -----
     g_slideshowBgBitmap = offscreenBmp;
 }
 
@@ -2008,6 +2033,71 @@ bool CreateMipTextureFromSource(IWICBitmapSource* wicSrc)
     return true;
 }
 
+// Extract one mip level from g_imageMipTex as a small D2D bitmap.
+// targetMaxPx is the desired maximum dimension — we pick the smallest mip
+// level whose max dimension is still >= targetMaxPx (so we never upscale).
+// The GPU already computed all mip levels, so this is just a cheap readback.
+static ComPtr<ID2D1Bitmap> ExtractMipAsD2DBitmap(UINT targetMaxPx)
+{
+    if (!g_imageMipTex || !g_d3dDevice || !g_d3dContext || !g_renderTarget)
+        return nullptr;
+
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    g_imageMipTex->GetDesc(&texDesc);
+
+    // Walk down the mip chain until the next level would be smaller than targetMaxPx.
+    UINT mipLevel = 0;
+    for (UINT m = 1; m < texDesc.MipLevels; ++m)
+    {
+        UINT mW = max(1u, texDesc.Width  >> m);
+        UINT mH = max(1u, texDesc.Height >> m);
+        if (max(mW, mH) < targetMaxPx) break;
+        mipLevel = m;
+    }
+
+    UINT mipW = max(1u, texDesc.Width  >> mipLevel);
+    UINT mipH = max(1u, texDesc.Height >> mipLevel);
+
+    // Staging texture — CPU-readable copy of the chosen mip level.
+    D3D11_TEXTURE2D_DESC stagDesc = {};
+    stagDesc.Width              = mipW;
+    stagDesc.Height             = mipH;
+    stagDesc.MipLevels          = 1;
+    stagDesc.ArraySize          = 1;
+    stagDesc.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    stagDesc.SampleDesc.Count   = 1;
+    stagDesc.Usage              = D3D11_USAGE_STAGING;
+    stagDesc.CPUAccessFlags     = D3D11_CPU_ACCESS_READ;
+
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(g_d3dDevice->CreateTexture2D(&stagDesc, nullptr, &staging)))
+        return nullptr;
+
+    g_d3dContext->CopySubresourceRegion(
+        staging.Get(), 0, 0, 0, 0,
+        g_imageMipTex.Get(),
+        D3D11CalcSubresource(mipLevel, 0, texDesc.MipLevels),
+        nullptr);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(g_d3dContext->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+        return nullptr;
+
+    D2D1_BITMAP_PROPERTIES bmpProps = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+    ComPtr<ID2D1Bitmap> bmp;
+    g_renderTarget->CreateBitmap(
+        D2D1::SizeU(mipW, mipH),
+        mapped.pData,
+        mapped.RowPitch,
+        bmpProps,
+        &bmp);
+
+    g_d3dContext->Unmap(staging.Get(), 0);
+    return bmp;
+}
+
 // Draw the image as a D3D11 textured quad with trilinear filtering.
 // Must be called BETWEEN two D2D EndDraw/BeginDraw pairs (not inside BeginDraw).
 // Uses the global g_zoom / g_offsetX / g_offsetY / g_imageRotationAngle to build
@@ -2089,6 +2179,7 @@ void RecreateImageBitmap()
         return;
 
     g_d2dBitmap.Reset();
+    g_shadowSourceBitmap.Reset();
 
     // D3D11 maximum texture dimension is 16384. If the source exceeds this,
     // downscale via WIC before creating the D2D bitmap.
@@ -2134,7 +2225,14 @@ void RecreateImageBitmap()
     // Also build the D3D11 mip texture for cache-friendly trilinear rendering.
     // We pass the (possibly downscaled) WIC source so the texture matches the D2D bitmap size.
     if (g_mipPipelineReady)
+    {
         CreateMipTextureFromSource(bitmapSourceForD2D.Get());
+
+        // Extract a ~256 px mip for use as the shadow effect input.
+        // The shadow is a blurred silhouette — full resolution is wasted here.
+        // This small bitmap is created once per image load and reused every frame.
+        g_shadowSourceBitmap = ExtractMipAsD2DBitmap(256u);
+    }
 }
 
 void InitializeImageLayout(HWND hWnd, bool hard = false)
@@ -2845,10 +2943,29 @@ void Render(HWND hWnd)
         if (g_slideshowPreFade)
             imgOpacity *= (1.0f - g_slideshowPreFadeAlpha);
 
-        // Shadow is still rendered through D2D (its input IS the D2D bitmap)
-        if (g_shadowEffect && g_d2dBitmap)
+        // Shadow: use the pre-extracted small mip bitmap (set once per image load).
+        // The small bitmap covers the same logical image rect as the full one, so we
+        // push an extra scale that maps (shadowW x shadowH) → (imgW x imgH) before
+        // applying the normal pan/zoom/rotation transform already on the context.
+        // Result is visually identical to using the full bitmap — sigma=25 destroys
+        // all detail — but the blur input is maybe 256×170 instead of 8000×5400.
+        ID2D1Bitmap* shadowSrc = g_shadowSourceBitmap
+                                 ? g_shadowSourceBitmap.Get()
+                                 : (g_d2dBitmap ? g_d2dBitmap.Get() : nullptr);
+
+        if (g_shadowEffect && shadowSrc)
         {
-            g_shadowEffect->SetInput(0, g_d2dBitmap.Get());
+            D2D1_SIZE_F shSz = shadowSrc->GetSize();
+            float scaleX = (shSz.width  > 0.f) ? imgSize.width  / shSz.width  : 1.f;
+            float scaleY = (shSz.height > 0.f) ? imgSize.height / shSz.height : 1.f;
+
+            // Temporarily extend the current transform with the small→full scale.
+            D2D1::Matrix3x2F shadowScale =
+                D2D1::Matrix3x2F::Scale(scaleX, scaleY, D2D1::Point2F(0.f, 0.f));
+
+            g_renderTarget->SetTransform(shadowScale * baseTransform * rotation);
+
+            g_shadowEffect->SetInput(0, shadowSrc);
             g_renderTarget->PushLayer(
                 D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr,
                     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
@@ -2856,6 +2973,9 @@ void Render(HWND hWnd)
                 nullptr);
             g_renderTarget->DrawImage(g_shadowEffect.Get(), D2D1::Point2F(0.0f, 0.0f));
             g_renderTarget->PopLayer();
+
+            // Restore the normal transform for anything drawn after.
+            g_renderTarget->SetTransform(baseTransform * rotation);
         }
 
         // Decide which path draws the image bitmap itself:
