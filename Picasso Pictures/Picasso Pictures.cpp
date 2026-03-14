@@ -40,6 +40,8 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+#include <d3dcompiler.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -119,6 +121,7 @@ float                                               g_smooth = 0.13f;
 bool                                                g_pendingPreserveView = false;
 std::vector<ComPtr<IWICBitmapSource>>               g_gifFrames;
 std::vector<ComPtr<ID2D1Bitmap>>                    g_gifD2DBitmaps;         // pre-uploaded GPU bitmaps for each GIF frame
+std::vector<ComPtr<ID3D11ShaderResourceView>>       g_gifD3DSRVs;            // pre-uploaded D3D11 mip SRVs for each GIF frame
 DWORD                                               g_lastGifFrameTime = 0;
 std::vector<UINT>                                   g_gifFrameDelays;
 UINT                                                g_currentGifFrame = 0;
@@ -136,6 +139,27 @@ std::unordered_map<int, AnimatedButton>             g_buttons;
 // Cached solid-color brushes (created once, reused every frame)
 ComPtr<ID2D1SolidColorBrush>                        g_dimBrush;
 ComPtr<ID2D1SolidColorBrush>                        g_blackBrush;
+
+// ---- D3D11 mip-mapped image rendering pipeline ----
+ComPtr<ID3D11Texture2D>                             g_imageMipTex;          // Full mip chain for the current image
+ComPtr<ID3D11ShaderResourceView>                    g_imageSRV;             // SRV: all mip levels
+ComPtr<ID3D11SamplerState>                          g_trilinearSampler;     // Trilinear / aniso sampler
+ComPtr<ID3D11VertexShader>                          g_imageVS;
+ComPtr<ID3D11PixelShader>                           g_imagePS;
+ComPtr<ID3D11InputLayout>                           g_imageIL;
+ComPtr<ID3D11Buffer>                                g_imageVB;              // Dynamic quad verts (4 × 16 bytes)
+ComPtr<ID3D11Buffer>                                g_imageCB;              // Dynamic constant buffer
+ComPtr<ID3D11BlendState>                            g_imageBlend;           // Pre-multiplied alpha blend
+ComPtr<ID3D11RasterizerState>                       g_imageRast;
+ComPtr<ID3D11DepthStencilState>                     g_imageDS;
+ComPtr<ID3D11RenderTargetView>                      g_swapRTV;              // RTV wrapping swap-chain buffer 0
+bool                                                g_mipPipelineReady = false;
+
+// ---- Vignette animated visibility ----
+float                                               g_topVignetteVisibility    = 0.f;
+float                                               g_topVignetteTarget        = 0.f;
+float                                               g_bottomVignetteVisibility = 0.f;
+float                                               g_bottomVignetteTarget     = 0.f;
 
 // ---- Slideshow mode ----
 bool                                                g_isSlideshowMode            = false;
@@ -188,6 +212,9 @@ void DestroyBlackCoverWindow();
 void CreateRenderTarget(HWND hWnd);
 void RecreateImageBitmap();
 static D2D1_BITMAP_PROPERTIES1 SwapChainBitmapProps();
+bool CreateMipTextureFromSource(IWICBitmapSource* wicSrc);
+void CreateD3DImagePipeline();
+static void RenderImageD3D11(float imgW, float imgH, float opacity, bool isPrev = false);
 void InitializeImageLayout(HWND hWnd, bool hard);
 void Render(HWND hWnd);
 bool LoadImageD2D(HWND hWnd, const wchar_t* filename);
@@ -678,6 +705,7 @@ void DiscardDeviceResources()
     g_prevSlideshowBgBitmap.Reset();
     g_prevD2DBitmap.Reset();
     g_gifD2DBitmaps.clear();
+    g_gifD3DSRVs.clear();
 
     // Cached brushes
     g_dimBrush.Reset();
@@ -694,6 +722,21 @@ void DiscardDeviceResources()
     g_shadowEffect.Reset();
     g_blurEffect.Reset();
     g_renderTargetWindow = nullptr;
+
+    // D3D11 mip image pipeline
+    g_imageMipTex.Reset();
+    g_imageSRV.Reset();
+    g_imageVS.Reset();
+    g_imagePS.Reset();
+    g_imageIL.Reset();
+    g_imageVB.Reset();
+    g_imageCB.Reset();
+    g_trilinearSampler.Reset();
+    g_imageBlend.Reset();
+    g_imageRast.Reset();
+    g_imageDS.Reset();
+    g_swapRTV.Reset();
+    g_mipPipelineReady = false;
 }
 
 void UpdateEngine(float dt)
@@ -708,11 +751,17 @@ void UpdateEngine(float dt)
 
             // If all frames are pre-uploaded, just swap the D2D pointer (no CPU→GPU upload)
             if (g_currentGifFrame < g_gifD2DBitmaps.size() && g_gifD2DBitmaps[g_currentGifFrame])
+            {
                 g_d2dBitmap = g_gifD2DBitmaps[g_currentGifFrame];
+
+                // Also swap the D3D11 mip SRV so the trilinear path shows the correct frame
+                if (g_currentGifFrame < g_gifD3DSRVs.size() && g_gifD3DSRVs[g_currentGifFrame])
+                    g_imageSRV = g_gifD3DSRVs[g_currentGifFrame];
+            }
             else
             {
                 g_wicBitmapSource = g_gifFrames[g_currentGifFrame];
-                RecreateImageBitmap();
+                RecreateImageBitmap();  // also rebuilds g_imageSRV via CreateMipTextureFromSource
             }
 
             g_lastGifFrameTime = now;
@@ -789,6 +838,11 @@ void UpdateEngine(float dt)
 
     for (auto& [id, txt] : g_textBoxes)
         txt.UpdateVisibility();
+
+    // Smooth-animate vignette visibility (same feel as buttons: ~0.08 falloff)
+    const float VIGN_FALLOFF = 0.08f;
+    g_topVignetteVisibility    += (g_topVignetteTarget    - g_topVignetteVisibility)    * VIGN_FALLOFF;
+    g_bottomVignetteVisibility += (g_bottomVignetteTarget - g_bottomVignetteVisibility) * VIGN_FALLOFF;
 
     InvalidateRect(renderWindow, nullptr, FALSE);
 
@@ -1610,6 +1664,19 @@ void CreateRenderTarget(HWND hWnd)
     // Create cached brushes (reused every frame — avoids per-frame COM allocations)
     g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &g_dimBrush);
     g_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.f), &g_blackBrush);
+
+    // Create a D3D11 RTV wrapping the swap-chain back buffer.
+    // This RTV is used later to bind the back buffer as a D3D11 render target
+    // in-between two D2D BeginDraw/EndDraw pairs so the D3D11 mip quad draw
+    // is composited on top of the D2D background / below the D2D UI.
+    {
+        ComPtr<ID3D11Texture2D> backBuf;
+        if (SUCCEEDED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuf))))
+            g_d3dDevice->CreateRenderTargetView(backBuf.Get(), nullptr, &g_swapRTV);
+    }
+
+    // Build shaders, sampler, states for the D3D11 mip-mapped image path.
+    CreateD3DImagePipeline();
 }
 
 // Returns the standard D2D1_BITMAP_PROPERTIES1 used for swap-chain target bitmaps.
@@ -1618,6 +1685,402 @@ static D2D1_BITMAP_PROPERTIES1 SwapChainBitmapProps()
     return D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+}
+
+// ============================================================
+//  D3D11 mip-mapped image rendering pipeline
+// ============================================================
+
+// Embedded HLSL — vertex shader
+static const char* g_imageVSHLSL = R"(
+cbuffer CBTransform : register(b0)
+{
+    row_major float4x4 g_transform;
+    float    g_opacity;
+    float3   g_pad;
+};
+struct VSIn  { float2 pos : POSITION; float2 uv  : TEXCOORD0; };
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+VSOut main(VSIn v)
+{
+    VSOut o;
+    o.pos = mul(g_transform, float4(v.pos, 0.0f, 1.0f));
+    o.uv  = v.uv;
+    return o;
+}
+)";
+
+// Embedded HLSL — pixel shader (trilinear comes from the sampler state)
+static const char* g_imagePSHLSL = R"(
+Texture2D    g_texture : register(t0);
+SamplerState g_sampler : register(s0);
+cbuffer CBTransform : register(b0)
+{
+    row_major float4x4 g_transform;
+    float    g_opacity;
+    float3   g_pad;
+};
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target
+{
+    float4 col = g_texture.Sample(g_sampler, uv);
+    col *= g_opacity;   // premultiplied-alpha opacity
+    return col;
+}
+)";
+
+struct ImageVertex { float x, y, u, v; };
+
+struct alignas(16) CBImageTransform {
+    float m[16];        // row-major 4×4  image-space → clip-space
+    float opacity;
+    float pad[3];
+};
+
+// Simple row-major 4×4 multiply: C = A * B
+static void Mat4Mul(const float A[16], const float B[16], float C[16])
+{
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            C[r*4+c] = 0.f;
+            for (int k = 0; k < 4; ++k)
+                C[r*4+c] += A[r*4+k] * B[k*4+c];
+        }
+}
+
+// Build a row-major matrix that maps image-space points (x∈[0,imgW], y∈[0,imgH])
+// directly to clip-space (NDC), accounting for pan, zoom, and rotation.
+static void BuildImageToClip(float out[16],
+    float imgW,    float imgH,
+    float zoom,    float offsetX,  float offsetY,
+    float rotDeg,
+    float screenW, float screenH)
+{
+    const float PI = 3.14159265359f;
+    float theta = rotDeg * (PI / 180.f);
+    float cosT  = cosf(theta);
+    float sinT  = sinf(theta);
+
+    // Screen-space centre of the image (rotation pivot)
+    float cx = offsetX + imgW * zoom * 0.5f;
+    float cy = offsetY + imgH * zoom * 0.5f;
+
+    // S: image-space → screen-space  (x_s = x_i*zoom + offsetX)
+    float S[16] = {
+        zoom, 0.f,  0.f, offsetX,
+        0.f,  zoom, 0.f, offsetY,
+        0.f,  0.f,  1.f, 0.f,
+        0.f,  0.f,  0.f, 1.f,
+    };
+
+    // R: 2-D rotation around (cx, cy) in screen-space
+    float R[16] = {
+         cosT, -sinT, 0.f,  cx*(1.f-cosT) + cy*sinT,
+         sinT,  cosT, 0.f,  cy*(1.f-cosT) - cx*sinT,
+         0.f,   0.f,  1.f,  0.f,
+         0.f,   0.f,  0.f,  1.f,
+    };
+
+    // N: screen-space → NDC
+    float N[16] = {
+         2.f/screenW,          0.f, 0.f, -1.f,
+         0.f,         -2.f/screenH, 0.f,  1.f,
+         0.f,                  0.f, 1.f,  0.f,
+         0.f,                  0.f, 0.f,  1.f,
+    };
+
+    float RS[16], NRS[16];
+    Mat4Mul(R, S, RS);
+    Mat4Mul(N, RS, NRS);
+    memcpy(out, NRS, 16 * sizeof(float));
+}
+
+// Create all device-once objects for the D3D11 image draw path.
+// Called once per device creation (from CreateRenderTarget).
+void CreateD3DImagePipeline()
+{
+    g_mipPipelineReady = false;
+    if (!g_d3dDevice || !g_d3dContext) return;
+
+    HRESULT hr;
+
+    // ----- Compile shaders at runtime -----
+    ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
+
+    hr = D3DCompile(g_imageVSHLSL, strlen(g_imageVSHLSL),
+        "ImageVS", nullptr, nullptr, "main", "vs_4_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob);
+    if (FAILED(hr)) {
+        if (errBlob)
+            OutputDebugStringA((char*)errBlob->GetBufferPointer());
+        return;
+    }
+
+    hr = D3DCompile(g_imagePSHLSL, strlen(g_imagePSHLSL),
+        "ImagePS", nullptr, nullptr, "main", "ps_4_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob);
+    if (FAILED(hr)) {
+        if (errBlob)
+            OutputDebugStringA((char*)errBlob->GetBufferPointer());
+        return;
+    }
+
+    hr = g_d3dDevice->CreateVertexShader(
+        vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_imageVS);
+    if (FAILED(hr)) return;
+
+    hr = g_d3dDevice->CreatePixelShader(
+        psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_imagePS);
+    if (FAILED(hr)) return;
+
+    // ----- Input layout: POSITION float2, TEXCOORD0 float2 -----
+    D3D11_INPUT_ELEMENT_DESC ilDesc[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0,  8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    hr = g_d3dDevice->CreateInputLayout(
+        ilDesc, 2, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_imageIL);
+    if (FAILED(hr)) return;
+
+    // ----- Dynamic vertex buffer (4 vertices, updated every draw) -----
+    D3D11_BUFFER_DESC vbDesc = {};
+    vbDesc.ByteWidth      = sizeof(ImageVertex) * 4;
+    vbDesc.Usage          = D3D11_USAGE_DYNAMIC;
+    vbDesc.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
+    vbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_d3dDevice->CreateBuffer(&vbDesc, nullptr, &g_imageVB);
+    if (FAILED(hr)) return;
+
+    // ----- Dynamic constant buffer -----
+    D3D11_BUFFER_DESC cbDesc = {};
+    cbDesc.ByteWidth      = sizeof(CBImageTransform);
+    cbDesc.Usage          = D3D11_USAGE_DYNAMIC;
+    cbDesc.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_d3dDevice->CreateBuffer(&cbDesc, nullptr, &g_imageCB);
+    if (FAILED(hr)) return;
+
+    // ----- Trilinear sampler (the key to cache-friendly zoom-out) -----
+    D3D11_SAMPLER_DESC sampDesc = {};
+    sampDesc.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;   // trilinear
+    sampDesc.AddressU       = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressV       = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressW       = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.MipLODBias     = 0.f;
+    sampDesc.MaxAnisotropy  = 1;
+    sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sampDesc.MinLOD         = 0.f;
+    sampDesc.MaxLOD         = D3D11_FLOAT32_MAX;
+    hr = g_d3dDevice->CreateSamplerState(&sampDesc, &g_trilinearSampler);
+    if (FAILED(hr)) return;
+
+    // ----- Pre-multiplied alpha blend state -----
+    D3D11_BLEND_DESC blendDesc = {};
+    blendDesc.RenderTarget[0].BlendEnable           = TRUE;
+    blendDesc.RenderTarget[0].SrcBlend              = D3D11_BLEND_ONE;        // src already premultiplied
+    blendDesc.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
+    blendDesc.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+    blendDesc.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ONE;
+    blendDesc.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_INV_SRC_ALPHA;
+    blendDesc.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = g_d3dDevice->CreateBlendState(&blendDesc, &g_imageBlend);
+    if (FAILED(hr)) return;
+
+    // ----- Rasterizer: no culling (quad is always front-facing) -----
+    D3D11_RASTERIZER_DESC rastDesc = {};
+    rastDesc.FillMode = D3D11_FILL_SOLID;
+    rastDesc.CullMode = D3D11_CULL_NONE;
+    hr = g_d3dDevice->CreateRasterizerState(&rastDesc, &g_imageRast);
+    if (FAILED(hr)) return;
+
+    // ----- Depth-stencil: no depth test -----
+    D3D11_DEPTH_STENCIL_DESC dsDesc = {};
+    dsDesc.DepthEnable   = FALSE;
+    dsDesc.StencilEnable = FALSE;
+    hr = g_d3dDevice->CreateDepthStencilState(&dsDesc, &g_imageDS);
+    if (FAILED(hr)) return;
+
+    g_mipPipelineReady = true;
+}
+
+// Upload a WIC image into a D3D11 Texture2D with a full mip chain,
+// then call GenerateMips so the GPU can trilinearly filter during zoom-out.
+// The full-resolution pixels are uploaded to mip 0; all lower mips are
+// generated on the GPU (fast, high quality).
+bool CreateMipTextureFromSource(IWICBitmapSource* wicSrc)
+{
+    g_imageMipTex.Reset();
+    g_imageSRV.Reset();
+
+    if (!wicSrc || !g_d3dDevice || !g_d3dContext) return false;
+
+    UINT srcW = 0, srcH = 0;
+    if (FAILED(wicSrc->GetSize(&srcW, &srcH)) || srcW == 0 || srcH == 0) return false;
+
+    // Clamp to D3D11 maximum texture dimension
+    const UINT D3D_MAX = 16384u;
+    float ratio = min(1.0f, min((float)D3D_MAX / srcW, (float)D3D_MAX / srcH));
+    UINT texW = max(1u, (UINT)(srcW * ratio));
+    UINT texH = max(1u, (UINT)(srcH * ratio));
+
+    // Compute how many mip levels fit
+    UINT mipLevels = 1u + (UINT)floorf(log2f((float)max(texW, texH)));
+
+    // Create texture with D3D11_RESOURCE_MISC_GENERATE_MIPS so GenerateMips works.
+    // We must include D3D11_BIND_RENDER_TARGET for GenerateMips to work.
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width              = texW;
+    texDesc.Height             = texH;
+    texDesc.MipLevels          = 0;    // 0 = allocate the full mip chain
+    texDesc.ArraySize          = 1;
+    texDesc.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    texDesc.SampleDesc.Count   = 1;
+    texDesc.Usage              = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags          = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    texDesc.MiscFlags          = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+
+    ComPtr<ID3D11Texture2D> tex;
+    if (FAILED(g_d3dDevice->CreateTexture2D(&texDesc, nullptr, &tex))) return false;
+
+    // ----- Get the actual mip count that was allocated -----
+    tex->GetDesc(&texDesc);   // mipLevels is now filled by the driver
+
+    // ----- Decode (and optionally scale) the image to BGRA pixels -----
+    ComPtr<IWICBitmapSource> src = wicSrc;
+
+    // Downscale via WIC if the source exceeds our texture dimensions
+    if (srcW != texW || srcH != texH)
+    {
+        ComPtr<IWICBitmapScaler> scaler;
+        ComPtr<IWICFormatConverter> conv;
+        if (SUCCEEDED(g_wicFactory->CreateBitmapScaler(&scaler)) &&
+            SUCCEEDED(scaler->Initialize(wicSrc, texW, texH,
+                                         WICBitmapInterpolationModeHighQualityCubic)) &&
+            SUCCEEDED(g_wicFactory->CreateFormatConverter(&conv)) &&
+            SUCCEEDED(conv->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
+                                        WICBitmapDitherTypeNone, nullptr, 0.f,
+                                        WICBitmapPaletteTypeCustom)))
+            src = conv;
+        else
+            return false;
+    }
+    else
+    {
+        // Still need BGRA pixel format
+        GUID fmt = {};
+        wicSrc->GetPixelFormat(&fmt);
+        if (!IsEqualGUID(fmt, GUID_WICPixelFormat32bppPBGRA))
+        {
+            ComPtr<IWICFormatConverter> conv;
+            if (SUCCEEDED(g_wicFactory->CreateFormatConverter(&conv)) &&
+                SUCCEEDED(conv->Initialize(wicSrc, GUID_WICPixelFormat32bppPBGRA,
+                                            WICBitmapDitherTypeNone, nullptr, 0.f,
+                                            WICBitmapPaletteTypeCustom)))
+                src = conv;
+        }
+    }
+
+    // Copy pixels from WIC
+    const UINT stride  = texW * 4;
+    const size_t bytes = (size_t)stride * texH;
+    std::vector<BYTE> pixels(bytes);
+    WICRect rc { 0, 0, (INT)texW, (INT)texH };
+    if (FAILED(src->CopyPixels(&rc, stride, (UINT)bytes, pixels.data()))) return false;
+
+    // Upload mip 0
+    g_d3dContext->UpdateSubresource(tex.Get(), 0, nullptr, pixels.data(), stride, 0);
+
+    // ----- Create SRV (all mip levels) so the sampler can access them -----
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srvDesc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    srvDesc.Texture2D.MipLevels       = (UINT)-1;  // all levels
+
+    ComPtr<ID3D11ShaderResourceView> srv;
+    if (FAILED(g_d3dDevice->CreateShaderResourceView(tex.Get(), &srvDesc, &srv))) return false;
+
+    // ----- GPU-generate all lower mip levels (very fast) -----
+    g_d3dContext->GenerateMips(srv.Get());
+
+    g_imageMipTex = tex;
+    g_imageSRV    = srv;
+    return true;
+}
+
+// Draw the image as a D3D11 textured quad with trilinear filtering.
+// Must be called BETWEEN two D2D EndDraw/BeginDraw pairs (not inside BeginDraw).
+// Uses the global g_zoom / g_offsetX / g_offsetY / g_imageRotationAngle to build
+// the transform matrix each frame.
+static void RenderImageD3D11(float imgW, float imgH, float opacity, bool /*isPrev*/)
+{
+    if (!g_mipPipelineReady || !g_imageSRV || !g_swapRTV) return;
+    if (!g_d3dDevice || !g_d3dContext)                    return;
+    if (opacity < 0.001f)                                  return;
+
+    const D2D1_SIZE_F rtSize = g_renderTarget->GetSize();
+    const float W = rtSize.width;
+    const float H = rtSize.height;
+
+    // ----- Update constant buffer -----
+    CBImageTransform cb = {};
+    BuildImageToClip(cb.m, imgW, imgH,
+                     g_zoom, g_offsetX, g_offsetY,
+                     g_imageRotationAngle, W, H);
+    cb.opacity = opacity;
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (SUCCEEDED(g_d3dContext->Map(g_imageCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    {
+        memcpy(mapped.pData, &cb, sizeof(cb));
+        g_d3dContext->Unmap(g_imageCB.Get(), 0);
+    }
+
+    // ----- Update dynamic vertex buffer (quad in image space) -----
+    ImageVertex verts[4] = {
+        { 0.f,  0.f,  0.f, 0.f },
+        { imgW, 0.f,  1.f, 0.f },
+        { 0.f,  imgH, 0.f, 1.f },
+        { imgW, imgH, 1.f, 1.f },
+    };
+    if (SUCCEEDED(g_d3dContext->Map(g_imageVB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    {
+        memcpy(mapped.pData, verts, sizeof(verts));
+        g_d3dContext->Unmap(g_imageVB.Get(), 0);
+    }
+
+    // ----- Set pipeline state -----
+    D3D11_VIEWPORT vp = {};
+    vp.Width    = W;
+    vp.Height   = H;
+    vp.MaxDepth = 1.0f;
+    g_d3dContext->RSSetViewports(1, &vp);
+    g_d3dContext->RSSetState(g_imageRast.Get());
+
+    g_d3dContext->OMSetRenderTargets(1, g_swapRTV.GetAddressOf(), nullptr);
+    g_d3dContext->OMSetBlendState(g_imageBlend.Get(), nullptr, 0xFFFFFFFF);
+    g_d3dContext->OMSetDepthStencilState(g_imageDS.Get(), 0);
+
+    g_d3dContext->IASetInputLayout(g_imageIL.Get());
+    UINT stride = sizeof(ImageVertex), offset = 0;
+    g_d3dContext->IASetVertexBuffers(0, 1, g_imageVB.GetAddressOf(), &stride, &offset);
+    g_d3dContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+    g_d3dContext->VSSetShader(g_imageVS.Get(), nullptr, 0);
+    g_d3dContext->VSSetConstantBuffers(0, 1, g_imageCB.GetAddressOf());
+
+    g_d3dContext->PSSetShader(g_imagePS.Get(), nullptr, 0);
+    g_d3dContext->PSSetShaderResources(0, 1, g_imageSRV.GetAddressOf());
+    g_d3dContext->PSSetSamplers(0, 1, g_trilinearSampler.GetAddressOf());
+    g_d3dContext->PSSetConstantBuffers(0, 1, g_imageCB.GetAddressOf());
+
+    g_d3dContext->Draw(4, 0);
+
+    // ----- Unbind so D2D / the debug layer don't complain -----
+    ID3D11ShaderResourceView* nullSRV = nullptr;
+    g_d3dContext->PSSetShaderResources(0, 1, &nullSRV);
+    ID3D11RenderTargetView*   nullRTV = nullptr;
+    g_d3dContext->OMSetRenderTargets(0, &nullRTV, nullptr);
 }
 
 void RecreateImageBitmap()
@@ -1665,7 +2128,13 @@ void RecreateImageBitmap()
     {           
         OutputDebugString(L"RecreateImageBitmap failed\n");
         g_d2dBitmap.Reset();
+        return;
     }
+
+    // Also build the D3D11 mip texture for cache-friendly trilinear rendering.
+    // We pass the (possibly downscaled) WIC source so the texture matches the D2D bitmap size.
+    if (g_mipPipelineReady)
+        CreateMipTextureFromSource(bitmapSourceForD2D.Get());
 }
 
 void InitializeImageLayout(HWND hWnd, bool hard = false)
@@ -2119,6 +2588,51 @@ void InitializeImageInfoLabel()
     g_textBoxes[TEXTBOX_ZOOM_INPUT].UpdateLayout(g_renderTarget.Get());
 }
 
+// Draw a linear-gradient vignette bar across the full width of the render target.
+// darkAtBottom=true  → transparent at topY,    dark at bottomY  (bottom bar)
+// darkAtBottom=false → dark at topY, transparent at bottomY     (top bar)
+// visibility scales the overall alpha [0..1].
+static void DrawVignetteBar(ID2D1DeviceContext* rt,
+                             float topY, float bottomY,
+                             float peakAlpha, float visibility,
+                             bool darkAtBottom)
+{
+    if (!rt || peakAlpha < 0.001f || visibility < 0.001f) return;
+
+    D2D1_SIZE_F sz = rt->GetSize();
+    const float y0 = topY    * sz.height;
+    const float y1 = bottomY * sz.height;
+
+    // stop 0 = startPoint (y0 = topY),  stop 1 = endPoint (y1 = bottomY)
+    D2D1_GRADIENT_STOP stops[2];
+    if (darkAtBottom)
+    {
+        stops[0].color = D2D1::ColorF(0.f, 0.f, 0.f, 0.f);               // transparent at top
+        stops[1].color = D2D1::ColorF(0.f, 0.f, 0.f, peakAlpha * visibility); // dark at bottom
+    }
+    else
+    {
+        stops[0].color = D2D1::ColorF(0.f, 0.f, 0.f, peakAlpha * visibility); // dark at top
+        stops[1].color = D2D1::ColorF(0.f, 0.f, 0.f, 0.f);               // transparent at bottom
+    }
+    stops[0].position = 0.f;
+    stops[1].position = 1.f;
+
+    ComPtr<ID2D1GradientStopCollection> coll;
+    if (FAILED(rt->CreateGradientStopCollection(stops, 2, &coll)) || !coll)
+        return;
+
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props;
+    props.startPoint = D2D1::Point2F(0.f, y0);
+    props.endPoint   = D2D1::Point2F(0.f, y1);
+
+    ComPtr<ID2D1LinearGradientBrush> brush;
+    if (FAILED(rt->CreateLinearGradientBrush(props, coll.Get(), &brush)) || !brush)
+        return;
+
+    rt->FillRectangle(D2D1::RectF(0.f, y0, sz.width, y1), brush.Get());
+}
+
 // Stretches a bitmap to cover the full render target at the given opacity.
 static void DrawCoverBg(ID2D1Bitmap* bmp, float alpha)
 {
@@ -2164,14 +2678,28 @@ void Render(HWND hWnd)
     if (g_isAnimatedGif && !g_gifFrames.empty() && g_gifD2DBitmaps.empty())
     {
         g_gifD2DBitmaps.reserve(g_gifFrames.size());
+        g_gifD3DSRVs.clear();
+        g_gifD3DSRVs.reserve(g_gifFrames.size());
         for (auto& wicFrame : g_gifFrames)
         {
             ComPtr<ID2D1Bitmap> bmp;
             g_renderTarget->CreateBitmapFromWicBitmap(wicFrame.Get(), nullptr, &bmp);
             g_gifD2DBitmaps.push_back(bmp);
+
+            if (g_mipPipelineReady)
+            {
+                CreateMipTextureFromSource(wicFrame.Get());
+                g_gifD3DSRVs.push_back(g_imageSRV);
+            }
+            else
+            {
+                g_gifD3DSRVs.push_back(nullptr);
+            }
         }
         if (g_currentGifFrame < g_gifD2DBitmaps.size() && g_gifD2DBitmaps[g_currentGifFrame])
             g_d2dBitmap = g_gifD2DBitmaps[g_currentGifFrame];
+        if (g_currentGifFrame < g_gifD3DSRVs.size() && g_gifD3DSRVs[g_currentGifFrame])
+            g_imageSRV = g_gifD3DSRVs[g_currentGifFrame];
     }
 
     if (!g_d2dBitmap && g_wicDefaultBackground && !g_defaultBackgroundBitmap)
@@ -2253,9 +2781,14 @@ void Render(HWND hWnd)
         }
     }
 
+    // Accumulate image info needed across the three-pass render split
+    D2D1_SIZE_F imgSize  = {};
+    float       imgOpacity   = 1.0f;
+    bool        useD3D11Image = false;
+
     if (g_d2dBitmap)
     {        
-        D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+        imgSize = g_d2dBitmap->GetSize();
 
         // ---- Draw previous image fading out (slideshow only) ----
         if (g_isSlideshowMode && g_prevD2DBitmap && g_slideshowTransitionAlpha < 0.99f)
@@ -2283,7 +2816,7 @@ void Render(HWND hWnd)
             g_renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
         }
 
-        // ---- Draw current image (with fade-in alpha in slideshow) ----
+        // ---- Compute transform for current image (shadow + mip quad share it) ----
         float imgCenterX = imgSize.width * 0.5f;
         float imgCenterY = imgSize.height * 0.5f;
 
@@ -2303,8 +2836,16 @@ void Render(HWND hWnd)
 
         g_renderTarget->SetTransform(baseTransform * rotation);
 
-        const float imgOpacity = g_isSlideshowMode ? g_slideshowTransitionAlpha : 1.0f;
-        
+        imgOpacity = g_isSlideshowMode ? g_slideshowTransitionAlpha : 1.0f;
+
+        // During the pre-fade-to-black that precedes slideshow entry, the black
+        // overlay is drawn in D2D Pass 1 and flushed before the D3D11 image quad
+        // is drawn in Pass 2.  Without this modulation the image renders on top of
+        // the overlay and never fades.  Multiplying here keeps them in sync.
+        if (g_slideshowPreFade)
+            imgOpacity *= (1.0f - g_slideshowPreFadeAlpha);
+
+        // Shadow is still rendered through D2D (its input IS the D2D bitmap)
         if (g_shadowEffect && g_d2dBitmap)
         {
             g_shadowEffect->SetInput(0, g_d2dBitmap.Get());
@@ -2317,12 +2858,21 @@ void Render(HWND hWnd)
             g_renderTarget->PopLayer();
         }
 
-        g_renderTarget->DrawBitmap(
-            g_d2dBitmap.Get(),
-            D2D1::RectF(0, 0, imgSize.width, imgSize.height),
-            imgOpacity,
-            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
-        );
+        // Decide which path draws the image bitmap itself:
+        //   D3D11 path  — trilinear mip filtering, cache-friendly at all zoom levels
+        //   D2D fallback — used only when the mip pipeline isn't available yet
+        useD3D11Image = g_mipPipelineReady && (g_imageSRV != nullptr);
+
+        if (!useD3D11Image)
+        {
+            // Fallback: D2D cubic (original behaviour, kept for safety)
+            g_renderTarget->DrawBitmap(
+                g_d2dBitmap.Get(),
+                D2D1::RectF(0, 0, imgSize.width, imgSize.height),
+                imgOpacity,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
+            );
+        }
 
         g_renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
     }
@@ -2345,7 +2895,6 @@ void Render(HWND hWnd)
             D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
         );
     }
-    //D2D1_SIZE_F rtSize = g_renderTarget->GetSize();
 
     // Pre-fade overlay: full-screen opaque black drawn on top of everything,
     // including UI, until the slideshow overlay has presented its first frame.
@@ -2355,49 +2904,132 @@ void Render(HWND hWnd)
         g_renderTarget->FillRectangle(D2D1::RectF(0, 0, rtSize.width, rtSize.height), g_blackBrush.Get());
     }
 
-    // Draw UI buttons
+    // =========================================================
+    // When the D3D11 mip path is active we need three passes:
+    //   Pass 1 (D2D)   — background + shadow + pre-fade  → EndDraw
+    //   Pass 2 (D3D11) — image quad, trilinear mip filter
+    //   Pass 3 (D2D)   — UI buttons + text boxes          → EndDraw → Present
+    //
+    // When D3D11 is NOT needed (no image, or mip pipeline not
+    // ready yet) we stay in the original single-pass model so
+    // that a second BeginDraw/EndDraw pair never splits a frame
+    // that has no D3D11 work between them — avoiding any
+    // potential back-buffer visibility issues in flip-model
+    // swap chains.
+    // =========================================================
 
-    // Update zoom text box — only reformat when zoom value actually changes
+    HRESULT hr = S_OK;
+
+    if (useD3D11Image)
     {
-        static float s_lastDisplayedZoom = -1.f;
-        int zoomPct = int(std::round(g_zoom * 100));
-        if (!g_textBoxes[TEXTBOX_ZOOM_INPUT].IsFocused())
+        // ----- Pass 1 end: flush D2D background + shadow -----
+        hr = g_renderTarget->EndDraw();
+
+        if (SUCCEEDED(hr) && g_swapChain)
         {
-            if (g_zoom != s_lastDisplayedZoom)
+            // ----- Pass 2: D3D11 draws the mip-mapped image quad -----
+            RenderImageD3D11(imgSize.width, imgSize.height, imgOpacity);
+
+            // ----- Pass 3: D2D draws UI on top -----
+            g_renderTarget->BeginDraw();
+
+            // Gradient vignette bars — only when an image is loaded.
+            // Fade in/out based on mouse proximity (g_topVignetteVisibility etc.).
+            if (g_d2dBitmap)
             {
-                g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(std::to_wstring(zoomPct));
-                s_lastDisplayedZoom = g_zoom;
+                // Bottom bar: transparent at 80 % → dark at 100 %
+                DrawVignetteBar(g_renderTarget.Get(), 0.85f, 1.00f, 0.5f,
+                                g_bottomVignetteVisibility, /*darkAtBottom=*/true);
+                // Top bar: dark at 0 % → transparent at 14 %
+                DrawVignetteBar(g_renderTarget.Get(), 0.00f, 0.1f, 0.5f,
+                                g_topVignetteVisibility,    /*darkAtBottom=*/false);
+            }
+
+            // Update zoom text box
+            {
+                static float s_lastDisplayedZoom = -1.f;
+                int zoomPct = int(std::round(g_zoom * 100));
+                if (!g_textBoxes[TEXTBOX_ZOOM_INPUT].IsFocused())
+                {
+                    if (g_zoom != s_lastDisplayedZoom)
+                    {
+                        g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(std::to_wstring(zoomPct));
+                        s_lastDisplayedZoom = g_zoom;
+                    }
+                }
+            }
+
+            for (auto& [id, btn] : g_buttons)
+            {
+                if (!g_isFullscreen && id == BUTTON_EXIT)
+                    continue;
+                btn.Draw(g_renderTarget.Get());
+            }
+
+            for (auto& [id, txt] : g_textBoxes)
+                txt.Draw(g_renderTarget.Get());
+
+            hr = g_renderTarget->EndDraw();
+
+            g_swapChain->Present(1, 0);
+
+            if (g_slideshowPreFade && g_isSlideshowMode && g_overlayWindow)
+            {
+                DestroyBlackCoverWindow();
+                g_slideshowPreFade      = false;
+                g_slideshowPreFadeAlpha = 0.0f;
             }
         }
     }
-
-    for (auto& [id, btn] : g_buttons)
+    else
     {
-        if (!g_isFullscreen && id == BUTTON_EXIT)
-            continue;
-        btn.Draw(g_renderTarget.Get());
-    }
+        // ----- Single-pass: everything in one BeginDraw/EndDraw -----
 
-    for (auto& [id, txt] : g_textBoxes)
-    {
-        txt.Draw(g_renderTarget.Get());
-    }
-    
-
-    HRESULT hr = g_renderTarget->EndDraw();
-
-    if (SUCCEEDED(hr) && g_swapChain)
-    {
-        g_swapChain->Present(1, 0);
-
-        // The slideshow overlay has now presented its first frame (which is solid black
-        // due to the pre-fade overlay above). It is safe to remove the cover window and
-        // release the pre-fade flag — the overlay owns the screen from this point on.
-        if (g_slideshowPreFade && g_isSlideshowMode && g_overlayWindow)
+        // Gradient vignette bars (same as three-pass path)
+        if (g_d2dBitmap)
         {
-            DestroyBlackCoverWindow();
-            g_slideshowPreFade      = false;
-            g_slideshowPreFadeAlpha = 0.0f;
+            DrawVignetteBar(g_renderTarget.Get(), 0.80f, 1.00f, 0.65f,
+                            g_bottomVignetteVisibility, /*darkAtBottom=*/true);
+            DrawVignetteBar(g_renderTarget.Get(), 0.00f, 0.14f, 0.55f,
+                            g_topVignetteVisibility,    /*darkAtBottom=*/false);
+        }
+
+        // Update zoom text box
+        {
+            static float s_lastDisplayedZoom = -1.f;
+            int zoomPct = int(std::round(g_zoom * 100));
+            if (!g_textBoxes[TEXTBOX_ZOOM_INPUT].IsFocused())
+            {
+                if (g_zoom != s_lastDisplayedZoom)
+                {
+                    g_textBoxes[TEXTBOX_ZOOM_INPUT].SetText(std::to_wstring(zoomPct));
+                    s_lastDisplayedZoom = g_zoom;
+                }
+            }
+        }
+
+        for (auto& [id, btn] : g_buttons)
+        {
+            if (!g_isFullscreen && id == BUTTON_EXIT)
+                continue;
+            btn.Draw(g_renderTarget.Get());
+        }
+
+        for (auto& [id, txt] : g_textBoxes)
+            txt.Draw(g_renderTarget.Get());
+
+        hr = g_renderTarget->EndDraw();
+
+        if (SUCCEEDED(hr) && g_swapChain)
+        {
+            g_swapChain->Present(1, 0);
+
+            if (g_slideshowPreFade && g_isSlideshowMode && g_overlayWindow)
+            {
+                DestroyBlackCoverWindow();
+                g_slideshowPreFade      = false;
+                g_slideshowPreFadeAlpha = 0.0f;
+            }
         }
     }
 
@@ -2460,6 +3092,8 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     g_wicBitmapSource.Reset();
     g_gifFrames.clear();
     g_gifFrameDelays.clear();
+    g_gifD2DBitmaps.clear();
+    g_gifD3DSRVs.clear();
     g_isAnimatedGif = false;
     g_currentGifFrame = 0;
     g_lastGifFrameTime = 0;
@@ -2970,15 +3604,31 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     {
         g_gifD2DBitmaps.clear();
         g_gifD2DBitmaps.reserve(g_gifFrames.size());
+        g_gifD3DSRVs.clear();
+        g_gifD3DSRVs.reserve(g_gifFrames.size());
         for (auto& wicFrame : g_gifFrames)
         {
+            // D2D bitmap
             ComPtr<ID2D1Bitmap> bmp;
             g_renderTarget->CreateBitmapFromWicBitmap(wicFrame.Get(), nullptr, &bmp);
             g_gifD2DBitmaps.push_back(bmp);
+
+            // D3D11 mip SRV — reuse CreateMipTextureFromSource; grab the SRV it leaves in g_imageSRV
+            if (g_mipPipelineReady)
+            {
+                CreateMipTextureFromSource(wicFrame.Get());
+                g_gifD3DSRVs.push_back(g_imageSRV);
+            }
+            else
+            {
+                g_gifD3DSRVs.push_back(nullptr);
+            }
         }
-        // Point g_d2dBitmap at the first pre-uploaded frame
+        // Point both pointers at frame 0
         if (!g_gifD2DBitmaps.empty() && g_gifD2DBitmaps[0])
             g_d2dBitmap = g_gifD2DBitmaps[0];
+        if (!g_gifD3DSRVs.empty() && g_gifD3DSRVs[0])
+            g_imageSRV = g_gifD3DSRVs[0];
     }
 
     // ------------------------------------------------------------
@@ -3337,9 +3987,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (width == 0 || height == 0)
             break;
 
-        // Unbind current target
+        // Unbind current D2D target and D3D11 RTV before ResizeBuffers —
+        // both wrap the old back buffer which is about to be released.
         g_renderTarget->SetTarget(nullptr);
         g_d2dTargetBitmap.Reset();
+        g_swapRTV.Reset();   // must release before ResizeBuffers
 
         HRESULT hr = g_swapChain->ResizeBuffers(
             0,
@@ -3351,9 +4003,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (FAILED(hr))
             break;
 
-        // Recreate target bitmap
+        // Recreate D2D target bitmap and D3D11 RTV from the new back buffer.
         ComPtr<IDXGISurface> surface;
-        if (SUCCEEDED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&surface))))
+        ComPtr<ID3D11Texture2D> backBuf;
+        if (SUCCEEDED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&surface))) &&
+            SUCCEEDED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuf))))
         {
             D2D1_BITMAP_PROPERTIES1 props = SwapChainBitmapProps();
 
@@ -3370,6 +4024,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 for (auto& [key, textbox] : g_textBoxes)
                     textbox.UpdateLayout(g_renderTarget.Get());
             }
+
+            // Recreate the D3D11 RTV that RenderImageD3D11 binds as render target
+            if (g_d3dDevice)
+                g_d3dDevice->CreateRenderTargetView(backBuf.Get(), nullptr, &g_swapRTV);
         }
 
  
@@ -3473,6 +4131,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         for (auto& [id, txt] : g_textBoxes)
             txt.UpdateProximity(pt.x, pt.y, windowWidth, windowHeight);
+
+        // Vignette activation zones: top 20 % for top bar, bottom 20 % for bottom bar.
+        // Only show when an image is loaded (same rule as the buttons).
+        if (g_d2dBitmap)
+        {
+            float normY = (windowHeight > 0.f) ? (float)pt.y / windowHeight : 0.f;
+            g_topVignetteTarget    = (normY <= 0.20f) ? 1.0f : 0.0f;
+            g_bottomVignetteTarget = (normY >= 0.80f) ? 1.0f : 0.0f;
+        }
+        else
+        {
+            g_topVignetteTarget    = 0.0f;
+            g_bottomVignetteTarget = 0.0f;
+        }
 
 
         if (g_isDragging && (wParam & MK_LBUTTON))
@@ -3670,6 +4342,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 {
                     InitFullScreenExit();
                     return 0;
+                }
+                else
+                {
+                    PostQuitMessage(0);
                 }
             }
             break;
