@@ -174,6 +174,11 @@ void UIElement::UpdateLayoutForSize(float rtWidth, float rtHeight)
 
 void UIElement::UpdateProximity(float mouseX, float mouseY, float windowWidth, float windowHeight)
 {
+    // Track whether the cursor is directly over the element's own visual rect.
+    // This is used by the tooltip dwell timer — independent of the activation zone.
+    m_mouseOverSelf = (mouseX >= m_rect.left && mouseX <= m_rect.right &&
+                       mouseY >= m_rect.top  && mouseY <= m_rect.bottom);
+
     if (m_forcedVisibility)
     {
         m_targetVisibility = 1.0f;
@@ -206,6 +211,21 @@ void UIElement::UpdateVisibility(float fallOff)
 
     m_visibility += (effectiveTarget - m_visibility) * fallOff;
 
+    // ---- Tooltip dwell timer ----
+    // Accumulate only while the cursor is physically over the element's own rect.
+    // The activation zone (which drives m_visibility) is deliberately ignored here
+    // so the tooltip never fires just because the mouse is somewhere in the zone.
+    if (!m_tooltipText.empty())
+    {
+        if (m_mouseOverSelf)
+            m_tooltipHoverTime += 0.016f;
+        else
+            m_tooltipHoverTime = 0.f;
+
+        const float tooltipTarget = (m_tooltipHoverTime > 1.0f) ? m_visibility : 0.f;
+        m_tooltipVisibility += (tooltipTarget - m_tooltipVisibility) * 0.10f;
+    }
+
     // ---- Focus pulse animation ----
     if (m_focused && m_selectAllOnFocus)
     {
@@ -227,4 +247,114 @@ void UIElement::SetForcedVisibility(bool forced){
     {
         m_targetVisibility = 0.f; // Allow it to fade out
     }
+}
+
+void UIElement::SetTooltip(const std::wstring& text)
+{
+    m_tooltipText = text;
+    m_tooltipTextFormat.Reset();
+
+    if (text.empty() || !m_dwriteFactory)
+        return;
+
+    float tooltipFontPx = max(1.f, m_layout.uiPixelScale * m_layout.tooltipFontSize);
+    HRESULT hr = m_dwriteFactory->CreateTextFormat(
+        L"Segoe UI", nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, tooltipFontPx, L"",
+        m_tooltipTextFormat.GetAddressOf());
+
+    if (SUCCEEDED(hr) && m_tooltipTextFormat)
+    {
+        m_tooltipTextFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        m_tooltipTextFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+}
+
+void UIElement::DrawTooltip(ID2D1RenderTarget* rt)
+{
+    if (m_tooltipText.empty() || !m_tooltipTextFormat || !rt)
+        return;
+    if (m_tooltipVisibility <= 0.01f)
+        return;
+
+    const float tviz   = m_tooltipVisibility;
+    const float fontPx = max(1.f, m_layout.uiPixelScale * m_layout.tooltipFontSize);
+    const float tpadX  = fontPx * 1.1f;
+    const float tpadY  = fontPx * 0.50f;
+
+    // Measure text so the pill is exactly wide enough
+    float tW = m_pixelWidth * 2.f;
+    float tH = fontPx * 2.f;
+    {
+        using Microsoft::WRL::ComPtr;
+        ComPtr<IDWriteTextLayout> tLayout;
+        if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(
+                m_tooltipText.c_str(), (UINT32)m_tooltipText.size(),
+                m_tooltipTextFormat.Get(), 600.f, 200.f, &tLayout)))
+        {
+            DWRITE_TEXT_METRICS metrics{};
+            if (SUCCEEDED(tLayout->GetMetrics(&metrics)))
+            {
+                tW = metrics.width  + tpadX * 2.f;
+                tH = metrics.height + tpadY * 2.f;
+            }
+        }
+    }
+
+    const float cx = (m_rect.left + m_rect.right) * 0.5f;
+    const float cy = (m_rect.top  + m_rect.bottom) * 0.5f;
+    (void)cy;
+
+    // Position above the element; flip below if too close to the top
+    const float gap = m_pixelHeight * 0.3f;
+    float tTop, tBottom;
+    if (m_rect.top - tH - gap < 2.f)
+    {
+        tTop    = m_rect.bottom + gap;
+        tBottom = tTop + tH;
+    }
+    else
+    {
+        tBottom = m_rect.top - gap;
+        tTop    = tBottom - tH;
+    }
+
+    // Horizontal: centre on the element then clamp to render-target edges
+    D2D1_SIZE_F rtSz = rt->GetSize();
+    const float margin = 4.f;
+    float tLeft  = cx - tW * 0.5f;
+    float tRight = cx + tW * 0.5f;
+    if (tRight > rtSz.width - margin)
+    {
+        tLeft  = rtSz.width - margin - tW;
+        tRight = rtSz.width - margin;
+    }
+    if (tLeft < margin)
+    {
+        tLeft  = margin;
+        tRight = margin + tW;
+    }
+
+    // Vertical: if flipped-below choice still clips the bottom, clamp it
+    if (tBottom > rtSz.height - margin)
+    {
+        tBottom = rtSz.height - margin;
+        tTop    = tBottom - tH;
+    }
+
+    D2D1_RECT_F   tRect = D2D1::RectF(tLeft, tTop, tRight, tBottom);
+    D2D1_ROUNDED_RECT tRR = D2D1::RoundedRect(tRect, tH * 0.3f, tH * 0.3f);
+
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID2D1SolidColorBrush> tBg, tBorder, tText;
+    rt->CreateSolidColorBrush(D2D1::ColorF(0.05f, 0.05f, 0.05f, 0.6f * tviz), &tBg);
+    rt->CreateSolidColorBrush(D2D1::ColorF(1.f,   1.f,   1.f,   0.2f * tviz), &tBorder);
+    rt->CreateSolidColorBrush(D2D1::ColorF(1.f,   1.f,   1.f,   tviz),         &tText);
+
+    if (tBg)     rt->FillRoundedRectangle(&tRR, tBg.Get());
+    if (tBorder) rt->DrawRoundedRectangle(&tRR, tBorder.Get(), 1.0f);
+    if (tText)   rt->DrawTextW(
+        m_tooltipText.c_str(), (UINT32)m_tooltipText.size(),
+        m_tooltipTextFormat.Get(), tRect, tText.Get());
 }

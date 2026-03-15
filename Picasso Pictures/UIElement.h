@@ -1,8 +1,9 @@
-#pragma once
+﻿#pragma once
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <string>
 
 class UIElement
 {
@@ -55,6 +56,11 @@ public:
         // In your app, you often set these to the fullscreen reference (monitor w/h)
         float referenceWidth = 0.f;
         float referenceHeight = 0.f;
+
+        // Tooltip font size — relative to uiPixelScale, same for all elements.
+        // Override only if you need a custom size; the default matches a comfortable
+        // small label that stays readable at typical screen sizes.
+        float tooltipFontSize = 0.013f;
     };
 
 public:
@@ -96,6 +102,13 @@ public:
     void SetForcedVisibility(bool forced);
     bool IsForcedVisibility() const { return m_forcedVisibility; }
 
+    // ---- Tooltip ----
+    // Set a tooltip string on any element; empty = no tooltip.
+    // Call SetTooltip() after Initialize() (the factory must already be set).
+    void SetTooltip(const std::wstring& text);
+    // Draw the tooltip if the dwell timer has fired. Call at the end of Draw().
+    void DrawTooltip(ID2D1RenderTarget* rt);
+
 protected:
     // Derived classes call this after setting pixel sizes.
     void SetPixelSize(float wPx, float hPx);
@@ -107,7 +120,7 @@ protected:
     // Called automatically by UpdateLayout on scale change and by InitializeLayout.
     void EnsureTextFormat();
 
-    // Shared DWrite factory � set by derived class during Initialize.
+    // Shared DWrite factory � set by derived class during Initialize.
     Microsoft::WRL::ComPtr<IDWriteFactory>     m_dwriteFactory;
     Microsoft::WRL::ComPtr<IDWriteTextFormat>  m_textFormat;
 
@@ -156,6 +169,13 @@ protected:
 
     AxisCache m_xCache{};
     AxisCache m_yCache{};
+
+    // ---- Tooltip state ----
+    std::wstring                                       m_tooltipText;
+    Microsoft::WRL::ComPtr<IDWriteTextFormat>          m_tooltipTextFormat;
+    float m_tooltipVisibility = 0.f;
+    float m_tooltipHoverTime  = 0.f;
+    bool  m_mouseOverSelf     = false;  // true only when cursor is directly over m_rect
 
 private:
     // Core

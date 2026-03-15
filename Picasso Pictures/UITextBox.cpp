@@ -121,6 +121,8 @@ void UITextBox::Draw(ID2D1RenderTarget* rt)
             drawRect,
             textBrush.Get());
     }
+
+    DrawTooltip(rt);
 }
 
 void UITextBox::SetText(const std::wstring& text)

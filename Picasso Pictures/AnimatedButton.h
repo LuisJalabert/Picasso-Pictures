@@ -11,6 +11,7 @@ public:
     struct Config
     {
         std::wstring text;
+        std::wstring tooltip;       // optional hover tooltip (empty = none)
         UIElement::Layout layout;
         float fontSize = 0.02f;
         bool holdEnabled = true;

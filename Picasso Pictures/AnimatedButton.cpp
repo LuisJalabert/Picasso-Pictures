@@ -20,6 +20,11 @@ bool AnimatedButton::Initialize(
     SetLayout(m_config.layout);
     m_pixelFontSize = m_config.layout.uiPixelScale * m_config.fontSize;
     InitializeLayout(renderTarget);
+
+    // Register tooltip with the base class (no-op if empty)
+    if (!m_config.tooltip.empty())
+        SetTooltip(m_config.tooltip);
+
     return true;
 }
 
@@ -102,6 +107,8 @@ void AnimatedButton::Draw(ID2D1RenderTarget* renderTarget)
         m_textFormat.Get(),
         drawRect,
         borderBrush.Get());
+
+    DrawTooltip(renderTarget);
 }
 
 bool AnimatedButton::OnMouseDown(float x, float y)

@@ -1163,8 +1163,8 @@ void CreateSlideshowBgBitmap()
 
     if (g_imageMipTex)
     {
-        // Pick a mip whose longest edge is ~400 px — enough colour detail for a blur wash.
-        smallBmp = ExtractMipAsD2DBitmap(400u);
+        // Pick a mip whose longest edge is ~200 px — enough colour detail for a blur wash.
+        smallBmp = ExtractMipAsD2DBitmap(200u);
     }
 
     if (!smallBmp)
@@ -1667,7 +1667,7 @@ void CreateRenderTarget(HWND hWnd)
         {
             g_shadowEffect->SetValue(
                 D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
-                25.0f);   // softness
+                5.0f);   // softness
         }
     }
 
@@ -1886,11 +1886,11 @@ void CreateD3DImagePipeline()
 
     // ----- Trilinear sampler (the key to cache-friendly zoom-out) -----
     D3D11_SAMPLER_DESC sampDesc = {};
-    sampDesc.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;   // trilinear
+    sampDesc.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;  // trilinear
     sampDesc.AddressU       = D3D11_TEXTURE_ADDRESS_CLAMP;
     sampDesc.AddressV       = D3D11_TEXTURE_ADDRESS_CLAMP;
     sampDesc.AddressW       = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sampDesc.MipLODBias     = 0.f;
+    sampDesc.MipLODBias     = 0.0f;
     sampDesc.MaxAnisotropy  = 1;
     sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sampDesc.MinLOD         = 0.f;
@@ -2324,10 +2324,12 @@ void InitializeMenuButtons()
     openConfig.layout.height = height;
     openConfig.fontSize = 0.04f;
     openConfig.text = L"\U0001F4C2";
+    openConfig.tooltip = L"Open image  [O]";
     openConfig.layout.activationZone = topLeftActivationZone;
     openConfig.layout.referenceWidth  = size.width;
     openConfig.layout.referenceHeight = size.height;
     openConfig.layout.uiPixelScale = min(size.width, size.height);
+    openConfig.layout.tooltipFontSize = 0.03f;
     openConfig.holdEnabled = false;
     openConfig.pressAnimation = false;
     g_buttons[BUTTON_OPEN].Initialize(
@@ -2348,6 +2350,7 @@ void InitializeMenuButtons()
 
     openConfig.layout.x.value += 0.056;
     openConfig.text = L"\U0000FF1F";
+    openConfig.tooltip = L"Keyboard shortcuts";
     g_buttons[BUTTON_HELP].Initialize(
         g_renderTarget.Get(),
         g_dwriteFactory.Get(),
@@ -2387,13 +2390,14 @@ void InitializeButtons()
     buttonConfig.layout.x.value = 0.49f;
     buttonConfig.layout.x.anchor = AnimatedButton::Anchor::OffsetFromCenter;
     buttonConfig.layout.x.mode = AnimatedButton::PosMode::Normalized;
-    buttonConfig.layout.y.value = 0.96f;
+    buttonConfig.layout.y.value = 0.93f;
     buttonConfig.layout.y.anchor = AnimatedButton::Anchor::OffsetFromEnd;
     buttonConfig.layout.y.mode = AnimatedButton::PosMode::Normalized;
     buttonConfig.layout.width = width;
     buttonConfig.layout.height = height;
     buttonConfig.fontSize = fontSize * 1.1f;
     buttonConfig.text = L"1:1";
+    buttonConfig.tooltip = L"1:1 zoom";
     buttonConfig.layout.activationZone = bottomActivationZone;
     buttonConfig.layout.uiPixelScale = g_uiPixelScale;
     D2D1_SIZE_F size = g_renderTarget->GetSize();
@@ -2420,6 +2424,7 @@ void InitializeButtons()
     buttonConfig.layout.x.value = 0.51f;
     buttonConfig.fontSize = fontSize;
     buttonConfig.text = L"\u25B6";
+    buttonConfig.tooltip = L"Slideshow\n[F5]";
 
     g_buttons[BUTTON_SLIDESHOW].Initialize(
         g_renderTarget.Get(),
@@ -2438,6 +2443,7 @@ void InitializeButtons()
     buttonConfig.layout.x.value = 0.53f;
     buttonConfig.fontSize = fontSize;
     buttonConfig.text = L"\u2795";
+    buttonConfig.tooltip = L"Zoom in\n[W / \u2191]";
 
     g_buttons[BUTTON_ZOOM_IN].Initialize(
         g_renderTarget.Get(),
@@ -2457,6 +2463,7 @@ void InitializeButtons()
 
     buttonConfig.layout.x.value = 0.47f;
     buttonConfig.text = L"\u2796";
+    buttonConfig.tooltip = L"Zoom out [S / \u2193]";
 
     g_buttons[BUTTON_ZOOM_OUT].Initialize(
         g_renderTarget.Get(),
@@ -2476,6 +2483,7 @@ void InitializeButtons()
     buttonConfig.layout.x.value = 0.45f;
     buttonConfig.fontSize = fontSize * 1.2f;
     buttonConfig.text = L"\u2B6F";
+    buttonConfig.tooltip = L"Rotate left\n[Q]";
 
     g_buttons[BUTTON_ROTATE_LEFT].Initialize(
         g_renderTarget.Get(),
@@ -2493,6 +2501,7 @@ void InitializeButtons()
 
     buttonConfig.layout.x.value = 0.55f;
     buttonConfig.text = L"\u2B6E";
+    buttonConfig.tooltip = L"Rotate right\n[E]";
 
     g_buttons[BUTTON_ROTATE_RIGHT].Initialize(
         g_renderTarget.Get(),
@@ -2510,6 +2519,7 @@ void InitializeButtons()
     buttonConfig.layout.x.value = 0.43f;
     buttonConfig.fontSize = fontSize * 1.3f;
     buttonConfig.text = L"\u2B9C";
+    buttonConfig.tooltip = L"Previous image\n[A / \u2190]";
 
     g_buttons[BUTTON_PREVIOUS].Initialize(
         g_renderTarget.Get(),
@@ -2530,6 +2540,7 @@ void InitializeButtons()
 
     buttonConfig.layout.x.value = 0.57f;
     buttonConfig.text = L"\u2B9E";
+    buttonConfig.tooltip = L"Next image\n[D / \u2192 / Space]";
     
     g_buttons[BUTTON_NEXT].Initialize(
         g_renderTarget.Get(),
@@ -2567,6 +2578,7 @@ void InitializeButtons()
     exitConfig.layout.height = 0.036f;
     exitConfig.fontSize = 0.016f;
     exitConfig.text = L"\u274C";
+    exitConfig.tooltip = L"Exit\n[Esc]";
     exitConfig.layout.activationZone = topRightActivationZone;
     exitConfig.layout.referenceWidth  = size.width;
     exitConfig.layout.referenceHeight = size.height;
@@ -2616,11 +2628,11 @@ void InitializeImageInfoLabel()
     config.layout.x.value = 0.5f;
     config.layout.x.anchor = UITextBox::Anchor::OffsetFromCenter;
     config.layout.x.mode = UITextBox::PosMode::Normalized;
-    config.layout.y.value = 0.92f;
+    config.layout.y.value = 0.97f;
     config.layout.y.anchor = UITextBox::Anchor::OffsetFromEnd;
     config.layout.x.mode = UITextBox::PosMode::Normalized;
 
-    config.relativeFontSize = 0.012f;
+    config.relativeFontSize = 0.016f;
     config.layout.width  = 0.6f;      // wide enough for filenames
     config.layout.height = 0.05f;
 
@@ -2649,6 +2661,7 @@ void InitializeImageInfoLabel()
     config.layout.y.anchor = UITextBox::Anchor::OffsetFromCenter;
     config.layout.width = 0.05f;
     config.layout.height = 0.025f;
+    config.relativeFontSize = 0.012f;
     config.backgroundAlpha = 0.5f; // semi-transparent box for zoom display
     config.isEditable = true;
     config.inputMode = UITextBox::InputMode::NumericFloat;
@@ -2684,6 +2697,8 @@ void InitializeImageInfoLabel()
             }
         );
     g_textBoxes[TEXTBOX_ZOOM_INPUT].UpdateLayout(g_renderTarget.Get());
+    g_textBoxes[TEXTBOX_ZOOM_INPUT].SetTooltip(
+        L"Zoom\nclick & type\n Enter to set");
 }
 
 // Draw a linear-gradient vignette bar across the full width of the render target.
@@ -3058,11 +3073,19 @@ void Render(HWND hWnd)
             if (g_d2dBitmap)
             {
                 // Bottom bar: transparent at 80 % → dark at 100 %
-                DrawVignetteBar(g_renderTarget.Get(), 0.85f, 1.00f, 0.5f,
-                                g_bottomVignetteVisibility, /*darkAtBottom=*/true);
+                DrawVignetteBar(g_renderTarget.Get(), 
+                                /*topY=*/0.86f, 
+                                /*bottomY=*/1.00f, 
+                                /*peakAlpha=*/0.65f,
+                                g_bottomVignetteVisibility, 
+                                /*darkAtBottom=*/true);
                 // Top bar: dark at 0 % → transparent at 14 %
-                DrawVignetteBar(g_renderTarget.Get(), 0.00f, 0.1f, 0.5f,
-                                g_topVignetteVisibility,    /*darkAtBottom=*/false);
+                DrawVignetteBar(g_renderTarget.Get(), 
+                                /*topY=*/0.00f, 
+                                /*bottomY=*/0.08f, 
+                                /*peakAlpha=*/0.65f,
+                                g_topVignetteVisibility,    
+                                /*darkAtBottom=*/false);
             }
 
             // Update zoom text box
@@ -3108,10 +3131,20 @@ void Render(HWND hWnd)
         // Gradient vignette bars (same as three-pass path)
         if (g_d2dBitmap)
         {
-            DrawVignetteBar(g_renderTarget.Get(), 0.80f, 1.00f, 0.65f,
-                            g_bottomVignetteVisibility, /*darkAtBottom=*/true);
-            DrawVignetteBar(g_renderTarget.Get(), 0.00f, 0.14f, 0.55f,
-                            g_topVignetteVisibility,    /*darkAtBottom=*/false);
+                // Bottom bar: transparent at 80 % → dark at 100 %
+                DrawVignetteBar(g_renderTarget.Get(), 
+                                /*topY=*/0.86f, 
+                                /*bottomY=*/1.00f, 
+                                /*peakAlpha=*/0.65f,
+                                g_bottomVignetteVisibility, 
+                                /*darkAtBottom=*/true);
+                // Top bar: dark at 0 % → transparent at 14 %
+                DrawVignetteBar(g_renderTarget.Get(), 
+                                /*topY=*/0.00f, 
+                                /*bottomY=*/0.08f, 
+                                /*peakAlpha=*/0.65f,
+                                g_topVignetteVisibility,    
+                                /*darkAtBottom=*/false);
         }
 
         // Update zoom text box
