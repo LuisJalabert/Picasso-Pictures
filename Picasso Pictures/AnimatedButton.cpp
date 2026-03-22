@@ -99,7 +99,7 @@ void AnimatedButton::Draw(ID2D1RenderTarget* renderTarget)
         D2D1::RoundedRect(highlightRect, 14.f, 14.f),
         highlightBrush.Get());
 
-    renderTarget->DrawRoundedRectangle(&rounded, borderBrush.Get(), 2.0f);
+    renderTarget->DrawRoundedRectangle(&rounded, borderBrush.Get(), 1.0f);
 
     renderTarget->DrawTextW(
         m_config.text.c_str(),

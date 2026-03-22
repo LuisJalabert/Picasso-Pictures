@@ -1,4 +1,4 @@
-#include "UIElement.h"
+ï»¿#include "UIElement.h"
 #include <cmath>
 
 void UIElement::SetLayout(const Layout& layout)
@@ -9,8 +9,9 @@ void UIElement::SetLayout(const Layout& layout)
 
 void UIElement::ResetAnchors()
 {
-    m_xCache = AxisCache{};
-    m_yCache = AxisCache{};
+    m_xCache    = AxisCache{};
+    m_yCache    = AxisCache{};
+    m_zoneCache = ZoneCache{};
 }
 
 void UIElement::SetPixelSize(float wPx, float hPx)
@@ -86,6 +87,28 @@ void UIElement::CaptureAnchorsOnce(float rtWidth, float rtHeight)
 
     CaptureAxis(m_xCache, refW, cx, m_layout.x);
     CaptureAxis(m_yCache, refH, cy, m_layout.y);
+
+    // Capture activation zone boundaries using the same Anchor pattern.
+    // Each normalized value is mapped to an anchor + pixel inset so that
+    // UpdateProximity resolves correctly at any window size.
+    if (!m_zoneCache.captured)
+    {
+        auto captureBoundary = [](float normVal, float dimPx) -> ZoneBoundary
+        {
+            if (normVal > 0.5f)
+                return { Anchor::OffsetFromEnd,    dimPx - normVal * dimPx };
+            else if (normVal < 0.5f)
+                return { Anchor::OffsetFromStart,  normVal * dimPx };
+            else
+                return { Anchor::OffsetFromCenter, 0.f };
+        };
+        const auto& z        = m_layout.activationZone;
+        m_zoneCache.left     = captureBoundary(z.left,   refW);
+        m_zoneCache.top      = captureBoundary(z.top,    refH);
+        m_zoneCache.right    = captureBoundary(z.right,  refW);
+        m_zoneCache.bottom   = captureBoundary(z.bottom, refH);
+        m_zoneCache.captured = true;
+    }
 }
 
 void UIElement::EnsureTextFormat()
@@ -175,7 +198,7 @@ void UIElement::UpdateLayoutForSize(float rtWidth, float rtHeight)
 void UIElement::UpdateProximity(float mouseX, float mouseY, float windowWidth, float windowHeight)
 {
     // Track whether the cursor is directly over the element's own visual rect.
-    // This is used by the tooltip dwell timer — independent of the activation zone.
+    // This is used by the tooltip dwell timer ï¿½ independent of the activation zone.
     m_mouseOverSelf = (mouseX >= m_rect.left && mouseX <= m_rect.right &&
                        mouseY >= m_rect.top  && mouseY <= m_rect.bottom);
 
@@ -185,12 +208,34 @@ void UIElement::UpdateProximity(float mouseX, float mouseY, float windowWidth, f
         return;
     }
 
-    const auto& z = m_layout.activationZone;
+    // Resolve zone boundaries: use captured pixel insets if available,
+    // otherwise fall back to normalized computation (pre-fullscreen, windowed).
+    auto resolveBoundary = [](const ZoneBoundary& b, float dim) -> float
+    {
+        switch (b.anchor)
+        {
+        case Anchor::OffsetFromEnd:    return dim - b.insetPx;
+        case Anchor::OffsetFromCenter: return dim * 0.5f + b.insetPx;
+        default:                       return b.insetPx;  // OffsetFromStart
+        }
+    };
 
-    float zoneLeft = windowWidth * z.left;
-    float zoneTop = windowHeight * z.top;
-    float zoneRight = windowWidth * z.right;
-    float zoneBottom = windowHeight * z.bottom;
+    float zoneLeft, zoneTop, zoneRight, zoneBottom;
+    if (m_zoneCache.captured)
+    {
+        zoneLeft   = resolveBoundary(m_zoneCache.left,   windowWidth);
+        zoneTop    = resolveBoundary(m_zoneCache.top,    windowHeight);
+        zoneRight  = resolveBoundary(m_zoneCache.right,  windowWidth);
+        zoneBottom = resolveBoundary(m_zoneCache.bottom, windowHeight);
+    }
+    else
+    {
+        const auto& z = m_layout.activationZone;
+        zoneLeft   = windowWidth  * z.left;
+        zoneTop    = windowHeight * z.top;
+        zoneRight  = windowWidth  * z.right;
+        zoneBottom = windowHeight * z.bottom;
+    }
 
     if (mouseX >= zoneLeft && mouseX <= zoneRight && mouseY >= zoneTop && mouseY <= zoneBottom)
         m_targetVisibility = 1.0f;

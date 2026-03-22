@@ -160,6 +160,17 @@ float                                               g_topVignetteVisibility    =
 float                                               g_topVignetteTarget        = 0.f;
 float                                               g_bottomVignetteVisibility = 0.f;
 float                                               g_bottomVignetteTarget     = 0.f;
+// Pixel heights captured once at fullscreen init (mirrors CaptureAnchorsOnce).
+// After capture these stay fixed; draw code back-converts to normalized fractions
+// for the current RT height so the bars never grow/shrink with the window.
+float                                               g_vignetteTopBarHeightPx    = 0.f;
+float                                               g_vignetteBottomBarHeightPx = 0.f;
+// Activation zone thresholds captured at fullscreen init (OffsetFromStart / OffsetFromEnd).
+// Top zone:    show when mouseY <= g_vignetteTopActivationPx           (inset from top)
+// Bottom zone: show when mouseY >= windowHeight - g_vignetteBottomActivationPx (inset from bottom)
+float                                               g_vignetteTopActivationPx   = 0.f;
+float                                               g_vignetteBottomActivationPx= 0.f;
+bool                                                g_vignetteHeightsCaptured   = false;
 
 // ---- Slideshow mode ----
 bool                                                g_isSlideshowMode            = false;
@@ -1330,6 +1341,19 @@ void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
     {
         D2D1_SIZE_F size = g_renderTarget->GetSize();
         g_uiPixelScale = min(size.width, size.height);
+
+        // Capture vignette bar heights in pixels the first time we enter fullscreen.
+        // Mirrors CaptureAnchorsOnce: once set, the physical thickness is fixed even
+        // if the user resizes the window or exits/re-enters fullscreen.
+        if (!g_vignetteHeightsCaptured && size.height > 0.f)
+        {
+            g_vignetteTopBarHeightPx     = size.height * 0.08f;  // topY=0.00→bottomY=0.08
+            g_vignetteBottomBarHeightPx  = size.height * 0.14f;  // topY=0.86→bottomY=1.00
+            // Activation zone: OffsetFromStart for top, OffsetFromEnd for bottom
+            g_vignetteTopActivationPx    = size.height * 0.20f;  // show when mouseY <= this
+            g_vignetteBottomActivationPx = size.height * 0.20f;  // show when mouseY >= windowH - this
+            g_vignetteHeightsCaptured    = true;
+        }
     }
 
     CreateBackgroundBitmap();
@@ -2633,7 +2657,7 @@ void InitializeImageInfoLabel()
     config.layout.x.mode = UITextBox::PosMode::Normalized;
 
     config.relativeFontSize = 0.016f;
-    config.layout.width  = 0.6f;      // wide enough for filenames
+    config.layout.width  = 1.0f;
     config.layout.height = 0.05f;
 
     config.backgroundAlpha = 0.0f;   // no box
@@ -3069,22 +3093,26 @@ void Render(HWND hWnd)
             g_renderTarget->BeginDraw();
 
             // Gradient vignette bars — only when an image is loaded.
-            // Fade in/out based on mouse proximity (g_topVignetteVisibility etc.).
+            // Bar thickness is fixed in pixels (captured at fullscreen init); we
+            // back-convert to normalized fractions for the current RT so the bars
+            // never grow/shrink when the window is resized.
             if (g_d2dBitmap)
             {
-                // Bottom bar: transparent at 80 % → dark at 100 %
-                DrawVignetteBar(g_renderTarget.Get(), 
-                                /*topY=*/0.86f, 
-                                /*bottomY=*/1.00f, 
+                const float vigRTH        = rtSize.height > 0.f ? rtSize.height : 1.f;
+                const float vigTopNorm    = g_vignetteHeightsCaptured ? (g_vignetteTopBarHeightPx    / vigRTH) : 0.08f;
+                const float vigBottomNorm = g_vignetteHeightsCaptured ? (g_vignetteBottomBarHeightPx / vigRTH) : 0.14f;
+
+                // Bottom bar: transparent at (1-vigBottomNorm) → dark at 1.0
+                DrawVignetteBar(g_renderTarget.Get(),
+                                1.f - vigBottomNorm, 1.f,
                                 /*peakAlpha=*/0.65f,
-                                g_bottomVignetteVisibility, 
+                                g_bottomVignetteVisibility,
                                 /*darkAtBottom=*/true);
-                // Top bar: dark at 0 % → transparent at 14 %
-                DrawVignetteBar(g_renderTarget.Get(), 
-                                /*topY=*/0.00f, 
-                                /*bottomY=*/0.08f, 
+                // Top bar: dark at 0.0 → transparent at vigTopNorm
+                DrawVignetteBar(g_renderTarget.Get(),
+                                0.f, vigTopNorm,
                                 /*peakAlpha=*/0.65f,
-                                g_topVignetteVisibility,    
+                                g_topVignetteVisibility,
                                 /*darkAtBottom=*/false);
             }
 
@@ -3128,22 +3156,22 @@ void Render(HWND hWnd)
     {
         // ----- Single-pass: everything in one BeginDraw/EndDraw -----
 
-        // Gradient vignette bars (same as three-pass path)
+        // Gradient vignette bars (same as three-pass path, pixel-fixed thickness)
         if (g_d2dBitmap)
         {
-                // Bottom bar: transparent at 80 % → dark at 100 %
-                DrawVignetteBar(g_renderTarget.Get(), 
-                                /*topY=*/0.86f, 
-                                /*bottomY=*/1.00f, 
+                const float vigRTH        = rtSize.height > 0.f ? rtSize.height : 1.f;
+                const float vigTopNorm    = g_vignetteHeightsCaptured ? (g_vignetteTopBarHeightPx    / vigRTH) : 0.08f;
+                const float vigBottomNorm = g_vignetteHeightsCaptured ? (g_vignetteBottomBarHeightPx / vigRTH) : 0.14f;
+
+                DrawVignetteBar(g_renderTarget.Get(),
+                                1.f - vigBottomNorm, 1.f,
                                 /*peakAlpha=*/0.65f,
-                                g_bottomVignetteVisibility, 
+                                g_bottomVignetteVisibility,
                                 /*darkAtBottom=*/true);
-                // Top bar: dark at 0 % → transparent at 14 %
-                DrawVignetteBar(g_renderTarget.Get(), 
-                                /*topY=*/0.00f, 
-                                /*bottomY=*/0.08f, 
+                DrawVignetteBar(g_renderTarget.Get(),
+                                0.f, vigTopNorm,
                                 /*peakAlpha=*/0.65f,
-                                g_topVignetteVisibility,    
+                                g_topVignetteVisibility,
                                 /*darkAtBottom=*/false);
         }
 
@@ -4289,9 +4317,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         // Only show when an image is loaded (same rule as the buttons).
         if (g_d2dBitmap)
         {
-            float normY = (windowHeight > 0.f) ? (float)pt.y / windowHeight : 0.f;
-            g_topVignetteTarget    = (normY <= 0.20f) ? 1.0f : 0.0f;
-            g_bottomVignetteTarget = (normY >= 0.80f) ? 1.0f : 0.0f;
+            // Use pixel-fixed activation thresholds (captured at fullscreen init);
+            // fall back to normalized 20% if not yet captured.
+            const float topThresh    = g_vignetteHeightsCaptured
+                                           ? g_vignetteTopActivationPx
+                                           : windowHeight * 0.20f;
+            const float bottomThresh = g_vignetteHeightsCaptured
+                                           ? (windowHeight - g_vignetteBottomActivationPx)
+                                           : windowHeight * 0.80f;
+            g_topVignetteTarget    = ((float)pt.y <= topThresh)    ? 1.0f : 0.0f;
+            g_bottomVignetteTarget = ((float)pt.y >= bottomThresh) ? 1.0f : 0.0f;
         }
         else
         {
@@ -4463,6 +4498,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
                 if (success)
                 {
+                    // Remove the deleted file's saved view state so no other
+                    // image can accidentally inherit it (e.g. if a new file
+                    // with the same name is later added to the same folder).
+                    g_imageStates.erase(fileToDelete);
+
                     g_imageFiles.erase(g_imageFiles.begin() + g_currentImageIndex);
 
                     if (g_imageFiles.empty())
@@ -4475,6 +4515,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                         g_currentImageIndex = (int)g_imageFiles.size() - 1;
 
                     LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
+
+                    // Reset zoom/pan for the incoming image when it has no
+                    // saved state — mirrors what OpenNextImage/OpenPrevImage do.
+                    // Without this call, the deleted image's view state bleeds
+                    // into the next image because the global zoom/pan vars are
+                    // never updated when g_restoredStateThisLoad is false.
+                    InitializeImageLayout(hWnd, true);
                 }
                 return 0;
             } 

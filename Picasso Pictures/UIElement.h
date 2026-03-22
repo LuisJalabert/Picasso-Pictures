@@ -76,6 +76,13 @@ public:
     void CaptureAnchorsOnce(float rtWidth, float rtHeight); // captures using referenceWidth/referenceHeight
     void ResetAnchors();       // call if you want to recapture (e.g. entering fullscreen)
 
+    // Capture / release the activation zone in absolute pixels.
+    // Call CaptureZone() once after the fullscreen render target is ready,
+    // and ReleaseZone() when exiting fullscreen so windowed mode uses
+    // the normalized activation zone instead.
+    void CaptureZone(float refW, float refH);
+    void ReleaseZone();
+
     // Update for the current render target size
     void UpdateLayoutForSize(float rtWidth, float rtHeight);
 
@@ -169,6 +176,25 @@ protected:
 
     AxisCache m_xCache{};
     AxisCache m_yCache{};
+
+    // Activation zone captured at CaptureAnchorsOnce() time.
+    // Each boundary is stored as (Anchor, insetPx) and resolved with the same
+    // switch as ResolveAxisCenter, so it behaves consistently with the axis caches.
+    // Anchor is derived from the normalized spec value:
+    //   < 0.5  -> OffsetFromStart   (inset from left/top)
+    //   > 0.5  -> OffsetFromEnd     (inset from right/bottom)
+    //   = 0.5  -> OffsetFromCenter  (inset from centre)
+    struct ZoneBoundary
+    {
+        Anchor anchor  = Anchor::OffsetFromStart;
+        float  insetPx = 0.f;
+    };
+    struct ZoneCache
+    {
+        bool         captured = false;
+        ZoneBoundary left, top, right, bottom;
+    };
+    ZoneCache m_zoneCache{};
 
     // ---- Tooltip state ----
     std::wstring                                       m_tooltipText;
