@@ -24,6 +24,10 @@
 #include <wrl/client.h>
 #include <cmath>
 #include <functional>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <atomic>
 #include <d2d1_1.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -105,6 +109,10 @@ float                                               g_overlayAlpha = 0.0f;
 HWND                                                g_overlayWindow = nullptr;
 HWND                                                g_mainWindow = nullptr;
 bool                                                g_isExiting = false;
+// True from the moment a keyboard navigation fires until the next frame is
+// fully rendered. Prevents auto-repeat from queuing up loads faster than
+// the render loop can display them.
+bool                                                g_navPendingRender = false;
 bool                                                g_fullScreenInitDone = false;
 std::vector<std::wstring>                           g_imageFiles;
 int                                                 g_currentImageIndex = -1;
@@ -155,6 +163,9 @@ ComPtr<ID3D11DepthStencilState>                     g_imageDS;
 ComPtr<ID3D11RenderTargetView>                      g_swapRTV;              // RTV wrapping swap-chain buffer 0
 bool                                                g_mipPipelineReady = false;
 
+// Custom window message posted by the directory watcher thread
+#define WM_APP_DIRCHANGE  (WM_APP + 1)
+
 // ---- Vignette animated visibility ----
 float                                               g_topVignetteVisibility    = 0.f;
 float                                               g_topVignetteTarget        = 0.f;
@@ -171,6 +182,31 @@ float                                               g_vignetteBottomBarHeightPx 
 float                                               g_vignetteTopActivationPx   = 0.f;
 float                                               g_vignetteBottomActivationPx= 0.f;
 bool                                                g_vignetteHeightsCaptured   = false;
+
+// ---- Directory watcher ----
+HANDLE                                                       g_watchHandle    = INVALID_HANDLE_VALUE;
+std::thread                                                  g_watchThread;
+std::atomic<bool>                                            g_watchStop{ false };
+
+// ---- Thumbnail film strip ----
+struct ThumbnailEntry
+{
+    Microsoft::WRL::ComPtr<IWICBitmap>  wic;  // CPU-side; survives device loss
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> d2d;  // GPU-side; cleared on device loss
+};
+std::vector<ThumbnailEntry>                                      g_thumbs;
+std::mutex                                                       g_thumbReadyMutex;
+std::queue<std::pair<int, Microsoft::WRL::ComPtr<IWICBitmap>>>   g_thumbReadyQueue;
+std::thread                                                      g_thumbLoaderThread;
+std::atomic<bool>                                                g_thumbLoaderStop{ false };
+float                                                            g_thumbScrollOffset = 0.f;
+float                                                            g_thumbTargetOffset = 0.f;
+float                                                            g_thumbW            = 0.f;
+float                                                            g_thumbH            = 0.f;
+float                                                            g_thumbGap          = 0.f;
+float                                                            g_thumbStripCenterY = 0.f;
+bool                                                             g_thumbSizeCaptured = false;
+std::vector<Microsoft::WRL::ComPtr<ID2D1RoundedRectangleGeometry>> g_thumbClipGeos;     // one per slot, rebuilt on resize
 
 // ---- Slideshow mode ----
 bool                                                g_isSlideshowMode            = false;
@@ -237,6 +273,11 @@ void OpenNextImage(HWND hWnd);
 void OpenPrevImage(HWND hWnd);
 bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt);
 void MakeZoomVisible(HWND hWnd);
+void StopThumbnailLoader();
+void StartThumbnailLoader();
+void DrawThumbnailStrip(float visibility);
+void StartDirectoryWatcher(const std::wstring& dir);
+void StopDirectoryWatcher();
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
 
@@ -720,6 +761,10 @@ void DiscardDeviceResources()
     g_gifD2DBitmaps.clear();
     g_gifD3DSRVs.clear();
 
+    // Clear GPU-side thumbnail bitmaps (WIC source survives for re-upload)
+    for (auto& t : g_thumbs)
+        t.d2d.Reset();
+
     // Cached brushes
     g_dimBrush.Reset();
     g_blackBrush.Reset();
@@ -836,6 +881,25 @@ void UpdateEngine(float dt)
             g_prevD2DBitmap.Reset();
             g_prevSlideshowBgBitmap.Reset();
         }
+    }
+
+    // ---- Thumbnail strip: drain loader queue (one upload per frame) ----
+    {
+        std::lock_guard<std::mutex> lk(g_thumbReadyMutex);
+        if (!g_thumbReadyQueue.empty())
+        {
+            auto& [idx, bmp] = g_thumbReadyQueue.front();
+            if (idx >= 0 && idx < (int)g_thumbs.size())
+                g_thumbs[idx].wic = std::move(bmp);
+            g_thumbReadyQueue.pop();
+        }
+    }
+
+    // Animate thumbnail scroll offset toward current image
+    if (g_thumbSizeCaptured)
+    {
+        g_thumbTargetOffset = -(g_currentImageIndex * (g_thumbW + g_thumbGap));
+        g_thumbScrollOffset += (g_thumbTargetOffset - g_thumbScrollOffset) * g_smooth;
     }
 
     g_zoom     += (g_targetZoom     - g_zoom)     * g_smooth;
@@ -1353,6 +1417,37 @@ void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
             g_vignetteTopActivationPx    = size.height * 0.20f;  // show when mouseY <= this
             g_vignetteBottomActivationPx = size.height * 0.20f;  // show when mouseY >= windowH - this
             g_vignetteHeightsCaptured    = true;
+        }
+
+        // Capture thumbnail strip dimensions once at fullscreen init
+        if (!g_thumbSizeCaptured && size.height > 0.f)
+        {
+            g_thumbH            = size.height * 0.08f;
+            g_thumbW            = g_thumbH;            // square slots
+            g_thumbGap          = g_thumbH    * 0.12f;
+            g_thumbStripCenterY = size.height * 0.855f;
+            g_thumbSizeCaptured = true;
+
+            // Snap scroll immediately so there is no slide-in on first open
+            g_thumbTargetOffset = -(g_currentImageIndex * (g_thumbW + g_thumbGap));
+            g_thumbScrollOffset = g_thumbTargetOffset;
+        }
+
+        // Rebuild per-slot clip geometries whenever thumb dimensions are freshly captured.
+        // Slots share the same shape so we only need one; index them by position later.
+        // We create exactly one geometry (reused for every slot via the same RR dimensions).
+        if (g_thumbSizeCaptured && g_thumbClipGeos.empty() && g_d2dFactory)
+        {
+            const float radius = g_thumbH * 0.10f;
+            // Placeholder rect centred at origin — position is irrelevant because
+            // we transform the render target before pushing the layer.
+            const D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
+                D2D1::RectF(-g_thumbW * 0.5f, -g_thumbH * 0.5f,
+                             g_thumbW * 0.5f,  g_thumbH * 0.5f),
+                radius, radius);
+            Microsoft::WRL::ComPtr<ID2D1RoundedRectangleGeometry> geo;
+            if (SUCCEEDED(g_d2dFactory->CreateRoundedRectangleGeometry(rr, &geo)))
+                g_thumbClipGeos.push_back(geo);
         }
     }
 
@@ -2849,6 +2944,31 @@ void Render(HWND hWnd)
     if (g_wicBitmapSource && !g_slideshowBgBitmap && g_blurEffect)
         CreateSlideshowBgBitmap();
 
+    // Lazy D2D upload for one thumbnail per frame — spiral outward from the
+    // current image so the visible window is always uploaded first.
+    if (!g_thumbs.empty() && g_currentImageIndex >= 0)
+    {
+        const int tn  = (int)g_thumbs.size();
+        const int cur = min(g_currentImageIndex, tn - 1);
+        for (int d = 0; d < tn; ++d)
+        {
+            auto tryUpload = [&](int i) -> bool
+            {
+                if (i < 0 || i >= tn) return false;
+                auto& t = g_thumbs[i];
+                if (t.wic && !t.d2d)
+                {
+                    g_renderTarget->CreateBitmapFromWicBitmap(t.wic.Get(), nullptr, &t.d2d);
+                    return true;  // one upload per frame
+                }
+                return false;
+            };
+            if (d == 0) { if (tryUpload(cur))           break; }
+            else        { if (tryUpload(cur + d) ||
+                             tryUpload(cur - d))         break; }
+        }
+    }
+
     g_renderTarget->BeginDraw();
 
     // Cache the render-target size once — used throughout this function.
@@ -3130,6 +3250,10 @@ void Render(HWND hWnd)
                 }
             }
 
+            // Thumbnail film strip (fades in/out with bottom vignette)
+            if (g_isFullscreen)
+                DrawThumbnailStrip(g_bottomVignetteVisibility);
+
             for (auto& [id, btn] : g_buttons)
             {
                 if (!g_isFullscreen && id == BUTTON_EXIT)
@@ -3143,6 +3267,7 @@ void Render(HWND hWnd)
             hr = g_renderTarget->EndDraw();
 
             g_swapChain->Present(1, 0);
+            g_navPendingRender = false;  // frame delivered — next key repeat may fire
 
             if (g_slideshowPreFade && g_isSlideshowMode && g_overlayWindow)
             {
@@ -3189,6 +3314,10 @@ void Render(HWND hWnd)
             }
         }
 
+        // Thumbnail film strip (fades in/out with bottom vignette)
+        if (g_isFullscreen)
+            DrawThumbnailStrip(g_bottomVignetteVisibility);
+
         for (auto& [id, btn] : g_buttons)
         {
             if (!g_isFullscreen && id == BUTTON_EXIT)
@@ -3204,6 +3333,7 @@ void Render(HWND hWnd)
         if (SUCCEEDED(hr) && g_swapChain)
         {
             g_swapChain->Present(1, 0);
+            g_navPendingRender = false;  // frame delivered
 
             if (g_slideshowPreFade && g_isSlideshowMode && g_overlayWindow)
             {
@@ -3913,6 +4043,10 @@ void BuildImageList(const wchar_t* filename)
             break;
         }
     }
+
+    // Start watching the directory for new/deleted/renamed image files
+    StartDirectoryWatcher(std::filesystem::path(filename).parent_path().wstring());
+    StartThumbnailLoader();
 }
 
 bool OpenImageFile(HWND hWnd)
@@ -3954,14 +4088,9 @@ bool OpenImageFile(HWND hWnd)
 
 void OpenPrevImage(HWND hWnd)
 {
-    if (!g_imageFiles.empty())
+    if (!g_imageFiles.empty() && g_currentImageIndex > 0)
     {
         g_currentImageIndex--;
-
-        if (g_currentImageIndex < 0)
-            g_currentImageIndex =
-                (int)g_imageFiles.size() - 1;
-
         LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
         InitializeImageLayout(hWnd, true);
     }
@@ -3969,11 +4098,10 @@ void OpenPrevImage(HWND hWnd)
 
 void OpenNextImage(HWND hWnd)
 {
-    if (!g_imageFiles.empty())
+    if (!g_imageFiles.empty() &&
+        g_currentImageIndex < (int)g_imageFiles.size() - 1)
     {
-        g_currentImageIndex =
-            (g_currentImageIndex + 1) % (int)g_imageFiles.size();
-
+        g_currentImageIndex++;
         LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
         InitializeImageLayout(hWnd, true);
     }
@@ -4042,6 +4170,310 @@ void MakeZoomVisible(HWND hWnd)
 {
     g_textBoxes[TEXTBOX_ZOOM_INPUT].SetForcedVisibility(true);
     SetTimer(hWnd, 666, 1000, nullptr);
+}
+
+
+// ============================================================
+//  Thumbnail film strip
+// ============================================================
+
+// ============================================================
+//  Directory watcher (ReadDirectoryChangesW)
+// ============================================================
+
+void StopDirectoryWatcher()
+{
+    g_watchStop = true;
+    // Cancel any blocking ReadDirectoryChangesW by closing the handle
+    if (g_watchHandle != INVALID_HANDLE_VALUE)
+    {
+        CancelIoEx(g_watchHandle, nullptr);
+        CloseHandle(g_watchHandle);
+        g_watchHandle = INVALID_HANDLE_VALUE;
+    }
+    if (g_watchThread.joinable())
+        g_watchThread.join();
+    g_watchStop = false;
+}
+
+void StartDirectoryWatcher(const std::wstring& dir)
+{
+    StopDirectoryWatcher();
+
+    g_watchHandle = CreateFileW(
+        dir.c_str(),
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+        nullptr);
+
+    if (g_watchHandle == INVALID_HANDLE_VALUE)
+        return;
+
+    g_watchThread = std::thread([dir]()
+    {
+        // Aligned buffer for FILE_NOTIFY_INFORMATION records
+        alignas(DWORD) BYTE buf[4096];
+        OVERLAPPED ov = {};
+        ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent) return;
+
+        while (!g_watchStop)
+        {
+            DWORD bytesReturned = 0;
+            ResetEvent(ov.hEvent);
+
+            BOOL ok = ReadDirectoryChangesW(
+                g_watchHandle,
+                buf, sizeof(buf),
+                FALSE,  // non-recursive
+                FILE_NOTIFY_CHANGE_FILE_NAME,  // created, deleted, renamed
+                nullptr,
+                &ov,
+                nullptr);
+
+            if (!ok) break;
+
+            // Wait for the overlapped result or a stop signal
+            DWORD wait = WaitForSingleObject(ov.hEvent, INFINITE);
+            if (g_watchStop || wait != WAIT_OBJECT_0) break;
+
+            if (!GetOverlappedResult(g_watchHandle, &ov, &bytesReturned, FALSE))
+                break;
+            if (bytesReturned == 0) continue;
+
+            // Check whether any changed file is a supported image
+            bool relevant = false;
+            const FILE_NOTIFY_INFORMATION* fni =
+                reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buf);
+            for (;;)
+            {
+                std::wstring name(fni->FileName,
+                                  fni->FileNameLength / sizeof(WCHAR));
+                std::wstring fullPath = dir + L"\\" + name;
+                if (IsSupportedImage(fullPath))
+                {
+                    relevant = true;
+                    break;
+                }
+                if (fni->NextEntryOffset == 0) break;
+                fni = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(
+                    reinterpret_cast<const BYTE*>(fni) + fni->NextEntryOffset);
+            }
+
+            if (relevant)
+            {
+                // Post to main window — safe to call from any thread
+                HWND target = g_overlayWindow ? g_overlayWindow : g_mainWindow;
+                if (target)
+                    PostMessage(target, WM_APP_DIRCHANGE, 0, 0);
+            }
+        }
+        CloseHandle(ov.hEvent);
+    });
+}
+
+void StopThumbnailLoader()
+{
+    g_thumbLoaderStop = true;
+    if (g_thumbLoaderThread.joinable())
+        g_thumbLoaderThread.join();
+    g_thumbLoaderStop = false;
+}
+
+void StartThumbnailLoader()
+{
+    // Stop the thread first so there is no race when we read g_thumbs below.
+    StopThumbnailLoader();
+
+    const int n = (int)g_imageFiles.size();
+
+    // Build a path→wic map from the CURRENT g_thumbs vector (thread is stopped
+    // so this is safe). g_thumbs may be a different size than g_imageFiles if a
+    // file was just deleted, so we zip by the PREVIOUS g_imageFiles snapshot
+    // stored in g_thumbs. Since we cannot access the old list here, we key by
+    // position only for entries that are still within range — this is safe
+    // because the caller already erased the deleted entry from g_imageFiles
+    // AND from g_thumbs (via the erase in the delete handler... wait, we removed
+    // that). So instead, the caller must pass the old file list. We handle this
+    // by keeping a persistent path→wic cache that callers update:
+    // actually, simplest correct approach — the caller snapshots the map before
+    // erasing. See the comment at the call site in the DEL handler.
+    //
+    // For non-delete calls (BuildImageList), g_thumbs is empty so nothing
+    // is preserved and the loader decodes everything fresh.
+
+    // Resize g_thumbs to match the new file list, preserving existing entries
+    // by path lookup via a temporary snapshot taken before any index shift.
+    // The snapshot is built by the caller into g_thumbSavedWic when needed.
+    g_thumbs.resize(n);  // new slots default-construct to null wic+d2d
+
+    {
+        std::lock_guard<std::mutex> lk(g_thumbReadyMutex);
+        while (!g_thumbReadyQueue.empty()) g_thumbReadyQueue.pop();
+    }
+
+    if (n == 0) return;
+
+    // Build work list: only files whose slot has no WIC bitmap yet.
+    // Spiral outward from the current image so the visible window fills first.
+    const int cur = max(0, min(g_currentImageIndex, n - 1));
+    std::vector<int> order;
+    order.reserve(n);
+    for (int d = 0; d < n; ++d)
+    {
+        const int a = cur + d, b = cur - d;
+        if (d == 0) { if (!g_thumbs[cur].wic) order.push_back(cur); }
+        else {
+            if (a < n  && !g_thumbs[a].wic) order.push_back(a);
+            if (b >= 0 && !g_thumbs[b].wic) order.push_back(b);
+        }
+    }
+
+    if (order.empty()) return;  // everything already loaded
+
+    g_thumbLoaderThread = std::thread(
+        [files = g_imageFiles, indices = std::move(order)]()
+        {
+            if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
+
+            Microsoft::WRL::ComPtr<IWICImagingFactory> wic;
+            if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                    CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) || !wic)
+            { CoUninitialize(); return; }
+
+            for (int idx : indices)
+            {
+                if (g_thumbLoaderStop) break;
+                if (idx < 0 || idx >= (int)files.size()) continue;
+
+                Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+                if (FAILED(wic->CreateDecoderFromFilename(files[idx].c_str(), nullptr,
+                        GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder)) || !decoder)
+                    continue;
+                if (g_thumbLoaderStop) break;
+
+                Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+                if (FAILED(decoder->GetFrame(0, &frame)) || !frame) continue;
+                if (g_thumbLoaderStop) break;
+
+                UINT sw = 0, sh = 0;
+                frame->GetSize(&sw, &sh);
+                if (sw == 0 || sh == 0) continue;
+
+                const UINT TARGET_H = 180u;
+                const UINT dw = max(1u, (UINT)((float)sw / (float)sh * TARGET_H));
+
+                Microsoft::WRL::ComPtr<IWICBitmapScaler>    scaler;
+                Microsoft::WRL::ComPtr<IWICFormatConverter> conv;
+                Microsoft::WRL::ComPtr<IWICBitmap>          thumb;
+
+                if (FAILED(wic->CreateBitmapScaler(&scaler)) ||
+                    FAILED(scaler->Initialize(frame.Get(), dw, TARGET_H,
+                        WICBitmapInterpolationModeHighQualityCubic)) ||
+                    FAILED(wic->CreateFormatConverter(&conv)) ||
+                    FAILED(conv->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
+                        WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom)))
+                    continue;
+                if (g_thumbLoaderStop) break;
+
+                if (FAILED(wic->CreateBitmapFromSource(conv.Get(), WICBitmapCacheOnLoad, &thumb)) || !thumb)
+                    continue;
+
+                {
+                    std::lock_guard<std::mutex> lk(g_thumbReadyMutex);
+                    g_thumbReadyQueue.push({ idx, thumb });
+                }
+            }
+            CoUninitialize();
+        });
+}
+
+void DrawThumbnailStrip(float visibility)
+{
+    if (!g_renderTarget || !g_d2dFactory)         return;
+    if (visibility <= 0.01f)                       return;
+    if (g_thumbs.empty() || !g_thumbSizeCaptured) return;
+    if (g_currentImageIndex < 0)                   return;
+
+    const D2D1_SIZE_F rtSz  = g_renderTarget->GetSize();
+    const float stride = g_thumbW + g_thumbGap;
+    const int   n      = (int)g_thumbs.size();
+    const float baseX  = rtSz.width * 0.5f + g_thumbScrollOffset;
+    const float cy     = g_thumbStripCenterY;
+    const float hw     = g_thumbW * 0.5f;
+    const float hh     = g_thumbH * 0.5f;
+    const float radius = g_thumbH * 0.10f;
+
+    // One cached geometry centred at the origin; we move the render target
+    // transform to each thumbnail position so every slot reuses the same geometry.
+    ID2D1RoundedRectangleGeometry* clipGeo =
+        (!g_thumbClipGeos.empty()) ? g_thumbClipGeos[0].Get() : nullptr;
+
+    // Use the base ID2D1RenderTarget pointer so PushLayer resolves to the
+    // D2D1_LAYER_PARAMETERS (not D2D1_LAYER_PARAMETERS1) overload.
+    ID2D1RenderTarget* rt = g_renderTarget.Get();
+
+    for (int i = 0; i < n; ++i)
+    {
+        const float cx = baseX + i * stride;
+        if (cx + hw < 0.f || cx - hw > rtSz.width) continue;
+
+        const D2D1_RECT_F       r  = D2D1::RectF(cx - hw, cy - hh, cx + hw, cy + hh);
+        const D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(r, radius, radius);
+        const bool isCurrent = (i == g_currentImageIndex);
+
+        if (g_thumbs[i].d2d && clipGeo)
+        {
+            // Translate the RT so the cached origin-centred geometry aligns with
+            // this slot, push the clip layer, then restore the identity transform.
+            rt->SetTransform(D2D1::Matrix3x2F::Translation(cx, cy));
+            rt->PushLayer(
+                D2D1::LayerParameters(D2D1::InfiniteRect(), clipGeo,
+                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    D2D1::IdentityMatrix(), visibility),
+                nullptr);
+            rt->SetTransform(D2D1::Matrix3x2F::Identity());
+
+            // Centre-crop the bitmap to fill the slot
+            const D2D1_SIZE_F bsz = g_thumbs[i].d2d->GetSize();
+            const float bA = bsz.width  / max(1.f, bsz.height);
+            const float tA = g_thumbW   / max(1.f, g_thumbH);
+            float srcL = 0.f, srcT = 0.f, srcR = bsz.width, srcB = bsz.height;
+            if (bA > tA) {
+                const float nw = bsz.height * tA;
+                srcL = (bsz.width  - nw) * 0.5f; srcR = srcL + nw;
+            } else {
+                const float nh = bsz.width / max(0.001f, tA);
+                srcT = (bsz.height - nh) * 0.5f; srcB = srcT + nh;
+            }
+
+            const D2D1_RECT_F srcRect = D2D1::RectF(srcL, srcT, srcR, srcB);
+            rt->DrawBitmap(g_thumbs[i].d2d.Get(), &r, 1.0f,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &srcRect);
+
+            rt->PopLayer();
+        }
+        else
+        {
+            // Placeholder while thumbnail is still loading
+            Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> ph;
+            rt->CreateSolidColorBrush(
+                D2D1::ColorF(0.22f, 0.22f, 0.22f, 0.8f * visibility), &ph);
+            if (ph) rt->FillRoundedRectangle(&rr, ph.Get());
+        }
+
+        // Darken non-current thumbnails
+        if (!isCurrent)
+        {
+            Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> dim;
+            rt->CreateSolidColorBrush(
+                D2D1::ColorF(0.f, 0.f, 0.f, 0.50f * visibility), &dim);
+            if (dim) rt->FillRoundedRectangle(&rr, dim.Get());
+        }
+    }
 }
 
 void InitFullScreenExit()
@@ -4253,6 +4685,34 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             if (box.OnMouseDown(x, y))
                 return 0;  // STOP — message box handled it
         }
+        // Thumbnail strip click: check before starting a drag
+        if (g_isFullscreen && g_thumbSizeCaptured && !g_thumbs.empty())
+        {
+            const float stripTop    = g_thumbStripCenterY - g_thumbH * 0.5f;
+            const float stripBottom = g_thumbStripCenterY + g_thumbH * 0.5f;
+            if (y >= stripTop && y <= stripBottom)
+            {
+                RECT rc2; GetClientRect(hWnd, &rc2);
+                const float rtW    = (float)(rc2.right - rc2.left);
+                const float baseX  = rtW * 0.5f + g_thumbScrollOffset;
+                const float stride = g_thumbW + g_thumbGap;
+                const int   n      = (int)g_thumbs.size();
+                for (int i = 0; i < n; ++i)
+                {
+                    const float cx = baseX + i * stride;
+                    if (x >= cx - g_thumbW * 0.5f && x <= cx + g_thumbW * 0.5f)
+                    {
+                        if (i != g_currentImageIndex && i < (int)g_imageFiles.size())
+                        {
+                            g_currentImageIndex = i;
+                            LoadImageD2D(hWnd, g_imageFiles[i].c_str());
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
+
         g_isDragging = true;
         SetCapture(hWnd);
         g_lastMouse.x = x;
@@ -4503,7 +4963,35 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     // with the same name is later added to the same folder).
                     g_imageStates.erase(fileToDelete);
 
+                    // Stop the loader before touching g_thumbs (no race).
+                    StopThumbnailLoader();
+
+                    // Snapshot BOTH wic and d2d by path BEFORE erasing g_imageFiles
+                    // so indices still match. D2D bitmaps are still valid — this is
+                    // not a device loss, just a file list change.
+                    struct ThumbSnap { Microsoft::WRL::ComPtr<IWICBitmap> wic;
+                                       Microsoft::WRL::ComPtr<ID2D1Bitmap> d2d; };
+                    std::unordered_map<std::wstring, ThumbSnap> snap;
+                    for (int si = 0; si < (int)g_thumbs.size() &&
+                                     si < (int)g_imageFiles.size(); ++si)
+                        if (g_thumbs[si].wic || g_thumbs[si].d2d)
+                            snap[g_imageFiles[si]] = { g_thumbs[si].wic, g_thumbs[si].d2d };
+
                     g_imageFiles.erase(g_imageFiles.begin() + g_currentImageIndex);
+
+                    // Rebuild g_thumbs, restoring both wic and d2d so the D2D
+                    // bitmaps don't go gray and the spiral skips already-loaded slots.
+                    const int newN = (int)g_imageFiles.size();
+                    g_thumbs.assign(newN, ThumbnailEntry{});
+                    for (int si = 0; si < newN; ++si)
+                    {
+                        auto it = snap.find(g_imageFiles[si]);
+                        if (it != snap.end())
+                        {
+                            g_thumbs[si].wic = it->second.wic;
+                            g_thumbs[si].d2d = it->second.d2d;
+                        }
+                    }
 
                     if (g_imageFiles.empty())
                     {
@@ -4522,6 +5010,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     // into the next image because the global zoom/pan vars are
                     // never updated when g_restoredStateThisLoad is false.
                     InitializeImageLayout(hWnd, true);
+                    StartThumbnailLoader();  // reload with updated file list
                 }
                 return 0;
             } 
@@ -4549,8 +5038,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 }
             }
             break;
-            case 0x46: // 'F' key
+            case 0x46: // 'F' key — ignore auto-repeat to prevent toggle glitches
             {
+                if (lParam & (1 << 30)) break;  // auto-repeat, skip
                 if (!g_d2dBitmap)
                 {
                     break;
@@ -4590,6 +5080,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             case 0x41: // 'A' key
             case VK_LEFT:
             {
+                if (g_navPendingRender) break;
+                g_navPendingRender = true;
                 OpenPrevImage(hWnd);
                 if (g_isSlideshowMode)
                     KillTimer(g_mainWindow, SLIDESHOW_TIMER_ID);
@@ -4601,6 +5093,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             case VK_SPACE:
             case VK_RIGHT:
             {
+                if (g_navPendingRender) break;
+                g_navPendingRender = true;
                 OpenNextImage(hWnd);
                 if (g_isSlideshowMode)
                     KillTimer(g_mainWindow, SLIDESHOW_TIMER_ID);
@@ -4646,6 +5140,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     break;
 
+    case WM_APP_DIRCHANGE:
+    {
+        // A supported image file was created, deleted, or renamed in the
+        // current directory. Rebuild the file list, preserving the current
+        // image if it still exists, or clamping to the nearest valid index.
+        if (!g_currentFilePath.empty())
+        {
+            const std::wstring currentPath = g_currentFilePath;
+            BuildImageList(currentPath.c_str());
+
+            // BuildImageList sets g_currentImageIndex to -1 if the current
+            // file no longer exists; clamp to a valid image in that case.
+            if (g_currentImageIndex < 0 && !g_imageFiles.empty())
+            {
+                g_currentImageIndex = 0;
+                LoadImageD2D(hWnd, g_imageFiles[0].c_str());
+                InitializeImageLayout(hWnd, true);
+            }
+        }
+        return 0;
+    }
+    break;
+
     case WM_DESTROY:
     {
         if (hWnd == g_mainWindow)
@@ -4657,6 +5174,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 g_overlayWindow = nullptr;
             }
 
+            StopDirectoryWatcher();
+            StopThumbnailLoader();
             DiscardDeviceResources();
             g_wicDefaultBackground.Reset();
             g_wicBackground.Reset();

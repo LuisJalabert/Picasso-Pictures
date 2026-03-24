@@ -76,13 +76,6 @@ public:
     void CaptureAnchorsOnce(float rtWidth, float rtHeight); // captures using referenceWidth/referenceHeight
     void ResetAnchors();       // call if you want to recapture (e.g. entering fullscreen)
 
-    // Capture / release the activation zone in absolute pixels.
-    // Call CaptureZone() once after the fullscreen render target is ready,
-    // and ReleaseZone() when exiting fullscreen so windowed mode uses
-    // the normalized activation zone instead.
-    void CaptureZone(float refW, float refH);
-    void ReleaseZone();
-
     // Update for the current render target size
     void UpdateLayoutForSize(float rtWidth, float rtHeight);
 
