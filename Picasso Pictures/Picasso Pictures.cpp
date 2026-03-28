@@ -165,6 +165,7 @@ bool                                                g_mipPipelineReady = false;
 
 // Custom window message posted by the directory watcher thread
 #define WM_APP_DIRCHANGE  (WM_APP + 1)
+#define WM_APP_EXITFULLSCREEN (WM_APP + 2)  // deferred exit to avoid mid-focus-change destruction
 
 // ---- Vignette animated visibility ----
 float                                               g_topVignetteVisibility    = 0.f;
@@ -4529,14 +4530,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     break;
 
+
     case WM_ACTIVATE:
     {
         if (LOWORD(wParam) == WA_INACTIVE)
         {
             if (g_isFullscreen && g_fullScreenInitDone)
             {
-                ExitFullscreen();
+                // Post rather than call directly — ExitFullscreen destroys the
+                // overlay and calls SetFocus while Windows is mid-focus-change,
+                // which leaves the main window visually active but without real
+                // keyboard focus. Deferring lets the OS finish first.
+                PostMessage(g_mainWindow, WM_APP_EXITFULLSCREEN, 0, 0);
             }
+        }
+        else
+        {
+            g_navPendingRender = false;
         }
     }
     break;
@@ -5139,7 +5149,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         SetTimer(hWnd, 123, 120, nullptr);
     }
     break;
-
+    
+    case WM_APP_EXITFULLSCREEN:
+    {
+        if (g_isFullscreen)
+            ExitFullscreen();
+        return 0;
+    }
+    break;
+ 
     case WM_APP_DIRCHANGE:
     {
         // A supported image file was created, deleted, or renamed in the
