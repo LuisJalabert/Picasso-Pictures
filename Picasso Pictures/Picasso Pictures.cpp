@@ -185,9 +185,9 @@ float                                               g_vignetteBottomActivationPx
 bool                                                g_vignetteHeightsCaptured   = false;
 
 // ---- Directory watcher ----
-HANDLE                                                       g_watchHandle    = INVALID_HANDLE_VALUE;
-std::thread                                                  g_watchThread;
-std::atomic<bool>                                            g_watchStop{ false };
+HANDLE                                              g_watchHandle    = INVALID_HANDLE_VALUE;
+std::thread                                         g_watchThread;
+std::atomic<bool>                                   g_watchStop{ false };
 
 // ---- Thumbnail film strip ----
 struct ThumbnailEntry
@@ -205,7 +205,7 @@ float                                                            g_thumbTargetOf
 float                                                            g_thumbW            = 0.f;
 float                                                            g_thumbH            = 0.f;
 float                                                            g_thumbGap          = 0.f;
-float                                                            g_thumbStripCenterY = 0.f;
+float                                                            g_thumbStripInsetFromBottomPx = 0.f;  // pixels from RT bottom to strip centre (anchored like vignettes)
 bool                                                             g_thumbSizeCaptured = false;
 std::vector<Microsoft::WRL::ComPtr<ID2D1RoundedRectangleGeometry>> g_thumbClipGeos;     // one per slot, rebuilt on resize
 
@@ -424,7 +424,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
   
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
     int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
-    g_smooth = g_smooth / ((float)(refreshRate) / 60.0f);
+    g_smooth = 1.0f - std::powf(1.0f - g_smooth, 60.0f / (float)refreshRate);
 
     // Make overlay box 2.3% of screen height
     float boxHeight = screenHeight * 0.023f;
@@ -840,14 +840,14 @@ void UpdateEngine(float dt)
         g_imageRotationAngle += step;
     }
     float overlayTarget = g_isExiting ? 0.0f : 1.0f;
-    g_overlayAlpha += (overlayTarget - g_overlayAlpha) * 0.15f;
+    g_overlayAlpha += (overlayTarget - g_overlayAlpha) * (1.0f - std::powf(1.0f - 0.15f, dt * 60.0f));
 
     // ---- Slideshow pre-fade (current view → black, then window transition) ----
     // g_slideshowPreFade stays true until Render() confirms the overlay's first Present().
     if (g_slideshowPreFade && !g_isSlideshowMode)
     {
         // Phase 1: fade the current render target to black (slow ease-out)
-        g_slideshowPreFadeAlpha += (1.0f - g_slideshowPreFadeAlpha) * 0.04f;
+        g_slideshowPreFadeAlpha += (1.0f - g_slideshowPreFadeAlpha) * (1.0f - std::powf(1.0f - 0.08f, dt * 60.0f));
 
         if (g_slideshowPreFadeAlpha > 0.995f)
         {
@@ -874,7 +874,7 @@ void UpdateEngine(float dt)
     if (g_isSlideshowMode && g_slideshowTransitionAlpha < g_slideshowTargetAlpha)
     {
         g_slideshowTransitionAlpha +=
-            (g_slideshowTargetAlpha - g_slideshowTransitionAlpha) * 0.02f;
+            (g_slideshowTargetAlpha - g_slideshowTransitionAlpha) * (1.0f - std::powf(1.0f - 0.08f, dt * 60.0f));
 
         if (g_slideshowTransitionAlpha > 0.995f)
         {
@@ -1426,7 +1426,7 @@ void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
             g_thumbH            = size.height * 0.08f;
             g_thumbW            = g_thumbH;            // square slots
             g_thumbGap          = g_thumbH    * 0.12f;
-            g_thumbStripCenterY = size.height * 0.855f;
+            g_thumbStripInsetFromBottomPx = size.height * (1.0f - 0.855f);  // mirrors vignette anchor pattern
             g_thumbSizeCaptured = true;
 
             // Snap scroll immediately so there is no slide-in on first open
@@ -2723,7 +2723,7 @@ void InitializeButtons()
             g_targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
 
             int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
-            g_smooth = 2 * 0.18f / ((float)(refreshRate) / 60.0f);
+            g_smooth = 1.0f - std::powf(1.0f - 2 * 0.18f, 60.0f / (float)refreshRate);
 
             g_targetZoom = 0.0005f;
             g_isExiting = true;
@@ -3252,8 +3252,7 @@ void Render(HWND hWnd)
             }
 
             // Thumbnail film strip (fades in/out with bottom vignette)
-            if (g_isFullscreen)
-                DrawThumbnailStrip(g_bottomVignetteVisibility);
+            DrawThumbnailStrip(g_bottomVignetteVisibility);
 
             for (auto& [id, btn] : g_buttons)
             {
@@ -3316,7 +3315,7 @@ void Render(HWND hWnd)
         }
 
         // Thumbnail film strip (fades in/out with bottom vignette)
-        if (g_isFullscreen)
+        //if (g_isFullscreen)
             DrawThumbnailStrip(g_bottomVignetteVisibility);
 
         for (auto& [id, btn] : g_buttons)
@@ -4403,7 +4402,7 @@ void DrawThumbnailStrip(float visibility)
     const float stride = g_thumbW + g_thumbGap;
     const int   n      = (int)g_thumbs.size();
     const float baseX  = rtSz.width * 0.5f + g_thumbScrollOffset;
-    const float cy     = g_thumbStripCenterY;
+    const float cy     = rtSz.height - g_thumbStripInsetFromBottomPx;  // anchored: fixed distance from bottom
     const float hw     = g_thumbW * 0.5f;
     const float hh     = g_thumbH * 0.5f;
     const float radius = g_thumbH * 0.10f;
@@ -4487,7 +4486,7 @@ void InitFullScreenExit()
     g_targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
     
     int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
-    g_smooth = 2*0.18f/((float)(refreshRate) / 60.0f);
+    g_smooth = 1.0f - std::powf(1.0f - 2*0.18f, 60.0f / (float)refreshRate);
     g_targetZoom = 0.0005f;
     g_isExiting = true;
 }
@@ -4696,10 +4695,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 return 0;  // STOP — message box handled it
         }
         // Thumbnail strip click: check before starting a drag
-        if (g_isFullscreen && g_thumbSizeCaptured && !g_thumbs.empty())
+        if (g_thumbSizeCaptured && !g_thumbs.empty())
         {
-            const float stripTop    = g_thumbStripCenterY - g_thumbH * 0.5f;
-            const float stripBottom = g_thumbStripCenterY + g_thumbH * 0.5f;
+            RECT rc2; GetClientRect(hWnd, &rc2);
+            const float rtH    = (float)(rc2.bottom - rc2.top);
+            const float stripCY = rtH - g_thumbStripInsetFromBottomPx;
+            const float stripTop    = stripCY - g_thumbH * 0.5f;
+            const float stripBottom = stripCY + g_thumbH * 0.5f;
             if (y >= stripTop && y <= stripBottom)
             {
                 RECT rc2; GetClientRect(hWnd, &rc2);
