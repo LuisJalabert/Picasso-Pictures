@@ -228,6 +228,14 @@ bool                                                g_slideshowPreFade          
 float                                               g_slideshowPreFadeAlpha      = 0.0f;  // 0=current view visible, 1=fully black
 HWND                                                g_blackCoverWindow           = nullptr;
 
+// ---- Fullscreen exit fade ----
+// While g_pendingExitFullscreen is true the overlay stays alive while
+// g_exitBgFadeAlpha animates 0->1, then CompleteExitFullscreen() tears it down.
+// g_wasInSlideshowOnExit lets Render cross-fade the blurred bg -> desktop bg.
+bool                                                g_pendingExitFullscreen      = false;
+bool                                                g_wasInSlideshowOnExit       = false;
+float                                               g_exitBgFadeAlpha            = 0.f;
+
 // Forward declarations of functions included in this code module:
 static std::wstring GetInitialFileFromCommandLine();
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow);
@@ -251,7 +259,8 @@ void InitializeButtons();
 void InitializeImageInfoLabel();
 void UpdateTargetZoom(float newZoom);
 void EnterFullscreen(bool preserveView, bool needsDelay);
-void ExitFullscreen();
+void ExitFullscreen(bool immediate = false);
+static void CompleteExitFullscreen();
 void EnterSlideshowMode();
 void ExitSlideshowMode();
 void CreateSlideshowBgBitmap();
@@ -424,7 +433,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
   
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
     int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
-    g_smooth = 1.0f - std::powf(1.0f - g_smooth, 60.0f / (float)refreshRate);
+    g_smooth = g_smooth * 60.0f / (float)refreshRate;
 
     // Make overlay box 2.3% of screen height
     float boxHeight = screenHeight * 0.023f;
@@ -840,14 +849,14 @@ void UpdateEngine(float dt)
         g_imageRotationAngle += step;
     }
     float overlayTarget = g_isExiting ? 0.0f : 1.0f;
-    g_overlayAlpha += (overlayTarget - g_overlayAlpha) * (1.0f - std::powf(1.0f - 0.15f, dt * 60.0f));
+    g_overlayAlpha += (overlayTarget - g_overlayAlpha) * 0.15f * dt * 60.0f;
 
     // ---- Slideshow pre-fade (current view → black, then window transition) ----
     // g_slideshowPreFade stays true until Render() confirms the overlay's first Present().
     if (g_slideshowPreFade && !g_isSlideshowMode)
     {
         // Phase 1: fade the current render target to black (slow ease-out)
-        g_slideshowPreFadeAlpha += (1.0f - g_slideshowPreFadeAlpha) * (1.0f - std::powf(1.0f - 0.08f, dt * 60.0f));
+        g_slideshowPreFadeAlpha += 0.02f * dt * 60.0f;
 
         if (g_slideshowPreFadeAlpha > 0.995f)
         {
@@ -858,7 +867,7 @@ void UpdateEngine(float dt)
             // destroy the render target.
             CreateBlackCoverWindow();
 
-            if (g_isFullscreen) ExitFullscreen();
+            if (g_isFullscreen) ExitFullscreen(/*immediate=*/true);
             g_isSlideshowMode          = true;
             g_prevD2DBitmap.Reset();
             g_prevSlideshowBgBitmap.Reset();
@@ -870,11 +879,24 @@ void UpdateEngine(float dt)
         }
     }
 
+    // ---- Fullscreen exit fade (desktop bg fades in, dim lifts, then teardown) ----
+    if (g_pendingExitFullscreen && g_isFullscreen)
+    {
+        g_exitBgFadeAlpha += 0.04f * dt * 60.0f;
+
+        if (g_exitBgFadeAlpha > 0.995f)
+        {
+            g_exitBgFadeAlpha       = 1.0f;
+            g_pendingExitFullscreen = false;
+            CompleteExitFullscreen();
+        }
+    }
+
     // ---- Slideshow cross-fade (image-to-image transition) ----
     if (g_isSlideshowMode && g_slideshowTransitionAlpha < g_slideshowTargetAlpha)
     {
-        g_slideshowTransitionAlpha +=
-            (g_slideshowTargetAlpha - g_slideshowTransitionAlpha) * (1.0f - std::powf(1.0f - 0.08f, dt * 60.0f));
+        g_slideshowTransitionAlpha += 0.02f * dt * 60.0f;
+        g_slideshowTransitionAlpha += (1.0f - g_slideshowTransitionAlpha) * (1.0f - std::powf(1.0f - 0.005f, dt * 60.0f));
 
         if (g_slideshowTransitionAlpha > 0.995f)
         {
@@ -1336,6 +1358,7 @@ void ExitSlideshowMode()
     g_prevSlideshowBgBitmap.Reset();
     g_slideshowTransitionAlpha = 1.0f;
 
+    g_wasInSlideshowOnExit = true;   // tell the exit fade to cross-fade blurred->desktop bg
     g_isSlideshowMode = false;
     ExitFullscreen();
 }
@@ -1392,7 +1415,14 @@ void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
     // ----------------------------------------
     // STAGE 2 — actual fullscreen overlay creation
     // ----------------------------------------
-    CaptureDesktop(g_mainWindow);
+    // Capture the desktop behind the window — but only when transitioning from
+    // windowed to fullscreen. When entering slideshow mode the screen is already
+    // covered by the black cover window, so capturing now would overwrite
+    // g_wicBackground with a black frame. The original desktop capture from the
+    // initial fullscreen entry is still alive in g_wicBackground (DiscardDeviceResources
+    // does not touch it) and will be re-uploaded below by CreateBackgroundBitmap().
+    if (!g_isSlideshowMode)
+        CaptureDesktop(g_mainWindow);
 
     // Switching render targets -> discard device resources
     DiscardDeviceResources();
@@ -1505,25 +1535,24 @@ void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
     g_renderTargetWindow = g_overlayWindow;
 }
 
-void ExitFullscreen()
+// Inner teardown — called either immediately (immediate=true path) or by
+// UpdateEngine once the exit-fade animation has finished.
+static void CompleteExitFullscreen()
 {
+    // Already cleaned up guard (e.g. double-call from slideshow timer race)
     if (!g_isFullscreen)
         return;
 
-    // Kill the zoom-display timer and hide the textbox in case it was visible
-    KillTimer(g_mainWindow, 666);
-    if (!g_textBoxes.empty())
-        g_textBoxes[TEXTBOX_ZOOM_INPUT].SetForcedVisibility(false);
-
     if (!g_d2dBitmap)
     {
-        // No bitmap? Just bail out safely.
+        // No bitmap — bail out safely.
         g_isFullscreen = false;
         if (g_overlayWindow)
         {
             DestroyWindow(g_overlayWindow);
             g_overlayWindow = nullptr;
         }
+        g_wasInSlideshowOnExit = false;
         return;
     }
 
@@ -1532,7 +1561,6 @@ void ExitFullscreen()
     RECT overlayClient;
     GetClientRect(g_overlayWindow, &overlayClient);
 
-    // Get overlay window screen rect
     RECT overlayRect;
     GetWindowRect(g_overlayWindow, &overlayRect);
 
@@ -1544,7 +1572,6 @@ void ExitFullscreen()
     float imgRight  = g_offsetX + imgSize.width  * g_zoom;
     float imgBottom = g_offsetY + imgSize.height * g_zoom;
 
-    // Clamp to visible region
     float visibleLeft   = max(0.0f, imgLeft);
     float visibleTop    = max(0.0f, imgTop);
     float offsetCorrectionX = imgLeft - visibleLeft;
@@ -1570,18 +1597,17 @@ void ExitFullscreen()
     visibleLeft -= extraW * 0.5f;
     visibleTop  -= extraH * 0.5f;
 
-    // Account for the window expanding around the image
     offsetCorrectionX += extraW * 0.5f;
     offsetCorrectionY += extraH * 0.5f;
 
-    // Adjust new position using visible region
     int newX = overlayRect.left + (int)visibleLeft;
     int newY = overlayRect.top  + (int)visibleTop;
 
-    // Tear down the overlay first
     g_isFullscreen = false;
     g_needsFullscreenInit = false;
     g_overlayAlpha = 1.0f;
+    g_wasInSlideshowOnExit = false;
+    g_exitBgFadeAlpha      = 0.f;
 
     if (g_overlayWindow)
     {
@@ -1589,12 +1615,8 @@ void ExitFullscreen()
         g_overlayWindow = nullptr;
     }
 
-    // Discard device-dependent resources from the overlay render target.
-    // This is crucial to avoid drawing one frame using bitmaps created on the old render target.
     DiscardDeviceResources();
 
-    // Calculate window rect BEFORE showing.
-    // FALSE = no menu bar (we removed it with SetMenu(nullptr)).
     RECT adj = { 0, 0, (LONG)clientWidth, (LONG)clientHeight };
     AdjustWindowRect(&adj, WS_OVERLAPPEDWINDOW, FALSE);
 
@@ -1606,7 +1628,6 @@ void ExitFullscreen()
     int winW = adj.right  - adj.left;
     int winH = adj.bottom - adj.top;
 
-    // Clamp so the window stays fully within the monitor's work area.
     MONITORINFO mi = { sizeof(mi) };
     GetMonitorInfo(MonitorFromPoint({ newX, newY }, MONITOR_DEFAULTTONEAREST), &mi);
     RECT& wa = mi.rcWork;
@@ -1616,7 +1637,6 @@ void ExitFullscreen()
     if (winX < wa.left)          winX = wa.left;
     if (winY < wa.top)           winY = wa.top;
 
-    // Resize/move window WITHOUT triggering redraw yet (prevents a "wrong size" first frame)
     SetWindowPos(
         g_mainWindow,
         nullptr,
@@ -1624,7 +1644,6 @@ void ExitFullscreen()
         SWP_NOZORDER | SWP_NOACTIVATE
     );
 
-    // Snap offsets/targets to final state for the new (cropped) client area
     int preClampWinX = winX;
     int preClampWinY = winY;
 
@@ -1644,11 +1663,9 @@ void ExitFullscreen()
 
     UpdateTargetZoom(g_zoom);
 
-    // Recreate device resources for the main window BEFORE making it visible again.
     CreateRenderTarget(g_mainWindow);
     RecreateImageBitmap();
 
-    // Restore main window visibility (remove layered transparency last)
     LONG ex = GetWindowLong(g_mainWindow, GWL_EXSTYLE);
     if (ex & WS_EX_LAYERED)
     {
@@ -1657,11 +1674,8 @@ void ExitFullscreen()
     }
 
     ShowWindow(g_mainWindow, SW_SHOW);
-
-    // Now redraw with correct size/zoom on the very first visible frame
     RedrawWindow(g_mainWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
 
-    // Update button and text layouts for the new render target
     for (auto& [id, btn] : g_buttons)
         btn.UpdateLayout(g_renderTarget.Get());
 
@@ -1674,6 +1688,38 @@ void ExitFullscreen()
     {
         ExitSlideshowMode();
     }
+}
+
+void ExitFullscreen(bool immediate)
+{
+    if (!g_isFullscreen)
+        return;
+
+    // Kill the zoom-display timer and hide the textbox in case it was visible.
+    // Safe to do immediately regardless of the fade path.
+    KillTimer(g_mainWindow, 666);
+    if (!g_textBoxes.empty())
+        g_textBoxes[TEXTBOX_ZOOM_INPUT].SetForcedVisibility(false);
+
+    // If there is no image, or an immediate exit is requested (e.g. slideshow
+    // entry which has already faded to black), skip the fade entirely.
+    if (immediate || !g_d2dBitmap)
+    {
+        g_pendingExitFullscreen = false;
+        g_exitBgFadeAlpha       = 0.f;
+        CompleteExitFullscreen();
+        return;
+    }
+
+    // Already fading — ignore re-entrant calls.
+    if (g_pendingExitFullscreen)
+        return;
+
+    // Start the deferred exit fade: UpdateEngine animates g_exitBgFadeAlpha
+    // 0->1 then calls CompleteExitFullscreen() when it reaches 1.
+    g_pendingExitFullscreen = false; // will be set true below; clear first for safety
+    g_exitBgFadeAlpha       = 0.f;
+    g_pendingExitFullscreen = true;
 }
 
 void CreateRenderTarget(HWND hWnd)
@@ -2723,7 +2769,7 @@ void InitializeButtons()
             g_targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
 
             int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
-            g_smooth = 1.0f - std::powf(1.0f - 2 * 0.18f, 60.0f / (float)refreshRate);
+            g_smooth = 0.18f * 60.0f / (float)refreshRate;
 
             g_targetZoom = 0.0005f;
             g_isExiting = true;
@@ -3019,9 +3065,19 @@ void Render(HWND hWnd)
             1.0f
         );
 
+        // When exiting from slideshow, cross-fade the blurred bg out on top of the
+        // desktop bg that was just drawn (slides from fully visible down to invisible).
+        if (g_pendingExitFullscreen && g_wasInSlideshowOnExit && g_slideshowBgBitmap)
+            DrawCoverBg(g_slideshowBgBitmap.Get(), 1.0f - g_exitBgFadeAlpha);
+
+        // Dim overlay: fades in on enter (driven by g_overlayAlpha), fades out on
+        // exit (modulated by g_exitBgFadeAlpha so it lifts in sync with the bg fade).
         if (g_dimBrush)
         {
-            g_dimBrush->SetColor(D2D1::ColorF(0, 0, 0, 0.67f * g_overlayAlpha));
+            const float dimAlpha = g_pendingExitFullscreen
+                ? g_overlayAlpha * (1.0f - g_exitBgFadeAlpha)
+                : g_overlayAlpha;
+            g_dimBrush->SetColor(D2D1::ColorF(0, 0, 0, 0.67f * dimAlpha));
             g_renderTarget->FillRectangle(
                 D2D1::RectF(0, 0, size.width, size.height),
                 g_dimBrush.Get());
@@ -3985,7 +4041,13 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     else
         g_currentFileName = g_currentFilePath;
 
-    uintmax_t bytes = std::filesystem::file_size(g_currentFileName);
+    // Use the full path here, not g_currentFileName (the bare name).
+    // When the app is launched from a Windows Explorer *search* results window the
+    // working directory is NOT set to the file's folder, so file_size(bare_name)
+    // would throw a filesystem_error and crash the process before anything is shown.
+    std::error_code ec;
+    uintmax_t bytes = std::filesystem::file_size(g_currentFilePath, ec);
+    if (ec) bytes = 0;
     wchar_t buffer[64];
     if (bytes < 1024)
         swprintf(buffer, 64, L"%llu B", bytes);
@@ -4012,8 +4074,24 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 
 void BuildImageList(const wchar_t* filename)
 {
+    // Stop the loader before touching g_imageFiles or g_thumbs to avoid races.
+    StopThumbnailLoader();
+
+    // Snapshot existing thumbnails keyed by full path BEFORE we clear g_imageFiles.
+    // After the sorted list is rebuilt, a new file may land in the middle, shifting
+    // all subsequent indices.  A naive resize() would misalign every thumbnail that
+    // follows the insertion point.  Keying by path lets us restore each entry to
+    // its correct new index regardless of where the new file was inserted.
+    std::unordered_map<std::wstring, ThumbnailEntry> thumbSnap;
+    for (int i = 0; i < (int)g_thumbs.size() && i < (int)g_imageFiles.size(); ++i)
+        if (g_thumbs[i].wic || g_thumbs[i].d2d)
+            thumbSnap[g_imageFiles[i]] = g_thumbs[i];
+
     g_imageFiles.clear();
-    g_imageStates.clear();
+    // NOTE: do NOT clear g_imageStates here.  States are keyed by full path, so
+    // they never collide when the folder changes, and they must survive directory-
+    // change notifications (WM_APP_DIRCHANGE) that are fired after a DEL — clearing
+    // them here would erase every other image's saved zoom/pan on every deletion.
     g_currentImageIndex = -1;
 
     std::filesystem::path p(filename);
@@ -4042,6 +4120,18 @@ void BuildImageList(const wchar_t* filename)
             g_currentImageIndex = (int)i;
             break;
         }
+    }
+
+    // Rebuild g_thumbs aligned to the new sorted g_imageFiles, restoring any
+    // already-decoded thumbnails from the snapshot.  New slots (e.g. a freshly
+    // added file) start empty and will be filled by the loader thread.
+    const int newN = (int)g_imageFiles.size();
+    g_thumbs.assign(newN, ThumbnailEntry{});
+    for (int i = 0; i < newN; ++i)
+    {
+        auto it = thumbSnap.find(g_imageFiles[i]);
+        if (it != thumbSnap.end())
+            g_thumbs[i] = it->second;
     }
 
     // Start watching the directory for new/deleted/renamed image files
@@ -4486,7 +4576,7 @@ void InitFullScreenExit()
     g_targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
     
     int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
-    g_smooth = 1.0f - std::powf(1.0f - 2*0.18f, 60.0f / (float)refreshRate);
+    g_smooth = 2*0.18f * 60.0f / (float)refreshRate;
     g_targetZoom = 0.0005f;
     g_isExiting = true;
 }
