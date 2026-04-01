@@ -8,7 +8,7 @@ Built with Direct2D, Direct3D 11, and WIC (Windows Imaging Component).
 
 [Bug reports](mailto:luisjalabert@gmail.com)
 
-![Picasso Pictures](screenshot.png)
+![Picasso Pictures](example.png)
 
 ---
 
