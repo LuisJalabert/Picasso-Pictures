@@ -4,7 +4,7 @@ A lightweight, GPU-accelerated image viewer for Windows with a focus on smooth a
 
 Built with Direct2D, Direct3D 11, and WIC (Windows Imaging Component).
 
-## **Download** (Win10 x86, latest release) [here](https://github.com/LuisJalabert/Picasso-Pictures/releases/download/1.3/Picasso.Pictures.exe)
+## **Download** (Win10 x86, latest release) [here](https://github.com/LuisJalabert/Picasso-Pictures/releases/download/1.4/Picasso.Pictures.exe)
 
 [Bug reports](mailto:luisjalabert@gmail.com)
 
