@@ -209,6 +209,14 @@ float                                                            g_thumbStripIns
 bool                                                             g_thumbSizeCaptured = false;
 std::vector<Microsoft::WRL::ComPtr<ID2D1RoundedRectangleGeometry>> g_thumbClipGeos;     // one per slot, rebuilt on resize
 
+// ---- Thumbnail strip drag / momentum ----
+bool  g_thumbDragging     = false;  // LMB held over strip, drag in progress
+float g_thumbDragStartX   = 0.f;    // cursor X at mouse-down (click vs drag test)
+float g_thumbDragLastX    = 0.f;    // cursor X at last WM_MOUSEMOVE
+float g_thumbVelocity     = 0.f;    // smoothed px/event velocity (EMA) for momentum
+bool  g_thumbFreeScroll   = false;  // true = UpdateEngine skips auto-centering
+int   g_thumbDragHitIndex = -1;     // thumbnail slot under cursor at mouse-down (-1 = gap)
+
 // ---- Slideshow mode ----
 bool                                                g_isSlideshowMode            = false;
 ComPtr<ID2D1Bitmap>                                 g_slideshowBgBitmap;         // 25 %-size blurred bg for current image
@@ -918,11 +926,22 @@ void UpdateEngine(float dt)
         }
     }
 
-    // Animate thumbnail scroll offset toward current image
+    // Animate thumbnail scroll offset
     if (g_thumbSizeCaptured)
     {
-        g_thumbTargetOffset = -(g_currentImageIndex * (g_thumbW + g_thumbGap));
-        g_thumbScrollOffset += (g_thumbTargetOffset - g_thumbScrollOffset) * g_smooth;
+        if (!g_thumbFreeScroll && !g_thumbDragging)
+        {
+            // Normal mode: keep the strip centered on the current image.
+            g_thumbTargetOffset = -(g_currentImageIndex * (g_thumbW + g_thumbGap));
+        }
+        // During an active drag g_thumbScrollOffset is updated directly in
+        // WM_MOUSEMOVE (zero-lag direct manipulation); skip the spring step so
+        // the strip tracks the finger exactly.  After release the momentum target
+        // is already set and the spring provides natural deceleration.
+        if (!g_thumbDragging)
+        {
+            g_thumbScrollOffset += (g_thumbTargetOffset - g_thumbScrollOffset) * g_smooth;
+        }
     }
 
     g_zoom     += (g_targetZoom     - g_zoom)     * g_smooth;
@@ -1530,6 +1549,12 @@ void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
 
     ShowWindow(g_overlayWindow, SW_SHOW);
     UpdateWindow(g_overlayWindow);
+
+    // Any drag that was in progress on the main window before the overlay took
+    // over is now stale — clear all drag state so it cannot bleed through.
+    g_isDragging    = false;
+    g_thumbDragging = false;
+    ReleaseCapture();
 
     g_fullScreenInitDone = true;
     g_renderTargetWindow = g_overlayWindow;
@@ -2730,7 +2755,7 @@ void InitializeButtons()
     topRightActivationZone.right  = 1.0f;
     topRightActivationZone.bottom = 0.1f;
 
-    float top = 0.012f;
+    float top = 0.01f;
     float right = 1.0f - top * 9.0f / 16.0f;
 
     AnimatedButton::Config exitConfig;
@@ -2742,7 +2767,7 @@ void InitializeButtons()
     exitConfig.layout.y.mode = AnimatedButton::PosMode::Normalized;
     exitConfig.layout.width = 0.036f;
     exitConfig.layout.height = 0.036f;
-    exitConfig.fontSize = 0.016f;
+    exitConfig.fontSize = 0.012f;
     exitConfig.text = L"\u274C";
     exitConfig.tooltip = L"Exit\n[Esc]";
     exitConfig.layout.activationZone = topRightActivationZone;
@@ -4180,6 +4205,7 @@ void OpenPrevImage(HWND hWnd)
 {
     if (!g_imageFiles.empty() && g_currentImageIndex > 0)
     {
+        g_thumbFreeScroll = false;  // resume auto-centering on the new image
         g_currentImageIndex--;
         LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
         InitializeImageLayout(hWnd, true);
@@ -4191,6 +4217,7 @@ void OpenNextImage(HWND hWnd)
     if (!g_imageFiles.empty() &&
         g_currentImageIndex < (int)g_imageFiles.size() - 1)
     {
+        g_thumbFreeScroll = false;  // resume auto-centering on the new image
         g_currentImageIndex++;
         LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
         InitializeImageLayout(hWnd, true);
@@ -4784,34 +4811,45 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             if (box.OnMouseDown(x, y))
                 return 0;  // STOP — message box handled it
         }
-        // Thumbnail strip click: check before starting a drag
-        if (g_thumbSizeCaptured && !g_thumbs.empty())
+        // Thumbnail strip interaction.
+        // The entire strip row is claimed on mouse-down so the user can drag to
+        // pan without accidentally starting an image-pan drag.  Whether the
+        // gesture ends as a click (open image) or a drag (pan with momentum) is
+        // decided in WM_LBUTTONUP.
+        if (g_thumbSizeCaptured)
         {
             RECT rc2; GetClientRect(hWnd, &rc2);
-            const float rtH    = (float)(rc2.bottom - rc2.top);
-            const float stripCY = rtH - g_thumbStripInsetFromBottomPx;
-            const float stripTop    = stripCY - g_thumbH * 0.5f;
-            const float stripBottom = stripCY + g_thumbH * 0.5f;
-            if (y >= stripTop && y <= stripBottom)
+            const float rtH      = (float)(rc2.bottom - rc2.top);
+            const float rtW      = (float)(rc2.right  - rc2.left);
+            const float stripCY  = rtH - g_thumbStripInsetFromBottomPx;
+            const float stripTop = stripCY - g_thumbH * 0.5f;
+            const float stripBot = stripCY + g_thumbH * 0.5f;
+
+            if (y >= stripTop && y <= stripBot)
             {
-                RECT rc2; GetClientRect(hWnd, &rc2);
-                const float rtW    = (float)(rc2.right - rc2.left);
+                // Identify which slot (if any) the cursor is over — we'll need
+                // this if the gesture turns out to be a click, not a drag.
                 const float baseX  = rtW * 0.5f + g_thumbScrollOffset;
                 const float stride = g_thumbW + g_thumbGap;
                 const int   n      = (int)g_thumbs.size();
+                g_thumbDragHitIndex = -1;
                 for (int i = 0; i < n; ++i)
                 {
                     const float cx = baseX + i * stride;
                     if (x >= cx - g_thumbW * 0.5f && x <= cx + g_thumbW * 0.5f)
                     {
-                        if (i != g_currentImageIndex && i < (int)g_imageFiles.size())
-                        {
-                            g_currentImageIndex = i;
-                            LoadImageD2D(hWnd, g_imageFiles[i].c_str());
-                        }
-                        return 0;
+                        g_thumbDragHitIndex = i;
+                        break;
                     }
                 }
+
+                g_thumbDragging   = true;
+                g_thumbFreeScroll = true;   // suspend auto-centering immediately
+                g_thumbDragStartX = x;
+                g_thumbDragLastX  = x;
+                g_thumbVelocity   = 0.f;
+                SetCapture(hWnd);
+                return 0;
             }
         }
 
@@ -4825,13 +4863,57 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     
     case WM_LBUTTONUP:
     {
+        float x = (float)GET_X_LPARAM(lParam);
+        float y = (float)GET_Y_LPARAM(lParam);
+
+        // ---- Resolve thumbnail strip drag ----------------------------------------
+        if (g_thumbDragging)
+        {
+            g_thumbDragging = false;
+            g_isDragging    = false;  // ensure image-drag state is never left stale
+            ReleaseCapture();
+
+            const float totalMove = fabsf(x - g_thumbDragStartX);
+            if (totalMove < 5.f)
+            {
+                // Gesture was a click: open the thumbnail that was under the cursor.
+                // Clicking the current image or a gap just snaps the strip back.
+                if (g_thumbDragHitIndex >= 0 &&
+                    g_thumbDragHitIndex < (int)g_imageFiles.size() &&
+                    g_thumbDragHitIndex != g_currentImageIndex)
+                {
+                    g_currentImageIndex = g_thumbDragHitIndex;
+                    LoadImageD2D(hWnd, g_imageFiles[g_thumbDragHitIndex].c_str());
+                    InitializeImageLayout(hWnd, true);  // reset zoom/pan to fit, matching OpenNextImage/OpenPrevImage
+                }
+                g_thumbFreeScroll = false;  // snap strip back to current image
+            }
+            else
+            {
+                // Gesture was a drag: apply momentum.
+                g_thumbTargetOffset = g_thumbScrollOffset + g_thumbVelocity * 25.f;
+                // Clamp the momentum target so a fast fling cannot overshoot
+                // the first or last thumbnail, and spring back any rubber-band overshoot.
+                if (g_thumbSizeCaptured && !g_imageFiles.empty())
+                {
+                    const float step   = g_thumbW + g_thumbGap;
+                    const float minOff = -(static_cast<float>(g_imageFiles.size() - 1) * step);
+                    const float maxOff = 0.f;
+                    if (g_thumbTargetOffset > maxOff) g_thumbTargetOffset = maxOff;
+                    if (g_thumbTargetOffset < minOff) g_thumbTargetOffset = minOff;
+                }
+                // g_thumbFreeScroll stays true so UpdateEngine does not overwrite
+                // the momentum target until the user navigates to another image.
+            }
+            return 0;
+        }
+        // --------------------------------------------------------------------------
+
         if (!g_d2dBitmap) break;
 
         g_isDragging = false;
         ReleaseCapture();
         
-        float x = (float)GET_X_LPARAM(lParam);
-        float y = (float)GET_Y_LPARAM(lParam);
         D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
         bool overImage =
             x >= g_offsetX &&
@@ -4888,7 +4970,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                                            ? (windowHeight - g_vignetteBottomActivationPx)
                                            : windowHeight * 0.80f;
             g_topVignetteTarget    = ((float)pt.y <= topThresh)    ? 1.0f : 0.0f;
-            g_bottomVignetteTarget = ((float)pt.y >= bottomThresh) ? 1.0f : 0.0f;
+            // Keep the bottom vignette (and the thumbnail strip it drives) visible
+            // for as long as the strip is still moving under momentum so it never
+            // disappears mid-coast.
+            const bool stripCoasting = g_thumbFreeScroll &&
+                                       !g_thumbDragging &&
+                                       g_thumbSizeCaptured &&
+                                       fabsf(g_thumbTargetOffset - g_thumbScrollOffset) > 1.0f;
+            g_bottomVignetteTarget = (((float)pt.y >= bottomThresh) || stripCoasting) ? 1.0f : 0.0f;
         }
         else
         {
@@ -4896,6 +4985,53 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             g_bottomVignetteTarget = 0.0f;
         }
 
+
+        // ---- Strip drag: pan the filmstrip directly, tracking velocity ----
+        if (g_thumbDragging && (wParam & MK_LBUTTON))
+        {
+            const float rawDx = (float)pt.x - g_thumbDragLastX;
+
+            // Apply rubber-band resistance when already past an edge:
+            // movement in the overshoot zone counts at 30%.
+            float dx = rawDx;
+            if (g_thumbSizeCaptured && !g_imageFiles.empty())
+            {
+                const float step   = g_thumbW + g_thumbGap;
+                const float minOff = -(static_cast<float>(g_imageFiles.size() - 1) * step);
+                const float maxOff = 0.f;
+                const bool pastMax = g_thumbScrollOffset > maxOff && rawDx > 0.f;
+                const bool pastMin = g_thumbScrollOffset < minOff && rawDx < 0.f;
+                if (pastMax || pastMin)
+                    dx = rawDx * 1.0f;
+            }
+
+            g_thumbScrollOffset += dx;
+            g_thumbTargetOffset  = g_thumbScrollOffset;
+            g_thumbVelocity      = g_thumbVelocity * 0.65f + dx * 0.35f;
+            g_thumbDragLastX     = (float)pt.x;
+
+            // Hard cap: never let the strip go further than half the screen width
+            // past the boundary — after that it simply stops stretching.
+            if (g_thumbSizeCaptured && !g_imageFiles.empty())
+            {
+                const float step        = g_thumbW + g_thumbGap;
+                const float minOff      = -(static_cast<float>(g_imageFiles.size() - 1) * step);
+                const float maxOff      = 0.f;
+                RECT rcRB; GetClientRect(hWnd, &rcRB);
+                const float maxOvershoot = 100.0f*(float)(rcRB.right - rcRB.left);// * 0.5f;
+
+                if (g_thumbScrollOffset > maxOff + maxOvershoot)
+                {
+                    g_thumbScrollOffset = maxOff + maxOvershoot;
+                    g_thumbTargetOffset = g_thumbScrollOffset;
+                }
+                else if (g_thumbScrollOffset < minOff - maxOvershoot)
+                {
+                    g_thumbScrollOffset = minOff - maxOvershoot;
+                    g_thumbTargetOffset = g_thumbScrollOffset;
+                }
+            }
+        }
 
         if (g_isDragging && (wParam & MK_LBUTTON))
         {
