@@ -115,6 +115,7 @@ bool                                                g_isExiting = false;
 // the render loop can display them.
 bool                                                g_navPendingRender = false;
 bool                                                g_fullScreenInitDone = false;
+bool                                                g_suppressFullscreenExit = false;  // true while a owned dialog (e.g. file open) has focus
 std::vector<std::wstring>                           g_imageFiles;
 int                                                 g_currentImageIndex = -1;
 std::wstring                                        g_currentFilePath;
@@ -4085,11 +4086,17 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 
         D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
 
-        // Convert stored pan back into absolute offsets for THIS render target
-        OffsetsFromPan(hWnd, g_zoom, imgSize.width, imgSize.height,
+        // Convert stored pan back into absolute offsets for THIS render target.
+        // When in fullscreen the overlay is the render target; always use it
+        // here so that callers passing g_mainWindow (e.g. the Open button
+        // callback or WM_COPYDATA) still get offsets in overlay coordinates.
+        HWND panWnd = (g_isFullscreen && g_overlayWindow && IsWindow(g_overlayWindow))
+                      ? g_overlayWindow : hWnd;
+
+        OffsetsFromPan(panWnd, g_zoom, imgSize.width, imgSize.height,
                        s.panX, s.panY, g_offsetX, g_offsetY);
 
-        OffsetsFromPan(hWnd, g_targetZoom, imgSize.width, imgSize.height,
+        OffsetsFromPan(panWnd, g_targetZoom, imgSize.width, imgSize.height,
                        s.targetPanX, s.targetPanY, g_targetOffsetX, g_targetOffsetY);
 
         g_imageRotationAngle = s.rotation;
@@ -4234,8 +4241,20 @@ bool OpenImageFile(HWND hWnd)
     ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST;
     ofn.lpstrDefExt = L"jpg";
 
-    // Show dialog
-    if (!GetOpenFileName(&ofn))
+    // In fullscreen the overlay is the real render target.  Use it as the
+    // dialog owner so that (a) focus-change messages target the overlay and
+    // (b) the suppress guard below keeps the WM_ACTIVATE(WA_INACTIVE) that
+    // fires during the dialog lifetime from leaking past the guard window.
+    if (g_isFullscreen && g_overlayWindow && IsWindow(g_overlayWindow))
+        ofn.hwndOwner = g_overlayWindow;
+
+    // Suppress the WM_ACTIVATE/WA_INACTIVE exit that fires when the dialog
+    // steals focus from the fullscreen overlay.
+    g_suppressFullscreenExit = true;
+    bool got = GetOpenFileName(&ofn) != FALSE;
+    g_suppressFullscreenExit = false;
+
+    if (!got)
         return false;   // User cancelled
 
     // Load image using Direct2D/WIC
@@ -4245,7 +4264,22 @@ bool OpenImageFile(HWND hWnd)
         return false;
     }
     BuildImageList(fileName);
-    EnterFullscreen();
+
+    if (g_isFullscreen)
+    {
+        // Already fullscreen — reset layout using the overlay window so that
+        // g_offsetX/Y are computed against the full-screen client rect.
+        // Using g_mainWindow here (e.g. when called from the button callback)
+        // would give wrong coordinates and cause the overImage check in
+        // WM_LBUTTONUP to fail, exiting fullscreen on the next click.
+        HWND layoutWnd = (g_overlayWindow && IsWindow(g_overlayWindow))
+                         ? g_overlayWindow : hWnd;
+        InitializeImageLayout(layoutWnd, true);
+    }
+    else
+    {
+        EnterFullscreen();
+    }
     return true;
 }
 
@@ -4516,7 +4550,7 @@ void StartThumbnailLoader()
 
                 Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
                 if (FAILED(wic->CreateDecoderFromFilename(files[idx].c_str(), nullptr,
-                        GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder)) || !decoder)
+                        GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder)) || !decoder)
                     continue;
                 if (g_thumbLoaderStop) break;
 
@@ -4524,28 +4558,124 @@ void StartThumbnailLoader()
                 if (FAILED(decoder->GetFrame(0, &frame)) || !frame) continue;
                 if (g_thumbLoaderStop) break;
 
-                UINT sw = 0, sh = 0;
-                frame->GetSize(&sw, &sh);
-                if (sw == 0 || sh == 0) continue;
+                // Read EXIF orientation tag (needed regardless of which decode path we take)
+                WICBitmapTransformOptions wicTransform = WICBitmapTransformRotate0;
+                {
+                    Microsoft::WRL::ComPtr<IWICMetadataQueryReader> mqr;
+                    if (SUCCEEDED(frame->GetMetadataQueryReader(&mqr)) && mqr)
+                    {
+                        PROPVARIANT var;
+                        PropVariantInit(&var);
+                        HRESULT hm = mqr->GetMetadataByName(L"/app1/ifd/{ushort=274}", &var);
+                        if (FAILED(hm))
+                            hm = mqr->GetMetadataByName(L"/ifd/{ushort=274}", &var);
+                        if (SUCCEEDED(hm))
+                        {
+                            UINT ori = 0;
+                            if      (var.vt == VT_UI2) ori = var.uiVal;
+                            else if (var.vt == VT_UI4) ori = var.ulVal;
+                            else if (var.vt == VT_I2)  ori = (UINT)var.iVal;
+                            else if (var.vt == VT_I4)  ori = (UINT)var.lVal;
+                            switch (ori)
+                            {
+                                case 3: wicTransform = WICBitmapTransformRotate180; break;
+                                case 6: wicTransform = WICBitmapTransformRotate90;  break;
+                                case 8: wicTransform = WICBitmapTransformRotate270; break;
+                                default: break;
+                            }
+                        }
+                        PropVariantClear(&var);
+                    }
+                }
 
                 const UINT TARGET_H = 180u;
-                const UINT dw = max(1u, (UINT)((float)sw / (float)sh * TARGET_H));
+                Microsoft::WRL::ComPtr<IWICBitmap> thumb;
 
-                Microsoft::WRL::ComPtr<IWICBitmapScaler>    scaler;
-                Microsoft::WRL::ComPtr<IWICFormatConverter> conv;
-                Microsoft::WRL::ComPtr<IWICBitmap>          thumb;
+                // ---- Fast path: use the embedded JPEG thumbnail if it exists
+                // and is at least TARGET_H pixels tall (or wide for 90/270). ----
+                {
+                    Microsoft::WRL::ComPtr<IWICBitmapSource> embedded;
+                    // Try frame thumbnail first, then decoder-level thumbnail.
+                    if (FAILED(frame->GetThumbnail(&embedded)) || !embedded)
+                        decoder->GetThumbnail(&embedded);
 
-                if (FAILED(wic->CreateBitmapScaler(&scaler)) ||
-                    FAILED(scaler->Initialize(frame.Get(), dw, TARGET_H,
-                        WICBitmapInterpolationModeHighQualityCubic)) ||
-                    FAILED(wic->CreateFormatConverter(&conv)) ||
-                    FAILED(conv->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
-                        WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom)))
-                    continue;
+                    if (embedded)
+                    {
+                        UINT tw = 0, th = 0;
+                        embedded->GetSize(&tw, &th);
+                        const UINT shortSide = min(tw, th);
+                        if (shortSide >= TARGET_H)
+                        {
+                            // Embedded thumbnail is large enough — just convert to PBGRA.
+                            Microsoft::WRL::ComPtr<IWICFormatConverter> conv;
+                            Microsoft::WRL::ComPtr<IWICBitmap> converted;
+                            if (SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
+                                SUCCEEDED(conv->Initialize(embedded.Get(),
+                                    GUID_WICPixelFormat32bppPBGRA,
+                                    WICBitmapDitherTypeNone, nullptr, 0.f,
+                                    WICBitmapPaletteTypeCustom)) &&
+                                SUCCEEDED(wic->CreateBitmapFromSource(conv.Get(),
+                                    WICBitmapCacheOnLoad, &converted)) &&
+                                converted)
+                            {
+                                thumb = converted;
+                            }
+                        }
+                    }
+                }
                 if (g_thumbLoaderStop) break;
 
-                if (FAILED(wic->CreateBitmapFromSource(conv.Get(), WICBitmapCacheOnLoad, &thumb)) || !thumb)
-                    continue;
+                // ---- Slow path: decode full frame and scale down. ----
+                if (!thumb)
+                {
+                    UINT sw = 0, sh = 0;
+                    frame->GetSize(&sw, &sh);
+                    if (sw == 0 || sh == 0) continue;
+
+                    // Scale using raw (pre-rotation) dimensions so the scaler
+                    // never stretches; the rotator corrects orientation afterwards.
+                    UINT scaleW, scaleH;
+                    if (wicTransform == WICBitmapTransformRotate90 ||
+                        wicTransform == WICBitmapTransformRotate270)
+                    {
+                        scaleH = max(1u, (UINT)((float)sh / (float)sw * TARGET_H));
+                        scaleW = TARGET_H;
+                    }
+                    else
+                    {
+                        scaleW = max(1u, (UINT)((float)sw / (float)sh * TARGET_H));
+                        scaleH = TARGET_H;
+                    }
+
+                    Microsoft::WRL::ComPtr<IWICBitmapScaler>    scaler;
+                    Microsoft::WRL::ComPtr<IWICFormatConverter> conv;
+
+                    if (FAILED(wic->CreateBitmapScaler(&scaler)) ||
+                        FAILED(scaler->Initialize(frame.Get(), scaleW, scaleH,
+                            WICBitmapInterpolationModeHighQualityCubic)) ||
+                        FAILED(wic->CreateFormatConverter(&conv)) ||
+                        FAILED(conv->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
+                            WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom)))
+                        continue;
+                    if (g_thumbLoaderStop) break;
+
+                    if (FAILED(wic->CreateBitmapFromSource(conv.Get(), WICBitmapCacheOnLoad, &thumb)) || !thumb)
+                        continue;
+                }
+
+                // Apply EXIF rotation on the small cached bitmap (both paths)
+                if (wicTransform != WICBitmapTransformRotate0)
+                {
+                    Microsoft::WRL::ComPtr<IWICBitmapFlipRotator> rotator;
+                    Microsoft::WRL::ComPtr<IWICBitmap> rotated;
+                    if (SUCCEEDED(wic->CreateBitmapFlipRotator(&rotator)) &&
+                        SUCCEEDED(rotator->Initialize(thumb.Get(), wicTransform)) &&
+                        SUCCEEDED(wic->CreateBitmapFromSource(rotator.Get(), WICBitmapCacheOnLoad, &rotated)) &&
+                        rotated)
+                    {
+                        thumb = rotated;
+                    }
+                }
 
                 {
                     std::lock_guard<std::mutex> lk(g_thumbReadyMutex);
@@ -4699,7 +4829,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (LOWORD(wParam) == WA_INACTIVE)
         {
-            if (g_isFullscreen && g_fullScreenInitDone)
+            if (g_isFullscreen && g_fullScreenInitDone && !g_suppressFullscreenExit)
             {
                 // Post rather than call directly — ExitFullscreen destroys the
                 // overlay and calls SetFocus while Windows is mid-focus-change,
