@@ -1326,20 +1326,48 @@ void CreateSlideshowBgBitmap()
         D2D1_BITMAP_OPTIONS_TARGET,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
 
-    ComPtr<ID2D1Bitmap1> offscreenBmp;
-    if (FAILED(g_renderTarget->CreateBitmap(
-            smallSz, nullptr, 0, bmpProps, &offscreenBmp))) return;
-
     // ----- 3. Render the Gaussian blur into the off-screen bitmap -----
+    // If the image has an EXIF rotation we must rotate the small source bitmap
+    // before blurring so the background matches the displayed orientation.
     g_blurEffect->SetInput(0, smallBmp.Get());
 
     ComPtr<ID2D1Image> prevTarget;
     g_renderTarget->GetTarget(&prevTarget);
-    g_renderTarget->SetTarget(offscreenBmp.Get());
 
+    // For 90/270 rotations the blurred bg needs to be portrait, not landscape —
+    // create the offscreen target with swapped dimensions in that case.
+    const float rotMod = fmodf(fabsf(g_exifRotation), 180.f);
+    const bool swapDims = (rotMod > 44.f && rotMod < 136.f);
+    D2D1_SIZE_U bgSz = swapDims
+        ? D2D1::SizeU(smallSz.height, smallSz.width)
+        : smallSz;
+
+    ComPtr<ID2D1Bitmap1> offscreenBmp;
+    if (FAILED(g_renderTarget->CreateBitmap(
+            bgSz, nullptr, 0, bmpProps, &offscreenBmp))) return;
+
+    g_renderTarget->SetTarget(offscreenBmp.Get());
     g_renderTarget->BeginDraw();
     g_renderTarget->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+    if (g_exifRotation != 0.f)
+    {
+        // Rotate around the centre of the (possibly swapped) offscreen target.
+        const float cx = bgSz.width  * 0.5f;
+        const float cy = bgSz.height * 0.5f;
+        // The blur effect output origin is at (0,0) of the small source bitmap.
+        // We need to centre the source in the destination, then rotate.
+        const float srcCx = smallSz.width  * 0.5f;
+        const float srcCy = smallSz.height * 0.5f;
+        D2D1_MATRIX_3X2_F xform =
+            D2D1::Matrix3x2F::Translation(-srcCx, -srcCy) *
+            D2D1::Matrix3x2F::Rotation(g_exifRotation) *
+            D2D1::Matrix3x2F::Translation(cx, cy);
+        g_renderTarget->SetTransform(xform);
+    }
+
     g_renderTarget->DrawImage(g_blurEffect.Get(), D2D1::Point2F(0.f, 0.f));
+    g_renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
     g_renderTarget->EndDraw();
 
     g_renderTarget->SetTarget(prevTarget.Get());
