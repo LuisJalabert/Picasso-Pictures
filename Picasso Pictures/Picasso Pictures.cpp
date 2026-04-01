@@ -100,6 +100,7 @@ float                                               g_uiPixelScale = 1.0f;
 float                                               g_imageRotationAngle = 0.0f;
 float                                               g_targetRotationAngle = 0.0f;       // New rotation target
 float                                               g_rotationSpeed = 300.0f;           // degrees per second
+float                                               g_exifRotation = 0.0f;              // EXIF orientation for current image (degrees CW)
 ComPtr<ID2D1Bitmap>                                 g_backgroundBitmap;                 // Device-dependent background bitmap
 ComPtr<IWICBitmap>                                  g_wicBackground;                    // Device-independent captured background (WIC)
 ComPtr<IWICBitmapSource>                            g_wicDefaultBackground;
@@ -2439,6 +2440,14 @@ void InitializeImageLayout(HWND hWnd, bool hard = false)
 
     D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
 
+    // If the image will be displayed rotated 90° or 270° (from EXIF), its
+    // effective on-screen footprint has swapped width and height.
+    float fitW = imgSize.width;
+    float fitH = imgSize.height;
+    const float rotMod = fmodf(fabsf(g_exifRotation), 180.f);
+    if (rotMod > 44.f && rotMod < 136.f)
+        std::swap(fitW, fitH);
+
     float scale = 1.0f;
 
     if (hard)
@@ -2446,11 +2455,11 @@ void InitializeImageLayout(HWND hWnd, bool hard = false)
     else
         g_overlayAlpha = 0.0f;
 
-    // If image is larger than screen, scale down to ~92% of screen
-    if (g_isSlideshowMode || imgSize.width > windowWidth || imgSize.height > windowHeight)
+    // If image is larger than screen, scale down to ~95% of screen
+    if (g_isSlideshowMode || fitW > windowWidth || fitH > windowHeight)
     {
-        float scaleX = (windowWidth  * 0.95f) / imgSize.width;
-        float scaleY = (windowHeight * 0.95f) / imgSize.height;
+        float scaleX = (windowWidth  * 0.95f) / fitW;
+        float scaleY = (windowHeight * 0.95f) / fitH;
 
         scale = min(scaleX, scaleY);
     }
@@ -2485,9 +2494,9 @@ void InitializeImageLayout(HWND hWnd, bool hard = false)
         g_targetOffsetX = windowCenterX - (imgSize.width  * g_targetZoom) / 2.0f;
         g_targetOffsetY = windowCenterY - (imgSize.height * g_targetZoom) / 2.0f;
     }
-    // Reset rotation for new images
-    g_imageRotationAngle = 0.0f;
-    g_targetRotationAngle = 0.0f;
+    // Reset rotation for new images, honouring any EXIF orientation tag.
+    g_imageRotationAngle  = g_exifRotation;
+    g_targetRotationAngle = g_exifRotation;
 }
 
 void InitializeMenuButtons()
@@ -3927,6 +3936,41 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         if (FAILED(hr) || !frame)
             return false;
 
+        // ---- Read EXIF Orientation tag (tag 274) ----
+        // Map the 8 EXIF orientation values to clockwise rotation degrees.
+        // Values 5-8 also involve a flip but we only apply the rotation component
+        // since the render pipeline doesn't support flipping.
+        //   1 = normal          → 0°
+        //   3 = upside-down     → 180°
+        //   6 = 90° CW shot     → 90°   (phone held 90° CCW)
+        //   8 = 90° CCW shot    → 270°  (phone held 90° CW)
+        {
+            ComPtr<IWICMetadataQueryReader> mqr;
+            if (SUCCEEDED(frame->GetMetadataQueryReader(mqr.GetAddressOf())) && mqr)
+            {
+                UINT orientation = 0;
+                if (ReadUIntMeta(mqr.Get(), L"/app1/ifd/{ushort=274}", orientation) ||
+                    ReadUIntMeta(mqr.Get(), L"/ifd/{ushort=274}",      orientation))
+                {
+                    switch (orientation)
+                    {
+                        case 3: g_exifRotation =  180.f; break;
+                        case 6: g_exifRotation =   90.f; break;
+                        case 8: g_exifRotation =  270.f; break;
+                        default:g_exifRotation =    0.f; break;
+                    }
+                }
+                else
+                {
+                    g_exifRotation = 0.f;
+                }
+            }
+            else
+            {
+                g_exifRotation = 0.f;
+            }
+        }
+
         Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
         hr = g_wicFactory->CreateFormatConverter(converter.GetAddressOf());
 
@@ -4056,6 +4100,10 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     else
     {
         g_restoredStateThisLoad = false;
+        // Apply EXIF orientation so the image appears upright immediately.
+        // GIFs never carry EXIF so g_exifRotation will be 0 for them.
+        g_imageRotationAngle  = g_exifRotation;
+        g_targetRotationAngle = g_exifRotation;
     }
     // Update current path
     g_currentFilePath = newPath;
