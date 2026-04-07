@@ -18,6 +18,7 @@
 #include <string>
 #include <dwrite.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <filesystem>
 #include <dwmapi.h>
 #include <uxtheme.h>
@@ -77,6 +78,12 @@ constexpr int BUTTON_SLIDESHOW   = 8;
 constexpr int BUTTON_OPEN        = 9;
 constexpr int BUTTON_HELP        = 10;
 
+// Right-click context menu command IDs
+constexpr int IDM_CTX_COPY        = 2001;
+constexpr int IDM_CTX_DELETE      = 2002;
+constexpr int IDM_CTX_OPEN_FOLDER = 2003;
+constexpr int IDM_CTX_PROPERTIES  = 2004;
+
 // Global Variables:
 HINSTANCE                                           hInst;                              // current instance
 WCHAR                                               szTitle[MAX_LOADSTRING];            // The title bar text
@@ -132,7 +139,7 @@ bool                                                g_pendingPreserveView = fals
 std::vector<ComPtr<IWICBitmapSource>>               g_gifFrames;
 std::vector<ComPtr<ID2D1Bitmap>>                    g_gifD2DBitmaps;         // pre-uploaded GPU bitmaps for each GIF frame
 std::vector<ComPtr<ID3D11ShaderResourceView>>       g_gifD3DSRVs;            // pre-uploaded D3D11 mip SRVs for each GIF frame
-DWORD                                               g_lastGifFrameTime = 0;
+ULONGLONG                                           g_lastGifFrameTime = 0;
 std::vector<UINT>                                   g_gifFrameDelays;
 UINT                                                g_currentGifFrame = 0;
 bool                                                g_isAnimatedGif = false;
@@ -219,7 +226,6 @@ float g_thumbVelocity     = 0.f;    // smoothed px/event velocity (EMA) for mome
 bool  g_thumbFreeScroll   = false;  // true = UpdateEngine skips auto-centering
 int   g_thumbDragHitIndex = -1;     // thumbnail slot under cursor at mouse-down (-1 = gap)
 
-// ---- Slideshow mode ----
 bool                                                g_isSlideshowMode            = false;
 ComPtr<ID2D1Bitmap>                                 g_slideshowBgBitmap;         // 25 %-size blurred bg for current image
 ComPtr<ID2D1Bitmap>                                 g_prevSlideshowBgBitmap;     // blurred bg fading out
@@ -232,8 +238,11 @@ float                                               g_prevImageZoom             
 float                                               g_prevImageOffX              = 0.0f;
 float                                               g_prevImageOffY              = 0.0f;
 float                                               g_prevImageRotation          = 0.0f;
-constexpr UINT_PTR                                  SLIDESHOW_TIMER_ID           = 999;
-constexpr UINT                                      SLIDESHOW_INTERVAL_MS        = 5000;  // ms between pictures
+constexpr UINT_PTR                                  SLIDESHOW_TIMER_ID           = 0xcafe;
+constexpr UINT_PTR                                  ZOOM_DISPLAY_TIMER_ID        = 0xbebe;
+constexpr UINT_PTR                                  KILL_ROTATION_TIMER_ID       = 0xbeca;
+constexpr UINT_PTR                                  ENTER_FULL_SCREEN_TIMER_ID   = 0xcaca;
+constexpr UINT                                      SLIDESHOW_INTERVAL_MS        = 6000;  // ms between pictures
 bool                                                g_slideshowPreFade           = false; // true from button-press until first overlay Present()
 float                                               g_slideshowPreFadeAlpha      = 0.0f;  // 0=current view visible, 1=fully black
 HWND                                                g_blackCoverWindow           = nullptr;
@@ -291,6 +300,7 @@ void BuildImageList(const wchar_t* filename);
 bool OpenImageFile(HWND hWnd);
 void OpenNextImage(HWND hWnd);
 void OpenPrevImage(HWND hWnd);
+void DeleteCurrentImage(HWND hWnd, bool permanent);
 bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt);
 void MakeZoomVisible(HWND hWnd);
 void StopThumbnailLoader();
@@ -505,7 +515,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     );
 
     MSG msg = {};
-    LONG lastTime = GetTickCount64();
+    ULONGLONG lastTime = GetTickCount64();
 
     // Main loop
     while (true)
@@ -522,7 +532,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
             }
         }
 
-        LONG now = GetTickCount64();
+        ULONGLONG now = GetTickCount64();
         float dt = (now - lastTime) / 1000.0f;
         lastTime = now;
 
@@ -822,7 +832,7 @@ void UpdateEngine(float dt)
 {
     if (g_isAnimatedGif && !g_gifFrames.empty())
     {
-        LONG now = GetTickCount64();
+        ULONGLONG now = GetTickCount64();
         if (now - g_lastGifFrameTime >= g_gifFrameDelays[g_currentGifFrame])
         {
             g_currentGifFrame =
@@ -1423,14 +1433,15 @@ void EnterFullscreen(bool preserveView = false, bool needsDelay = true)
     if (needsDelay)
     {
         g_isFullscreen = true;
-
-        SetWindowLong(g_mainWindow, GWL_EXSTYLE,
-            GetWindowLong(g_mainWindow, GWL_EXSTYLE) | WS_EX_LAYERED);
+        SetWindowLong  (g_mainWindow, 
+                        GWL_EXSTYLE,
+                        GetWindowLong(g_mainWindow, GWL_EXSTYLE) | WS_EX_LAYERED
+                        );
 
         SetLayeredWindowAttributes(g_mainWindow, 0, 0, LWA_ALPHA);
         UpdateWindow(g_mainWindow);
 
-        SetTimer(g_mainWindow, 8888, 150, nullptr);
+        SetTimer(g_mainWindow, ENTER_FULL_SCREEN_TIMER_ID, 150, nullptr);
         g_pendingPreserveView = preserveView;
         return;
     }
@@ -1622,10 +1633,25 @@ static void CompleteExitFullscreen()
     float overlayWidth  = (float)(overlayClient.right  - overlayClient.left);
     float overlayHeight = (float)(overlayClient.bottom - overlayClient.top);
 
-    float imgLeft   = g_offsetX;
-    float imgTop    = g_offsetY;
-    float imgRight  = g_offsetX + imgSize.width  * g_zoom;
-    float imgBottom = g_offsetY + imgSize.height * g_zoom;
+    // The image is rendered rotated around its unrotated centre.
+    // g_offsetX/Y is the top-left of the *unrotated* rectangle, so the
+    // visual (post-rotation) bounding box must be derived from the centre
+    // and the effective (possibly swapped) screen dimensions.
+    float fitW = imgSize.width;
+    float fitH = imgSize.height;
+    {
+        const float rotMod = fmodf(fabsf(g_imageRotationAngle), 180.f);
+        if (rotMod > 44.f && rotMod < 136.f)
+            std::swap(fitW, fitH);
+    }
+    // Rotation pivot (screen-space centre of the image, invariant to rotation)
+    float cx = g_offsetX + imgSize.width  * g_zoom * 0.5f;
+    float cy = g_offsetY + imgSize.height * g_zoom * 0.5f;
+
+    float imgLeft   = cx - fitW * g_zoom * 0.5f;
+    float imgTop    = cy - fitH * g_zoom * 0.5f;
+    float imgRight  = cx + fitW * g_zoom * 0.5f;
+    float imgBottom = cy + fitH * g_zoom * 0.5f;
 
     float visibleLeft   = max(0.0f, imgLeft);
     float visibleTop    = max(0.0f, imgTop);
@@ -1710,8 +1736,14 @@ static void CompleteExitFullscreen()
     int clampShiftX = winX - preClampWinX;
     int clampShiftY = winY - preClampWinY;
 
-    g_offsetX = offsetCorrectionX - (float)clampShiftX;
-    g_offsetY = offsetCorrectionY - (float)clampShiftY;
+    // offsetCorrectionX/Y is the visual (rotated) image left/top in the new
+    // client rect.  g_offsetX/Y is the *unrotated* top-left, which is offset
+    // from the visual edge by half the difference between unrotated and rotated
+    // dimensions.  For non-rotated images fitW==imgW so the adjustment is zero.
+    float cx_new = offsetCorrectionX - (float)clampShiftX + fitW * g_zoom * 0.5f;
+    float cy_new = offsetCorrectionY - (float)clampShiftY + fitH * g_zoom * 0.5f;
+    g_offsetX = cx_new - imgSize.width  * g_zoom * 0.5f;
+    g_offsetY = cy_new - imgSize.height * g_zoom * 0.5f;
 
     g_targetOffsetX = g_offsetX;
     g_targetOffsetY = g_offsetY;
@@ -1752,7 +1784,7 @@ void ExitFullscreen(bool immediate)
 
     // Kill the zoom-display timer and hide the textbox in case it was visible.
     // Safe to do immediately regardless of the fade path.
-    KillTimer(g_mainWindow, 666);
+    KillTimer(g_mainWindow, ZOOM_DISPLAY_TIMER_ID);
     if (!g_textBoxes.empty())
         g_textBoxes[TEXTBOX_ZOOM_INPUT].SetForcedVisibility(false);
 
@@ -1901,7 +1933,7 @@ void CreateRenderTarget(HWND hWnd)
         if (SUCCEEDED(hr))
         {
             // 20 px on a 25 %-size image ≈ 80 px of blur on the original
-            g_blurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, 20.0f);
+            g_blurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, 4.0f);
             // Mirror edges so the fill has no dark border
             g_blurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
         }
@@ -2577,7 +2609,7 @@ void InitializeMenuButtons()
     // Help Button
     // -------------------------
 
-    openConfig.layout.x.value += 0.056;
+    openConfig.layout.x.value += 0.056f;
     openConfig.text = L"\U0000FF1F";
     openConfig.tooltip = L"Keyboard shortcuts";
     g_buttons[BUTTON_HELP].Initialize(
@@ -2915,7 +2947,7 @@ void InitializeImageInfoLabel()
                         value = 10000.0f;
                     } 
                     
-                    UpdateTargetZoom(value/100.0);
+                    UpdateTargetZoom(value/100.0f);
                     ZoomIntoImage(g_overlayWindow, 0, nullptr);
                     
                 }
@@ -4334,6 +4366,86 @@ void OpenNextImage(HWND hWnd)
     }
 }
 
+void InitFullScreenExit()
+{
+    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+    float centerX = g_offsetX + imgSize.width  * g_zoom / 2.0f;
+    float centerY = g_offsetY + imgSize.height * g_zoom / 2.0f;
+    
+    g_targetOffsetX = centerX - (imgSize.width * 0.05f) / 2.0f;
+    g_targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
+    
+    int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
+    g_smooth = 2*0.18f * 60.0f / (float)refreshRate;
+    g_targetZoom = 0.0005f;
+    g_isExiting = true;
+}
+
+void DeleteCurrentImage(HWND hWnd, bool permanent)
+{
+    if (g_currentImageIndex < 0 || g_currentImageIndex >= (int)g_imageFiles.size())
+        return;
+
+    std::wstring fileToDelete = g_imageFiles[g_currentImageIndex];
+    bool success = false;
+
+    if (permanent)
+    {
+        success = std::filesystem::remove(fileToDelete);
+    }
+    else
+    {
+        SHFILEOPSTRUCTW op = {};
+        std::wstring from = fileToDelete + L'\0';
+        op.wFunc  = FO_DELETE;
+        op.pFrom  = from.c_str();
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
+        success = (SHFileOperationW(&op) == 0);
+    }
+
+    if (success)
+    {
+        g_imageStates.erase(fileToDelete);
+
+        StopThumbnailLoader();
+
+        struct ThumbSnap { Microsoft::WRL::ComPtr<IWICBitmap> wic;
+                           Microsoft::WRL::ComPtr<ID2D1Bitmap> d2d; };
+        std::unordered_map<std::wstring, ThumbSnap> snap;
+        for (int si = 0; si < (int)g_thumbs.size() &&
+                         si < (int)g_imageFiles.size(); ++si)
+            if (g_thumbs[si].wic || g_thumbs[si].d2d)
+                snap[g_imageFiles[si]] = { g_thumbs[si].wic, g_thumbs[si].d2d };
+
+        g_imageFiles.erase(g_imageFiles.begin() + g_currentImageIndex);
+
+        const int newN = (int)g_imageFiles.size();
+        g_thumbs.assign(newN, ThumbnailEntry{});
+        for (int si = 0; si < newN; ++si)
+        {
+            auto it = snap.find(g_imageFiles[si]);
+            if (it != snap.end())
+            {
+                g_thumbs[si].wic = it->second.wic;
+                g_thumbs[si].d2d = it->second.d2d;
+            }
+        }
+
+        if (g_imageFiles.empty())
+        {
+            InitFullScreenExit();
+            return;
+        }
+
+        if (g_currentImageIndex >= (int)g_imageFiles.size())
+            g_currentImageIndex = (int)g_imageFiles.size() - 1;
+
+        LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
+        InitializeImageLayout(hWnd, true);
+        StartThumbnailLoader();
+    }
+}
+
 bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt)
 {
     if (g_isExiting || !g_d2dBitmap)
@@ -4396,7 +4508,7 @@ bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt)
 void MakeZoomVisible(HWND hWnd)
 {
     g_textBoxes[TEXTBOX_ZOOM_INPUT].SetForcedVisibility(true);
-    SetTimer(hWnd, 666, 1000, nullptr);
+    SetTimer(hWnd, ZOOM_DISPLAY_TIMER_ID, 1000, nullptr);
 }
 
 
@@ -4799,20 +4911,6 @@ void DrawThumbnailStrip(float visibility)
     }
 }
 
-void InitFullScreenExit()
-{
-    D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
-    float centerX = g_offsetX + imgSize.width  * g_zoom / 2.0f;
-    float centerY = g_offsetY + imgSize.height * g_zoom / 2.0f;
-    
-    g_targetOffsetX = centerX - (imgSize.width * 0.05f) / 2.0f;
-    g_targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
-    
-    int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
-    g_smooth = 2*0.18f * 60.0f / (float)refreshRate;
-    g_targetZoom = 0.0005f;
-    g_isExiting = true;
-}
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -4906,6 +5004,81 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         case ID_HELP_COMMANDS:
             DialogBox(hInst, MAKEINTRESOURCE(IDD_COMMANDBOX), hWnd, About);
             break;
+
+        case IDM_CTX_COPY:
+        {
+            if (!g_d2dBitmap || !g_wicBitmapSource || g_currentFilePath.empty()) break;
+
+            UINT srcW = 0, srcH = 0;
+            g_wicBitmapSource->GetSize(&srcW, &srcH);
+
+            BITMAPINFOHEADER bi = {};
+            bi.biSize        = sizeof(bi);
+            bi.biWidth       = (LONG)srcW;
+            bi.biHeight      = -(LONG)srcH;  // top-down
+            bi.biPlanes      = 1;
+            bi.biBitCount    = 32;
+            bi.biCompression = BI_RGB;
+
+            size_t pixelBytes = (size_t)srcW * srcH * 4;
+            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + pixelBytes);
+            if (!hMem) break;
+
+            BYTE* pBuf = (BYTE*)GlobalLock(hMem);
+            memcpy(pBuf, &bi, sizeof(bi));
+            BYTE* pDst = pBuf + sizeof(BITMAPINFOHEADER);
+
+            ComPtr<IWICFormatConverter> conv;
+            if (SUCCEEDED(g_wicFactory->CreateFormatConverter(&conv)) &&
+                SUCCEEDED(conv->Initialize(g_wicBitmapSource.Get(),
+                    GUID_WICPixelFormat32bppBGR, WICBitmapDitherTypeNone,
+                    nullptr, 0.f, WICBitmapPaletteTypeCustom)))
+            {
+                conv->CopyPixels(nullptr, srcW * 4, (UINT)pixelBytes, pDst);
+            }
+            GlobalUnlock(hMem);
+
+            if (OpenClipboard(hWnd))
+            {
+                EmptyClipboard();
+                SetClipboardData(CF_DIB, hMem);
+                CloseClipboard();
+            }
+            break;
+        }
+
+        case IDM_CTX_DELETE:
+        {
+            bool shiftHeld = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            DeleteCurrentImage(hWnd, shiftHeld);
+            break;
+        }
+
+        case IDM_CTX_OPEN_FOLDER:
+        {
+            if (g_currentFilePath.empty()) break;
+            PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(g_currentFilePath.c_str());
+            if (pidl)
+            {
+                SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+                ILFree(pidl);
+            }
+            break;
+        }
+
+        case IDM_CTX_PROPERTIES:
+        {
+            if (g_currentFilePath.empty()) break;
+            SHELLEXECUTEINFOW sei = {};
+            sei.cbSize = sizeof(sei);
+            sei.fMask  = SEE_MASK_INVOKEIDLIST;
+            sei.hwnd   = hWnd;
+            sei.lpVerb = L"properties";
+            sei.lpFile = g_currentFilePath.c_str();
+            ShellExecuteExW(&sei);
+            break;
+        }
+
         default:
             return DefWindowProc(hWnd, message, wParam, lParam);
         }
@@ -4990,6 +5163,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     break;
 
+    case WM_RBUTTONUP:
+    {
+        if (g_currentFilePath.empty()) break;
+
+        HMENU hMenu = CreatePopupMenu();
+        AppendMenuW(hMenu, MF_STRING,    IDM_CTX_COPY,        L"Copy image");
+        AppendMenuW(hMenu, MF_STRING,    IDM_CTX_DELETE,      L"Delete");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0,                    nullptr);
+        AppendMenuW(hMenu, MF_STRING,    IDM_CTX_OPEN_FOLDER, L"Open containing folder");
+        AppendMenuW(hMenu, MF_STRING,    IDM_CTX_PROPERTIES,  L"Properties");
+
+        POINT pt;
+        GetCursorPos(&pt);
+        SetForegroundWindow(hWnd);
+        TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+        DestroyMenu(hMenu);
+        return 0;
+    }
+
     case WM_MOUSEWHEEL:
     {
         if (!g_d2dBitmap)
@@ -5004,8 +5196,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
     case WM_LBUTTONDOWN:
     {
-        float x = GET_X_LPARAM(lParam);
-        float y = GET_Y_LPARAM(lParam);
+        float x = static_cast<float>(GET_X_LPARAM(lParam));
+        float y = static_cast<float>(GET_Y_LPARAM(lParam));
         for (auto& [id, btn] : g_buttons)
         {
             if (btn.OnMouseDown(x, y))
@@ -5061,8 +5253,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         g_isDragging = true;
         SetCapture(hWnd);
-        g_lastMouse.x = x;
-        g_lastMouse.y = y;
+        g_lastMouse.x = static_cast<LONG>(x);
+        g_lastMouse.y = static_cast<LONG>(y);
         g_mouseFromDown = g_lastMouse;
     }
     break;
@@ -5144,7 +5336,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             break;
         }
         // Handle incomplete rotations
-        SetTimer(hWnd, 123, 120, nullptr);
+        SetTimer(hWnd, KILL_ROTATION_TIMER_ID, 120, nullptr);
     }
     break;
 
@@ -5158,10 +5350,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         float windowWidth   = (float)(rc.right - rc.left);
         float windowHeight  = (float)(rc.bottom - rc.top);
         for (auto& [id, btn] : g_buttons)
-            btn.UpdateProximity(pt.x, pt.y, windowWidth, windowHeight);
+            btn.UpdateProximity(static_cast<float>(pt.x), static_cast<float>(pt.y), windowWidth, windowHeight);
 
         for (auto& [id, txt] : g_textBoxes)
-            txt.UpdateProximity(pt.x, pt.y, windowWidth, windowHeight);
+            txt.UpdateProximity(static_cast<float>(pt.x), static_cast<float>(pt.y), windowWidth, windowHeight);
 
         // Vignette activation zones: top 20 % for top bar, bottom 20 % for bottom bar.
         // Only show when an image is loaded (same rule as the buttons).
@@ -5269,8 +5461,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
 
-        float x = GET_X_LPARAM(lParam);
-        float y = GET_Y_LPARAM(lParam);
+        float x = static_cast<float>(GET_X_LPARAM(lParam));
+        float y = static_cast<float>(GET_Y_LPARAM(lParam));
 
         for (auto& [id, btn] : g_buttons)
         {
@@ -5309,15 +5501,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     
     case WM_TIMER:
     {
-        if (wParam == 8888)
+        if (wParam == ENTER_FULL_SCREEN_TIMER_ID)
         {
-            KillTimer(hWnd, 8888);
+            KillTimer(hWnd, ENTER_FULL_SCREEN_TIMER_ID);
             EnterFullscreen(g_pendingPreserveView, false);
         }
-        if (wParam == 123)
+        if (wParam == KILL_ROTATION_TIMER_ID)
         {
             // Handle incomplete rotations:
-            KillTimer(hWnd, 123);
+            KillTimer(hWnd, KILL_ROTATION_TIMER_ID);
             if (g_imageRotationAngle < g_targetRotationAngle)
             {
                 g_targetRotationAngle = std::ceil(g_imageRotationAngle / 90.0f) * 90.0f;
@@ -5327,9 +5519,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 g_targetRotationAngle = std::floor(g_imageRotationAngle / 90.0f) * 90.0f;
             }
         }
-        if (wParam == 666)
+        if (wParam == ZOOM_DISPLAY_TIMER_ID)
             {
-                KillTimer(hWnd, 666);
+                KillTimer(hWnd, ZOOM_DISPLAY_TIMER_ID);
                 g_textBoxes[TEXTBOX_ZOOM_INPUT].SetForcedVisibility(false);
         }
         if (wParam == SLIDESHOW_TIMER_ID)
@@ -5357,6 +5549,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
     case WM_KEYDOWN:
     {   
+        if (g_isSlideshowMode)
+            KillTimer(g_mainWindow, SLIDESHOW_TIMER_ID);
+            SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
+
         // If any textbox is focused, let it handle the key
         for (auto& [id, box] : g_textBoxes)
         {
@@ -5366,96 +5562,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 return 0;  // STOP. Do NOT process global shortcuts.
             }
         }
-
+        
         switch (wParam)
         {
             case VK_DELETE:
             {
-                if (g_currentImageIndex < 0 || g_currentImageIndex >= (int)g_imageFiles.size())
-                    return 0;
-
-                std::wstring fileToDelete = g_imageFiles[g_currentImageIndex];
-
                 bool shiftHeld = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                bool success = false;
-
-                if (shiftHeld)
-                {
-                    // Permanent delete
-                    success = std::filesystem::remove(fileToDelete);
-                }
-                else
-                {
-                    // Send to recycle bin
-                    SHFILEOPSTRUCTW op = {};
-                    std::wstring from = fileToDelete + L'\0';
-
-                    op.wFunc = FO_DELETE;
-                    op.pFrom = from.c_str();
-                    op.fFlags =
-                        FOF_ALLOWUNDO |       // recycle bin
-                        FOF_NOCONFIRMATION |
-                        FOF_SILENT;
-
-                    success = (SHFileOperationW(&op) == 0);
-                }
-
-                if (success)
-                {
-                    // Remove the deleted file's saved view state so no other
-                    // image can accidentally inherit it (e.g. if a new file
-                    // with the same name is later added to the same folder).
-                    g_imageStates.erase(fileToDelete);
-
-                    // Stop the loader before touching g_thumbs (no race).
-                    StopThumbnailLoader();
-
-                    // Snapshot BOTH wic and d2d by path BEFORE erasing g_imageFiles
-                    // so indices still match. D2D bitmaps are still valid — this is
-                    // not a device loss, just a file list change.
-                    struct ThumbSnap { Microsoft::WRL::ComPtr<IWICBitmap> wic;
-                                       Microsoft::WRL::ComPtr<ID2D1Bitmap> d2d; };
-                    std::unordered_map<std::wstring, ThumbSnap> snap;
-                    for (int si = 0; si < (int)g_thumbs.size() &&
-                                     si < (int)g_imageFiles.size(); ++si)
-                        if (g_thumbs[si].wic || g_thumbs[si].d2d)
-                            snap[g_imageFiles[si]] = { g_thumbs[si].wic, g_thumbs[si].d2d };
-
-                    g_imageFiles.erase(g_imageFiles.begin() + g_currentImageIndex);
-
-                    // Rebuild g_thumbs, restoring both wic and d2d so the D2D
-                    // bitmaps don't go gray and the spiral skips already-loaded slots.
-                    const int newN = (int)g_imageFiles.size();
-                    g_thumbs.assign(newN, ThumbnailEntry{});
-                    for (int si = 0; si < newN; ++si)
-                    {
-                        auto it = snap.find(g_imageFiles[si]);
-                        if (it != snap.end())
-                        {
-                            g_thumbs[si].wic = it->second.wic;
-                            g_thumbs[si].d2d = it->second.d2d;
-                        }
-                    }
-
-                    if (g_imageFiles.empty())
-                    {
-                        InitFullScreenExit();
-                        return 0;
-                    }
-
-                    if (g_currentImageIndex >= (int)g_imageFiles.size())
-                        g_currentImageIndex = (int)g_imageFiles.size() - 1;
-
-                    LoadImageD2D(hWnd, g_imageFiles[g_currentImageIndex].c_str());
-
-                    // Reset zoom/pan for the incoming image when it has no
-                    // saved state — mirrors what OpenNextImage/OpenPrevImage do.
-                    // Without this call, the deleted image's view state bleeds
-                    // into the next image because the global zoom/pan vars are
-                    // never updated when g_restoredStateThisLoad is false.
-                    InitializeImageLayout(hWnd, true);
-                    StartThumbnailLoader();  // reload with updated file list
-                }
+                DeleteCurrentImage(hWnd, shiftHeld);
                 return 0;
             } 
             break;
@@ -5527,9 +5640,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 if (g_navPendingRender) break;
                 g_navPendingRender = true;
                 OpenPrevImage(hWnd);
-                if (g_isSlideshowMode)
-                    KillTimer(g_mainWindow, SLIDESHOW_TIMER_ID);
-                    SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
                 return 0;
             }
 
@@ -5540,9 +5650,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 if (g_navPendingRender) break;
                 g_navPendingRender = true;
                 OpenNextImage(hWnd);
-                if (g_isSlideshowMode)
-                    KillTimer(g_mainWindow, SLIDESHOW_TIMER_ID);
-                    SetTimer(g_mainWindow, SLIDESHOW_TIMER_ID, SLIDESHOW_INTERVAL_MS, nullptr);
                 return 0;
             }
 
@@ -5580,7 +5687,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_KEYUP:
     {
         // Handle incomplete rotations
-        SetTimer(hWnd, 123, 120, nullptr);
+        SetTimer(hWnd, KILL_ROTATION_TIMER_ID, 120, nullptr);
     }
     break;
     
