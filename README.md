@@ -8,7 +8,7 @@ Built with Direct2D, Direct3D 11, and WIC (Windows Imaging Component).
 
 [Bug reports](mailto:luisjalabert@gmail.com)
 
-![Picasso Pictures](example.png)
+![Picasso Pictures](Pi7_GIF_CMP(2).gif)
 
 ---
 
@@ -42,6 +42,7 @@ Built with Direct2D, Direct3D 11, and WIC (Windows Imaging Component).
 Once an image is open, the viewer automatically finds all other supported images in the same folder and lets you browse through them.
 
 ---
+![Picasso Pictures](example.png)
 
 ## Controls
 
