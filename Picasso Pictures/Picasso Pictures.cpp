@@ -41,6 +41,8 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dxguid.lib")
@@ -83,6 +85,13 @@ constexpr int IDM_CTX_COPY        = 2001;
 constexpr int IDM_CTX_DELETE      = 2002;
 constexpr int IDM_CTX_OPEN_FOLDER = 2003;
 constexpr int IDM_CTX_PROPERTIES  = 2004;
+constexpr int IDM_CTX_WALLPAPER   = 2005;
+
+// Hamburger menu command IDs
+constexpr int IDM_MENU_SHORTCUTS  = 3001;
+constexpr int IDM_MENU_ABOUT      = 3002;
+constexpr int IDM_MENU_ASSOCIATE  = 3003;
+constexpr int IDM_MENU_HQ_FILTER  = 3004;
 
 // Global Variables:
 HINSTANCE                                           hInst;                              // current instance
@@ -171,6 +180,7 @@ ComPtr<ID3D11RasterizerState>                       g_imageRast;
 ComPtr<ID3D11DepthStencilState>                     g_imageDS;
 ComPtr<ID3D11RenderTargetView>                      g_swapRTV;              // RTV wrapping swap-chain buffer 0
 bool                                                g_mipPipelineReady = false;
+bool                                                g_useHQFilter      = false;  // when true, forces D2D HIGH_QUALITY_CUBIC instead of D3D11 trilinear
 
 // Custom window message posted by the directory watcher thread
 #define WM_APP_DIRCHANGE  (WM_APP + 1)
@@ -301,6 +311,7 @@ bool OpenImageFile(HWND hWnd);
 void OpenNextImage(HWND hWnd);
 void OpenPrevImage(HWND hWnd);
 void DeleteCurrentImage(HWND hWnd, bool permanent);
+void AssociateFileTypes(HWND hWnd);
 bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt);
 void MakeZoomVisible(HWND hWnd);
 void StopThumbnailLoader();
@@ -406,6 +417,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     // --- Normal initialization continues here ---
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // Restore persisted settings from registry
+    {
+        DWORD hqVal = 0, cb = sizeof(hqVal);
+        RegGetValueW(HKEY_CURRENT_USER, L"Software\\PicassoPictures",
+                     L"HQFilter", RRF_RT_REG_DWORD, nullptr, &hqVal, &cb);
+        g_useHQFilter = (hqVal != 0);
+    }
 
     if (FAILED(CoInitialize(nullptr)))
     {
@@ -607,7 +626,7 @@ bool LoadDefaultBackgroundFromResource()
     if (g_wicDefaultBackground)
         return true;
 
-    HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCE(IDR_DEFAULT_BKG_JPG), L"JPG");
+    HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCEW(IDR_DEFAULT_BKG_JPG), L"JPG");
     if (!hRes)
         return false;
 
@@ -1006,7 +1025,9 @@ bool IsSupportedImage(const std::wstring& path)
            ext == L".gif"  ||
            ext == L".tif"  ||
            ext == L".tiff" ||
-           ext == L".webp";
+           ext == L".webp" ||
+           ext == L".avif" ||   // Requires AV1 Video Extension (Windows 11 / Store)
+           ext == L".jxl";      // Requires a third-party JXL WIC codec
 }
 
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
@@ -2606,19 +2627,32 @@ void InitializeMenuButtons()
     
 
     // -------------------------
-    // Help Button
+    // Hamburger Menu Button
     // -------------------------
 
     openConfig.layout.x.value += 0.056f;
-    openConfig.text = L"\U0000FF1F";
-    openConfig.tooltip = L"Keyboard shortcuts";
+    openConfig.text = L"\u2630";
+    openConfig.tooltip = L"Menu";
     g_buttons[BUTTON_HELP].Initialize(
         g_renderTarget.Get(),
         g_dwriteFactory.Get(),
         openConfig,
         []()
         {
-            { DialogBox(hInst, MAKEINTRESOURCE(IDD_COMMANDBOX),  g_mainWindow, About); }
+            HMENU hMenu = CreatePopupMenu();
+            AppendMenuW(hMenu, MF_STRING,             IDM_MENU_SHORTCUTS, L"Keyboard shortcuts");
+            AppendMenuW(hMenu, MF_STRING,             IDM_MENU_ABOUT,     L"About");
+            AppendMenuW(hMenu, MF_SEPARATOR, 0,                            nullptr);
+            AppendMenuW(hMenu, MF_STRING | (g_useHQFilter ? MF_CHECKED : MF_UNCHECKED),
+                                                      IDM_MENU_HQ_FILTER, L"High quality filter");
+            AppendMenuW(hMenu, MF_SEPARATOR, 0,                            nullptr);
+            AppendMenuW(hMenu, MF_STRING,             IDM_MENU_ASSOCIATE, L"Associate file types");
+
+            POINT pt;
+            GetCursorPos(&pt);
+            SetForegroundWindow(g_mainWindow);
+            TrackPopupMenu(hMenu, TPM_LEFTBUTTON, pt.x, pt.y, 0, g_mainWindow, nullptr);
+            DestroyMenu(hMenu);
         });
     g_buttons[BUTTON_HELP].UpdateLayout(g_renderTarget.Get());
     g_buttons[BUTTON_HELP].SetForcedVisibility(true);
@@ -3291,8 +3325,9 @@ void Render(HWND hWnd)
 
         // Decide which path draws the image bitmap itself:
         //   D3D11 path  — trilinear mip filtering, cache-friendly at all zoom levels
-        //   D2D fallback — used only when the mip pipeline isn't available yet
-        useD3D11Image = g_mipPipelineReady && (g_imageSRV != nullptr);
+        //   D2D fallback — used only when the mip pipeline isn't available yet,
+        //                  or when the user has enabled the HQ filter option
+        useD3D11Image = g_mipPipelineReady && (g_imageSRV != nullptr) && !g_useHQFilter;
 
         if (!useD3D11Image)
         {
@@ -4279,6 +4314,122 @@ void BuildImageList(const wchar_t* filename)
     StartThumbnailLoader();
 }
 
+void AssociateFileTypes(HWND hWnd)
+{
+    // Extensions we will associate, shown to the user before anything is written
+    static const wchar_t* exts[] = {
+        L".jpg", L".jpeg", L".png", L".bmp",
+        L".gif", L".tif",  L".tiff", L".webp",
+        L".avif", L".jxl"
+    };
+
+    // ----------------------------------------------------------------
+    // 1. Confirmation dialog via TaskDialog
+    // ----------------------------------------------------------------
+    std::wstring extList;
+    for (auto ext : exts)
+        extList += std::wstring(ext) + L"  ";
+
+    std::wstring detail =
+        L"The following file types will be associated with Picasso Pictures:\n\n"
+        + extList +
+        L"\n\nAfter this change, double-clicking any of these files in Explorer "
+        L"will open them in Picasso Pictures.\n\n"
+        L"You can always change this later in Windows Settings → Default Apps.";
+
+    TASKDIALOGCONFIG tdc       = {};
+    tdc.cbSize                 = sizeof(tdc);
+    tdc.hwndParent             = hWnd;
+    tdc.hInstance              = hInst;
+    tdc.dwFlags                = TDF_ALLOW_DIALOG_CANCELLATION | TDF_SIZE_TO_CONTENT;
+    tdc.pszWindowTitle         = L"Associate file types";
+    tdc.pszMainIcon            = TD_INFORMATION_ICON;
+    tdc.pszMainInstruction     = L"Set Picasso Pictures as the default image viewer?";
+    tdc.pszContent             = detail.c_str();
+    tdc.dwCommonButtons        = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
+
+    int button = 0;
+    if (FAILED(TaskDialogIndirect(&tdc, &button, nullptr, nullptr)) ||
+        button != IDOK)
+        return;  // user cancelled
+
+    // ----------------------------------------------------------------
+    // 2. Write registry entries
+    // ----------------------------------------------------------------
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
+    static const wchar_t* PROG_ID      = L"PicassoPictures.ImageFile";
+    static const wchar_t* FRIENDLY     = L"Picasso Pictures Image";
+    static const wchar_t* OPEN_CMD_FMT = L"\"%s\" \"%%1\"";
+
+    wchar_t openCmd[MAX_PATH + 8] = {};
+    swprintf_s(openCmd, MAX_PATH + 8, OPEN_CMD_FMT, exePath);
+
+    auto RegSetStr = [](const wchar_t* keyPath, const wchar_t* valueName, const wchar_t* data) -> bool
+    {
+        HKEY hKey = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, keyPath, 0, nullptr,
+                            REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr,
+                            &hKey, nullptr) != ERROR_SUCCESS)
+            return false;
+        DWORD cb = (DWORD)((wcslen(data) + 1) * sizeof(wchar_t));
+        bool ok = RegSetValueExW(hKey, valueName, 0, REG_SZ,
+                                 reinterpret_cast<const BYTE*>(data), cb) == ERROR_SUCCESS;
+        RegCloseKey(hKey);
+        return ok;
+    };
+
+    // ProgID + open command
+    std::wstring progBase = std::wstring(L"Software\\Classes\\") + PROG_ID;
+    RegSetStr(progBase.c_str(),                               nullptr, FRIENDLY);
+    RegSetStr((progBase + L"\\shell\\open\\command").c_str(), nullptr, openCmd);
+
+    // App capabilities (shows up in Windows Settings → Default Apps)
+    static const wchar_t* CAP_KEY = L"Software\\PicassoPictures\\Capabilities";
+    RegSetStr(L"Software\\RegisteredApplications", L"PicassoPictures", CAP_KEY);
+    RegSetStr(CAP_KEY, L"ApplicationName",          L"Picasso Pictures");
+    RegSetStr(CAP_KEY, L"ApplicationDescription",   L"Lightweight image viewer");
+
+    // Per-extension association
+    bool allOk = true;
+    for (auto ext : exts)
+    {
+        std::wstring extKey = std::wstring(L"Software\\Classes\\") + ext;
+        std::wstring capKey = std::wstring(CAP_KEY) + L"\\FileAssociations";
+
+        if (!RegSetStr(extKey.c_str(), nullptr, PROG_ID))
+            allOk = false;
+
+        RegSetStr(capKey.c_str(), ext, PROG_ID);
+    }
+
+    // Flush the shell cache
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+
+    // ----------------------------------------------------------------
+    // 3. Result dialog
+    // ----------------------------------------------------------------
+    if (allOk)
+    {
+        TaskDialog(hWnd, hInst,
+            L"File association",
+            L"Done!",
+            L"Picasso Pictures is now the default viewer for all supported image types.\n\n"
+            L"If Windows asks you to confirm the change, click \"Switch anyway\".",
+            TDCBF_OK_BUTTON, TD_INFORMATION_ICON, nullptr);
+    }
+    else
+    {
+        TaskDialog(hWnd, hInst,
+            L"File association",
+            L"Some types could not be associated",
+            L"One or more file types could not be registered.\n"
+            L"Try running Picasso Pictures as administrator and trying again.",
+            TDCBF_OK_BUTTON, TD_WARNING_ICON, nullptr);
+    }
+}
+
 bool OpenImageFile(HWND hWnd)
 {
     // Buffer that will receive the selected file path
@@ -4294,8 +4445,8 @@ bool OpenImageFile(HWND hWnd)
 
     // File filter (double-null terminated!)
     ofn.lpstrFilter =
-        L"All Supported Images (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.webp)\0"
-        L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.webp\0"
+        L"All Supported Images (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.webp;*.avif;*.jxl)\0"
+        L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.webp;*.avif;*.jxl\0"
         L"All Files (*.*)\0*.*\0";
 
     ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST;
@@ -5005,6 +5156,33 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             DialogBox(hInst, MAKEINTRESOURCE(IDD_COMMANDBOX), hWnd, About);
             break;
 
+        case IDM_MENU_SHORTCUTS:
+            DialogBox(hInst, MAKEINTRESOURCE(IDD_COMMANDBOX), hWnd, About);
+            break;
+
+        case IDM_MENU_ABOUT:
+            DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
+            break;
+
+        case IDM_MENU_HQ_FILTER:
+        {
+            g_useHQFilter = !g_useHQFilter;
+            DWORD val = g_useHQFilter ? 1 : 0;
+            HKEY hKey;
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\PicassoPictures",
+                                0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+            {
+                RegSetValueExW(hKey, L"HQFilter", 0, REG_DWORD,
+                               reinterpret_cast<const BYTE*>(&val), sizeof(val));
+                RegCloseKey(hKey);
+            }
+            break;
+        }
+
+        case IDM_MENU_ASSOCIATE:
+            AssociateFileTypes(hWnd);
+            break;
+
         case IDM_CTX_COPY:
         {
             if (!g_d2dBitmap || !g_wicBitmapSource || g_currentFilePath.empty()) break;
@@ -5076,6 +5254,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             sei.lpVerb = L"properties";
             sei.lpFile = g_currentFilePath.c_str();
             ShellExecuteExW(&sei);
+            break;
+        }
+
+        case IDM_CTX_WALLPAPER:
+        {
+            if (g_currentFilePath.empty()) break;
+            auto ext = g_currentFilePath.substr(g_currentFilePath.rfind(L'.'));
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+            static const std::vector<std::wstring> supported = {
+                L".jpg", L".jpeg", L".png", L".bmp", L".gif"
+            };
+            if (std::find(supported.begin(), supported.end(), ext) == supported.end())
+            {
+                MessageBoxW(hWnd, L"This file format is not supported as a wallpaper.",
+                            L"Set as wallpaper", MB_ICONINFORMATION);
+                break;
+            }
+            SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0,
+                (PVOID)g_currentFilePath.c_str(),
+                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+            MessageBoxW(hWnd,
+                (L"\"" + g_currentFileName + L"\" set as wallpaper.").c_str(),
+                L"Set as wallpaper", MB_ICONINFORMATION);
             break;
         }
 
@@ -5173,6 +5374,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         AppendMenuW(hMenu, MF_SEPARATOR, 0,                    nullptr);
         AppendMenuW(hMenu, MF_STRING,    IDM_CTX_OPEN_FOLDER, L"Open containing folder");
         AppendMenuW(hMenu, MF_STRING,    IDM_CTX_PROPERTIES,  L"Properties");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0,                    nullptr);
+        AppendMenuW(hMenu, MF_STRING,    IDM_CTX_WALLPAPER,   L"Set as wallpaper");
 
         POINT pt;
         GetCursorPos(&pt);
