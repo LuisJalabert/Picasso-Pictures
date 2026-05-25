@@ -4334,8 +4334,7 @@ void AssociateFileTypes(HWND hWnd)
         L"The following file types will be associated with Picasso Pictures:\n\n"
         + extList +
         L"\n\nAfter this change, double-clicking any of these files in Explorer "
-        L"will open them in Picasso Pictures.\n\n"
-        L"You can always change this later in Windows Settings → Default Apps.";
+        L"will open them in Picasso Pictures.";
 
     TASKDIALOGCONFIG tdc       = {};
     tdc.cbSize                 = sizeof(tdc);
@@ -4415,8 +4414,7 @@ void AssociateFileTypes(HWND hWnd)
         TaskDialog(hWnd, hInst,
             L"File association",
             L"Done!",
-            L"Picasso Pictures is now the default viewer for all supported image types.\n\n"
-            L"If Windows asks you to confirm the change, click \"Switch anyway\".",
+            L"Picasso Pictures is now the default viewer for all supported image types.",
             TDCBF_OK_BUTTON, TD_INFORMATION_ICON, nullptr);
     }
     else
@@ -5430,14 +5428,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             {
                 // Identify which slot (if any) the cursor is over — we'll need
                 // this if the gesture turns out to be a click, not a drag.
-                const float baseX  = rtW * 0.5f + g_thumbScrollOffset;
-                const float stride = g_thumbW + g_thumbGap;
-                const int   n      = (int)g_thumbs.size();
+                // The hit half-width is expanded by half the gap on each side so
+                // clicks in the gaps between thumbnails register on the nearest
+                // one, leaving no dead zone and no overlap.
+                const float baseX    = rtW * 0.5f + g_thumbScrollOffset;
+                const float stride   = g_thumbW + g_thumbGap;
+                const float hitHalfW = g_thumbW * 0.5f + g_thumbGap * 0.5f;
+                const int   n        = (int)g_thumbs.size();
                 g_thumbDragHitIndex = -1;
                 for (int i = 0; i < n; ++i)
                 {
                     const float cx = baseX + i * stride;
-                    if (x >= cx - g_thumbW * 0.5f && x <= cx + g_thumbW * 0.5f)
+                    if (x >= cx - hitHalfW && x <= cx + hitHalfW)
                     {
                         g_thumbDragHitIndex = i;
                         break;
@@ -5965,6 +5967,17 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
     {
     case WM_INITDIALOG:
         return (INT_PTR)TRUE;
+
+    case WM_NOTIFY:
+    {
+        NMHDR* pHdr = reinterpret_cast<NMHDR*>(lParam);
+        if (pHdr->idFrom == IDC_SYSLINK_GITHUB && pHdr->code == NM_CLICK)
+        {
+            NMLINK* pLink = reinterpret_cast<NMLINK*>(lParam);
+            ShellExecuteW(hDlg, L"open", pLink->item.szUrl, nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        return (INT_PTR)TRUE;
+    }
 
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
