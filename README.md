@@ -4,7 +4,7 @@ A lightweight, GPU-accelerated image viewer for Windows with a focus on smooth a
 
 Built with Direct2D, Direct3D 11, and WIC (Windows Imaging Component).
 
-## **Download Windows installer** (latest release) [here](https://github.com/LuisJalabert/Picasso-Pictures/releases/download/v1.51/PicassoPicturesSetup_1.51.exe)
+## **Download Windows installer** (latest release) [here](https://github.com/LuisJalabert/Picasso-Pictures/releases/download/v1.6/PicassoPicturesSetup_1.6.exe)
 
 [Bug reports](mailto:luisjalabert@gmail.com)
 
@@ -19,7 +19,7 @@ Built with Direct2D, Direct3D 11, and WIC (Windows Imaging Component).
 - **Slideshow mode** — automatically advances through images in the folder with cross-fade transitions and a blurred background
 - **Blurred background** — the current image is used as a softly blurred, cover-scaled background in both windowed and fullscreen modes
 - **Trilinear mip-mapped rendering** — GPU-accelerated trilinear filtering via a full D3D11 mip chain; optional high-quality bicubic mode for maximum fidelity on capable hardware
-- **Animated GIF support** with correct per-frame delay timings and full frame-composition (disposal methods, transparency)
+- **Animated GIF and WEBP support** with correct per-frame delay timings and full frame-composition (disposal methods, transparency)
 - **Per-image state memory** — zoom, pan, and rotation are remembered for each file in the session
 - **EXIF orientation** — images are automatically rotated to their correct upright orientation
 - **File management** — send to Recycle Bin, permanently delete, copy to clipboard, open containing folder, set as desktop wallpaper — all from a right-click menu
@@ -31,7 +31,7 @@ Built with Direct2D, Direct3D 11, and WIC (Windows Imaging Component).
 
 ## Supported Formats
 
-`JPG` · `JPEG` · `PNG` · `BMP` · `GIF` (animated) · `TIFF` · `TIF` · `WEBP` · `AVIF` · `JXL`
+`JPG` · `JPEG` · `PNG` · `BMP` · `GIF` (animated) · `TIFF` · `TIF` · `WEBP` (animated) · `AVIF` · `JXL`
 
 ---
 
