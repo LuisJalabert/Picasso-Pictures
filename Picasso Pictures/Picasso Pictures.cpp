@@ -3619,7 +3619,14 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 
     GUID container = {};
     decoder->GetContainerFormat(&container);
-    const bool isGifContainer = IsEqualGUID(container, GUID_ContainerFormatGif);
+
+    // GUID_ContainerFormatWebp is only present in newer Windows SDKs, so use
+    // a local GUID constant to keep the project buildable with older SDKs too.
+    static const GUID kContainerFormatWebp =
+        { 0xe094b0e2, 0x67f2, 0x45b3, { 0xb0, 0xea, 0x11, 0x53, 0x37, 0xca, 0x7c, 0xf3 } };
+
+    const bool isGifContainer  = IsEqualGUID(container, GUID_ContainerFormatGif);
+    const bool isWebpContainer = IsEqualGUID(container, kContainerFormatWebp);
 
     // --------------------------------------------
     // Small local helpers (avoid min/max macros)
@@ -3861,10 +3868,88 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     };
 
     // ============================================================
+    // Animated WebP
+    // ============================================================
+    // Windows WIC WebP animation support exposes each animation frame via
+    // IWICBitmapDecoder::GetFrame. WIC handles the WebP-specific frame
+    // composition internally, so unlike GIF we should NOT manually apply GIF
+    // disposal logic here. We simply cache each decoded frame as full PBGRA.
+    if (isWebpContainer && frameCount > 1)
+    {
+        for (UINT i = 0; i < frameCount; ++i)
+        {
+            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+            if (FAILED(decoder->GetFrame(i, frame.GetAddressOf())) || !frame)
+                continue;
+
+            UINT delayMs = 100; // WebP delays are milliseconds; fallback = 100ms
+
+            Microsoft::WRL::ComPtr<IWICMetadataQueryReader> meta;
+            if (SUCCEEDED(frame->GetMetadataQueryReader(meta.GetAddressOf())) && meta)
+            {
+                UINT v = 0;
+
+                // WIC's WebP ANMF metadata exposes WICWebpAnmfFrameDuration
+                // (property id 1) in milliseconds. Different systems/SDKs have
+                // used slightly different query-reader paths, so try the common
+                // forms and fall back gracefully if none are present.
+                if (ReadUIntMeta(meta.Get(), L"/ANMF/{uint=1}", v) ||
+                    ReadUIntMeta(meta.Get(), L"/anmf/{uint=1}", v) ||
+                    ReadUIntMeta(meta.Get(), L"/ANMF/FrameDuration", v) ||
+                    ReadUIntMeta(meta.Get(), L"/anmf/FrameDuration", v) ||
+                    ReadUIntMeta(meta.Get(), L"/webpanmf/{uint=1}", v) ||
+                    ReadUIntMeta(meta.Get(), L"/webpanmf/FrameDuration", v))
+                {
+                    delayMs = v;
+                }
+            }
+
+            if (delayMs < 10)
+                delayMs = 100;
+
+            std::vector<BYTE> pixels;
+            UINT w = 0, h = 0, stride = 0;
+            if (!DecodeToPBGRA(frame.Get(), nullptr, pixels, w, h, stride))
+                continue;
+
+            Microsoft::WRL::ComPtr<IWICBitmap> cached;
+            HRESULT hrFrame = g_wicFactory->CreateBitmapFromMemory(
+                w,
+                h,
+                GUID_WICPixelFormat32bppPBGRA,
+                stride,
+                (UINT)pixels.size(),
+                pixels.data(),
+                cached.GetAddressOf());
+
+            if (FAILED(hrFrame) || !cached)
+                continue;
+
+            g_gifFrames.push_back(cached);
+            g_gifFrameDelays.push_back(delayMs);
+
+            if (i == 0)
+            {
+                g_imageWidth  = (int)w;
+                g_imageHeight = (int)h;
+            }
+        }
+
+        if (g_gifFrames.empty())
+            return false;
+
+        // Reuse the existing animated-frame playback pipeline. The name still
+        // says GIF, but it now means "WIC-backed animated image".
+        g_isAnimatedGif = true;
+        g_currentGifFrame = 0;
+        g_wicBitmapSource = g_gifFrames[0];
+        g_lastGifFrameTime = GetTickCount64();
+    }
+    // ============================================================
     // Animated GIF (compose frames properly)
     // ============================================================
 
-    if (isGifContainer && frameCount > 1)
+    else if (isGifContainer && frameCount > 1)
     {
         // Logical screen size (canvas size)
         UINT canvasW = 0, canvasH = 0;
