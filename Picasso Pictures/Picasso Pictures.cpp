@@ -35,6 +35,9 @@
 #include <wrl.h>
 #include <d2d1effects.h>
 #include <unordered_map>
+#include <avif/avif.h>
+#include <jxl/decode.h>
+#include <jxl/thread_parallel_runner.h>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "d2d1.lib")
@@ -52,6 +55,7 @@
 
 using Microsoft::WRL::ComPtr;
 
+// Local struct declarations:
 struct ImageViewState {
     float zoom;
     float panX;        // image-center minus window-center, in pixels
@@ -136,6 +140,7 @@ std::vector<std::wstring>                           g_imageFiles;
 int                                                 g_currentImageIndex = -1;
 std::wstring                                        g_currentFilePath;
 std::wstring                                        g_currentFileName;
+std::wstring                                        g_lastLoadError;                    // human-readable reason the most recent LoadImageD2D failed
 int                                                 g_imageWidth  = 0;
 int                                                 g_imageHeight = 0;
 std::unordered_map<std::wstring, ImageViewState>    g_imageStates;
@@ -306,6 +311,10 @@ static ComPtr<ID2D1Bitmap> ExtractMipAsD2DBitmap(UINT targetMaxPx);
 void InitializeImageLayout(HWND hWnd, bool hard);
 void Render(HWND hWnd);
 bool LoadImageD2D(HWND hWnd, const wchar_t* filename);
+static bool LoadFail(const wchar_t* msg, HRESULT hr = S_OK);
+static bool DecodeAvifToWicBitmap(const wchar_t* path, IWICImagingFactory* wicFactory, ComPtr<IWICBitmap>& outBitmap, UINT& outW, UINT& outH, std::wstring* outReason = nullptr);
+static bool DecodeJxlToWicBitmap(const wchar_t* path, IWICImagingFactory* wicFactory, ComPtr<IWICBitmap>& outBitmap, UINT& outW, UINT& outH, std::wstring* outReason = nullptr);
+static bool FinishImageLoad(HWND hWnd, const wchar_t* filename);
 void BuildImageList(const wchar_t* filename);
 bool OpenImageFile(HWND hWnd);
 void OpenNextImage(HWND hWnd);
@@ -857,19 +866,23 @@ void UpdateEngine(float dt)
             g_currentGifFrame =
                 (g_currentGifFrame + 1) % g_gifFrames.size();
 
-            // If all frames are pre-uploaded, just swap the D2D pointer (no CPU→GPU upload)
+            // Already uploaded? Just swap the pointer — no CPU→GPU work.
             if (g_currentGifFrame < g_gifD2DBitmaps.size() && g_gifD2DBitmaps[g_currentGifFrame])
             {
                 g_d2dBitmap = g_gifD2DBitmaps[g_currentGifFrame];
-
-                // Also swap the D3D11 mip SRV so the trilinear path shows the correct frame
-                if (g_currentGifFrame < g_gifD3DSRVs.size() && g_gifD3DSRVs[g_currentGifFrame])
-                    g_imageSRV = g_gifD3DSRVs[g_currentGifFrame];
+                g_imageSRV.Reset();  // animated formats never carry a mip SRV
             }
             else
             {
+                // First time reaching this frame: decode/upload it now, and
+                // cache the result so it's never re-uploaded on later loops.
                 g_wicBitmapSource = g_gifFrames[g_currentGifFrame];
-                RecreateImageBitmap();  // also rebuilds g_imageSRV via CreateMipTextureFromSource
+                RecreateImageBitmap();
+
+                if (g_currentGifFrame < g_gifD2DBitmaps.size())
+                    g_gifD2DBitmaps[g_currentGifFrame] = g_d2dBitmap;
+                if (g_currentGifFrame < g_gifD3DSRVs.size())
+                    g_gifD3DSRVs[g_currentGifFrame] = g_imageSRV;  // stays null (animated = no mips)
             }
 
             g_lastGifFrameTime = now;
@@ -1026,8 +1039,8 @@ bool IsSupportedImage(const std::wstring& path)
            ext == L".tif"  ||
            ext == L".tiff" ||
            ext == L".webp" ||
-           ext == L".avif" ||   // Requires AV1 Video Extension (Windows 11 / Store)
-           ext == L".jxl";      // Requires a third-party JXL WIC codec
+           ext == L".avif" ||   // Decoded via bundled libavif/dav1d — no OS/Store extension required
+           ext == L".jxl";      // Decoded via bundled libjxl — no OS/Store extension required
 }
 
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
@@ -2447,6 +2460,36 @@ static void RenderImageD3D11(float imgW, float imgH, float opacity, bool /*isPre
     g_d3dContext->OMSetRenderTargets(0, &nullRTV, nullptr);
 }
 
+// Cheap CPU-side downscale used as the shadow-effect input for animated
+// formats, where we deliberately skip the D3D11 mip chain (see
+// RecreateImageBitmap). Mirrors the WIC fallback path in CreateSlideshowBgBitmap.
+static ComPtr<ID2D1Bitmap> CreateSmallShadowSourceViaWic(IWICBitmapSource* wicSrc, UINT targetMaxPx)
+{
+    if (!wicSrc || !g_wicFactory || !g_renderTarget) return nullptr;
+
+    UINT fullW = 0, fullH = 0;
+    if (FAILED(wicSrc->GetSize(&fullW, &fullH)) || fullW == 0 || fullH == 0) return nullptr;
+
+    float scaleRatio = min(1.0f, min((float)targetMaxPx / fullW, (float)targetMaxPx / fullH));
+    const UINT smallW = max(1u, (UINT)(fullW * scaleRatio));
+    const UINT smallH = max(1u, (UINT)(fullH * scaleRatio));
+
+    ComPtr<IWICBitmapScaler> scaler;
+    if (FAILED(g_wicFactory->CreateBitmapScaler(&scaler))) return nullptr;
+    if (FAILED(scaler->Initialize(wicSrc, smallW, smallH, WICBitmapInterpolationModeHighQualityCubic)))
+        return nullptr;
+
+    ComPtr<IWICFormatConverter> conv;
+    if (FAILED(g_wicFactory->CreateFormatConverter(&conv))) return nullptr;
+    if (FAILED(conv->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
+                                 WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom)))
+        return nullptr;
+
+    ComPtr<ID2D1Bitmap> bmp;
+    if (FAILED(g_renderTarget->CreateBitmapFromWicBitmap(conv.Get(), nullptr, &bmp))) return nullptr;
+    return bmp;
+}
+
 void RecreateImageBitmap()
 {
     if (!g_wicBitmapSource || !g_renderTarget)
@@ -2498,14 +2541,27 @@ void RecreateImageBitmap()
 
     // Also build the D3D11 mip texture for cache-friendly trilinear rendering.
     // We pass the (possibly downscaled) WIC source so the texture matches the D2D bitmap size.
-    if (g_mipPipelineReady)
+    if (g_mipPipelineReady && !g_isAnimatedGif)
     {
         CreateMipTextureFromSource(bitmapSourceForD2D.Get());
 
         // Extract a ~256 px mip for use as the shadow effect input.
-        // The shadow is a blurred silhouette — full resolution is wasted here.
+        // The shadow is a blurred silhouette - full resolution is wasted here.
         // This small bitmap is created once per image load and reused every frame.
         g_shadowSourceBitmap = ExtractMipAsD2DBitmap(256u);
+    }
+    else if (g_isAnimatedGif)
+    {
+        // Animated formats: skip the D3D11 mip chain entirely (no benefit -
+        // trilinear filtering isn't worth a per-frame upload+GenerateMips
+        // cost for something shown near 1:1 for a few seconds). g_imageSRV
+        // staying null makes the render path fall back to plain D2D draw
+        // automatically. Still build a *small* shadow source via cheap WIC
+        // downscale so the drop shadow doesn't blur the full-res frame
+        // every single render call.
+        g_imageMipTex.Reset();
+        g_imageSRV.Reset();
+        g_shadowSourceBitmap = CreateSmallShadowSourceViaWic(bitmapSourceForD2D.Get(), 256u);
     }
 }
 
@@ -3082,32 +3138,21 @@ void Render(HWND hWnd)
     if (g_wicBitmapSource && !g_d2dBitmap)
         RecreateImageBitmap();
 
-    // On device loss, GIF D2D bitmaps are cleared — re-upload all frames.
+    // On device loss, GIF D2D bitmaps are cleared — re-upload only the frame
+    // currently on screen. The rest are re-created lazily by UpdateEngine as
+    // playback reaches them, same as the initial-load path.
     if (g_isAnimatedGif && !g_gifFrames.empty() && g_gifD2DBitmaps.empty())
     {
-        g_gifD2DBitmaps.reserve(g_gifFrames.size());
-        g_gifD3DSRVs.clear();
-        g_gifD3DSRVs.reserve(g_gifFrames.size());
-        for (auto& wicFrame : g_gifFrames)
+        g_gifD2DBitmaps.assign(g_gifFrames.size(), nullptr);
+        g_gifD3DSRVs.assign(g_gifFrames.size(), nullptr);
+
+        if (g_currentGifFrame < g_gifFrames.size())
         {
             ComPtr<ID2D1Bitmap> bmp;
-            g_renderTarget->CreateBitmapFromWicBitmap(wicFrame.Get(), nullptr, &bmp);
-            g_gifD2DBitmaps.push_back(bmp);
-
-            if (g_mipPipelineReady)
-            {
-                CreateMipTextureFromSource(wicFrame.Get());
-                g_gifD3DSRVs.push_back(g_imageSRV);
-            }
-            else
-            {
-                g_gifD3DSRVs.push_back(nullptr);
-            }
+            g_renderTarget->CreateBitmapFromWicBitmap(g_gifFrames[g_currentGifFrame].Get(), nullptr, &bmp);
+            g_gifD2DBitmaps[g_currentGifFrame] = bmp;
+            g_d2dBitmap = bmp;
         }
-        if (g_currentGifFrame < g_gifD2DBitmaps.size() && g_gifD2DBitmaps[g_currentGifFrame])
-            g_d2dBitmap = g_gifD2DBitmaps[g_currentGifFrame];
-        if (g_currentGifFrame < g_gifD3DSRVs.size() && g_gifD3DSRVs[g_currentGifFrame])
-            g_imageSRV = g_gifD3DSRVs[g_currentGifFrame];
     }
 
     if (!g_d2dBitmap && g_wicDefaultBackground && !g_defaultBackgroundBitmap)
@@ -3537,10 +3582,393 @@ void Render(HWND hWnd)
     g_renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
+// ============================================================
+//  Load-failure reporting
+// ============================================================
+// Every failure path in LoadImageD2D / FinishImageLoad funnels through here
+// so the UI can show a specific reason instead of a generic "Failed to load
+// image." g_lastLoadError is cleared at the top of LoadImageD2D and read by
+// the caller (OpenImageFile, WM_DROPFILES, WM_COPYDATA) immediately after a
+// failed call.
+static bool LoadFail(const wchar_t* msg, HRESULT hr)
+{
+    g_lastLoadError = msg;
+    if (hr != S_OK)
+    {
+        wchar_t buf[48];
+        swprintf_s(buf, L" (HRESULT 0x%08X)", (unsigned)hr);
+        g_lastLoadError += buf;
+    }
+    OutputDebugStringW((g_lastLoadError + L"\n").c_str());
+    return false;
+}
+
+// ============================================================
+//  AVIF decoding (via libavif + dav1d, statically linked)
+// ============================================================
+// Bundled so AVIF works with zero extra installs — no Store "AV1 Video
+// Extension" required. Decodes straight into a premultiplied-alpha WIC
+// bitmap so everything downstream (RecreateImageBitmap, the D3D11 mip
+// path, the shadow effect) sees exactly what it already expects.
+//
+// NOTE: libavif's public API has shifted slightly across releases. This
+// targets the mainstream 1.x API shape (avifDecoderSetIOFile /
+// avifImageYUVToRGB). If your vcpkg version differs, <avif/avif.h> is the
+// source of truth — the overall shape (parse -> decode frame -> convert to
+// RGB -> wrap as WIC bitmap) has been stable for a long time.
+//
+// KNOWN LIMITATION: AVIF's irot/imir orientation transforms aren't applied
+// yet (g_exifRotation is left at 0 for AVIF). Most AVIF exporters don't set
+// them, but a file that does may appear in its untransformed orientation.
+// Reads just enough of a file to report its ISOBMFF major/compatible brands
+// (the 'ftyp' box). Used to diagnose "BMFF parsing failed" — the file might
+// not actually be AVIF at all (wrong/misleading extension, an AVIF *image
+// sequence* ('avis' brand, a different code path than the still-image
+// 'avif' brand), or simply truncated/corrupted). This is a light manual
+// read of the box header, not a full parser — just enough for a human to
+// eyeball in the error message.
+static std::wstring SniffIsobmffBrands(const wchar_t* path)
+{
+    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return L"";
+
+    BYTE header[128] = {};
+    DWORD bytesRead = 0;
+    BOOL ok = ReadFile(hFile, header, sizeof(header), &bytesRead, nullptr);
+    CloseHandle(hFile);
+    if (!ok || bytesRead < 16) return L"file is too small to contain a valid ftyp box";
+
+    auto be32 = [&](DWORD off) -> uint32_t
+    {
+        return (uint32_t(header[off]) << 24) | (uint32_t(header[off + 1]) << 16) |
+               (uint32_t(header[off + 2]) << 8) | uint32_t(header[off + 3]);
+    };
+    auto tag4 = [&](DWORD off) -> std::wstring
+    {
+        wchar_t buf[5] = {};
+        for (int i = 0; i < 4; ++i)
+        {
+            BYTE b = header[off + i];
+            buf[i] = (b >= 0x20 && b < 0x7f) ? (wchar_t)b : L'?';
+        }
+        return buf;
+    };
+
+    uint32_t boxSize = be32(0);
+    std::wstring boxType = tag4(4);
+    if (boxType != L"ftyp")
+        return L"first box is '" + boxType + L"', not 'ftyp' - this likely isn't a valid AVIF/ISOBMFF file";
+
+    std::wstring majorBrand = tag4(8);
+    std::wstring result = L"major brand '" + majorBrand + L"'";
+    if (majorBrand == L"avis")
+        result += L" (an AVIF image *sequence*, not a still image - not supported by this build)";
+    else if (majorBrand != L"avif")
+        result += L" (expected 'avif' - this file may be mislabeled or a different format entirely)";
+
+    std::wstring compat;
+    DWORD limit = min((DWORD)bytesRead, boxSize);
+    limit = min(limit, (DWORD)sizeof(header));
+    for (DWORD off = 16; off + 4 <= limit; off += 4)
+        compat += tag4(off) + L" ";
+    if (!compat.empty())
+        result += L", compatible brands: " + compat;
+
+    return result;
+}
+
+static bool DecodeAvifToWicBitmap(const wchar_t* path, IWICImagingFactory* wicFactory, ComPtr<IWICBitmap>& outBitmap, UINT& outW, UINT& outH, std::wstring* outReason)
+{
+    auto fail = [&](const wchar_t* why) -> bool
+    {
+        if (outReason) *outReason = why;
+        return false;
+    };
+    // avifResultToString() returns a narrow (const char*) string — convert
+    // to wide so it can flow into g_lastLoadError / MessageBox alongside
+    // everything else.
+    auto failAvif = [&](avifResult r) -> bool
+    {
+        if (outReason)
+        {
+            const char* narrow = avifResultToString(r);
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, narrow, -1, nullptr, 0);
+            if (wlen > 0)
+            {
+                std::wstring wide(wlen, L'\0');
+                MultiByteToWideChar(CP_UTF8, 0, narrow, -1, wide.data(), wlen);
+                if (!wide.empty() && wide.back() == L'\0') wide.pop_back();
+                *outReason = wide;
+            }
+        }
+        return false;
+    };
+
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr, nullptr);
+    if (utf8Len <= 0) return fail(L"invalid file path");
+    std::string utf8Path(utf8Len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8Path.data(), utf8Len, nullptr, nullptr);
+
+    avifDecoder* decoder = avifDecoderCreate();
+    if (!decoder) return fail(L"couldn't create AVIF decoder");
+
+    bool ok = false;
+
+    avifResult r = avifDecoderSetIOFile(decoder, utf8Path.c_str());
+    if (r != AVIF_RESULT_OK)
+    {
+        failAvif(r);
+    }
+    else if ((r = avifDecoderParse(decoder)) != AVIF_RESULT_OK)
+    {
+        // Most common real-world cause of "some AVIF files won't open": a
+        // container libavif's demuxer can't parse (truncated file, unusual
+        // brand, or a feature this libavif build wasn't compiled with).
+        // Sniff the ftyp box so the error names the actual problem instead
+        // of just repeating libavif's generic "BMFF parsing failed".
+        failAvif(r);
+        if (outReason)
+        {
+            std::wstring brands = SniffIsobmffBrands(path);
+            if (!brands.empty())
+                *outReason += L" - " + brands;
+        }
+    }
+    else if ((r = avifDecoderNextImage(decoder)) != AVIF_RESULT_OK)
+    {
+        // Most common cause here: 10/12-bit HDR content, or a AV1 profile
+        // dav1d in this build doesn't support.
+        failAvif(r);
+    }
+    else
+    {
+        avifRGBImage rgb;
+        avifRGBImageSetDefaults(&rgb, decoder->image);
+        rgb.format = AVIF_RGB_FORMAT_BGRA;   // byte order WIC's 32bppBGRA expects
+        rgb.depth  = 8;                      // downconvert HDR bit depths to 8-bit for display
+
+        if (avifRGBImageAllocatePixels(&rgb) != AVIF_RESULT_OK)
+        {
+            fail(L"couldn't allocate pixel buffer");
+        }
+        else
+        {
+            r = avifImageYUVToRGB(decoder->image, &rgb);
+            if (r != AVIF_RESULT_OK)
+            {
+                failAvif(r);
+            }
+            else
+            {
+                ComPtr<IWICBitmap> straight;
+                if (FAILED(wicFactory->CreateBitmapFromMemory(
+                        rgb.width, rgb.height,
+                        GUID_WICPixelFormat32bppBGRA,   // straight (non-premultiplied) alpha
+                        rgb.rowBytes,
+                        rgb.rowBytes * rgb.height,
+                        rgb.pixels,
+                        straight.GetAddressOf())))
+                {
+                    fail(L"WIC couldn't wrap the decoded pixels");
+                }
+                else
+                {
+                    ComPtr<IWICFormatConverter> conv;
+                    if (FAILED(wicFactory->CreateFormatConverter(&conv)) ||
+                        FAILED(conv->Initialize(straight.Get(), GUID_WICPixelFormat32bppPBGRA,
+                            WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom)))
+                    {
+                        fail(L"couldn't convert to premultiplied alpha");
+                    }
+                    else
+                    {
+                        ComPtr<IWICBitmap> cached;
+                        if (FAILED(wicFactory->CreateBitmapFromSource(conv.Get(), WICBitmapCacheOnLoad, &cached)))
+                        {
+                            fail(L"couldn't cache the decoded bitmap");
+                        }
+                        else
+                        {
+                            outBitmap = cached;
+                            outW = rgb.width;
+                            outH = rgb.height;
+                            ok = true;
+                        }
+                    }
+                }
+            }
+            avifRGBImageFreePixels(&rgb);
+        }
+    }
+
+    avifDecoderDestroy(decoder);
+    return ok;
+}
+
+// ============================================================
+//  JPEG XL decoding (via libjxl, statically linked)
+// ============================================================
+// Same bundling rationale as AVIF above. Reads the whole file into memory
+// and drives libjxl's one-shot event loop (BASIC_INFO -> FULL_IMAGE); JXL
+// files viewed in an image viewer are not expected to be large enough that
+// streaming decode is worth the extra complexity.
+//
+// NOTE: like the AVIF path, check <jxl/decode.h> against your installed
+// libjxl version if this doesn't compile as-is — a few struct/field names
+// have moved between releases, though the event loop shape has been stable.
+//
+// KNOWN LIMITATION: only the first frame of an animated JXL is decoded
+// (mirrors how AVIF is handled here; static JXL — the overwhelmingly common
+// case — is unaffected).
+static bool DecodeJxlToWicBitmap(const wchar_t* path, IWICImagingFactory* wicFactory, ComPtr<IWICBitmap>& outBitmap, UINT& outW, UINT& outH, std::wstring* outReason)
+{
+    auto fail = [&](const wchar_t* why) -> bool
+    {
+        if (outReason) *outReason = why;
+        return false;
+    };
+
+    std::vector<uint8_t> fileData;
+    {
+        HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return fail(L"couldn't open the file");
+
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 0)
+        {
+            CloseHandle(hFile);
+            return fail(L"couldn't determine file size");
+        }
+
+        fileData.resize((size_t)size.QuadPart);
+        DWORD bytesRead = 0;
+        BOOL readOk = ReadFile(hFile, fileData.data(), (DWORD)fileData.size(), &bytesRead, nullptr);
+        CloseHandle(hFile);
+        if (!readOk || bytesRead != fileData.size())
+            return fail(L"couldn't read the file");
+    }
+
+    JxlDecoder* dec = JxlDecoderCreate(nullptr);
+    if (!dec) return fail(L"couldn't create JXL decoder");
+
+    bool ok = false;
+    std::vector<uint8_t> pixels;
+    JxlBasicInfo info{};
+
+    void* runner = JxlThreadParallelRunnerCreate(
+        nullptr, (size_t)max(1u, std::thread::hardware_concurrency()));
+    if (runner)
+        JxlDecoderSetParallelRunner(dec, JxlThreadParallelRunner, runner);
+
+    if (JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE) == JXL_DEC_SUCCESS)
+    {
+        JxlDecoderSetInput(dec, fileData.data(), fileData.size());
+        JxlDecoderCloseInput(dec);
+
+        JxlPixelFormat format = { 4, JXL_TYPE_UINT8, JXL_LITTLE_ENDIAN, 0 }; // RGBA8, straight alpha
+
+        std::wstring loopFailReason;
+        for (;;)
+        {
+            JxlDecoderStatus status = JxlDecoderProcessInput(dec);
+
+            if (status == JXL_DEC_ERROR)
+            {
+                loopFailReason = L"the decoder reported a parse/decode error";
+                break;
+            }
+
+            if (status == JXL_DEC_BASIC_INFO)
+            {
+                if (JxlDecoderGetBasicInfo(dec, &info) != JXL_DEC_SUCCESS)
+                {
+                    loopFailReason = L"couldn't read basic image info";
+                    break;
+                }
+                continue;
+            }
+
+            if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER)
+            {
+                size_t bufferSize = 0;
+                if (JxlDecoderImageOutBufferSize(dec, &format, &bufferSize) != JXL_DEC_SUCCESS)
+                {
+                    loopFailReason = L"couldn't determine output buffer size";
+                    break;
+                }
+                pixels.resize(bufferSize);
+                if (JxlDecoderSetImageOutBuffer(dec, &format, pixels.data(), pixels.size()) != JXL_DEC_SUCCESS)
+                {
+                    loopFailReason = L"couldn't set output buffer";
+                    break;
+                }
+                continue;
+            }
+
+            if (status == JXL_DEC_FULL_IMAGE)
+            {
+                // First (or only, for a static image) frame decoded — stop here.
+                ok = (info.xsize > 0 && info.ysize > 0 && !pixels.empty());
+                if (!ok) loopFailReason = L"decoded frame had no pixel data";
+                break;
+            }
+
+            if (status == JXL_DEC_SUCCESS)
+            {
+                loopFailReason = L"stream ended before a full image was produced";
+                break;
+            }
+        }
+
+        if (!ok && outReason && !loopFailReason.empty())
+            *outReason = loopFailReason;
+    }
+
+    if (runner)
+        JxlThreadParallelRunnerDestroy(runner);
+    JxlDecoderDestroy(dec);
+
+    if (!ok)
+    {
+        if (outReason && outReason->empty())
+            *outReason = L"decode failed";
+        return false;
+    }
+
+    ComPtr<IWICBitmap> straight;
+    if (FAILED(wicFactory->CreateBitmapFromMemory(
+            info.xsize, info.ysize,
+            GUID_WICPixelFormat32bppRGBA,
+            info.xsize * 4,
+            (UINT)pixels.size(),
+            pixels.data(),
+            straight.GetAddressOf())))
+        return fail(L"WIC couldn't wrap the decoded pixels");
+
+    ComPtr<IWICFormatConverter> conv;
+    if (FAILED(wicFactory->CreateFormatConverter(&conv)) ||
+        FAILED(conv->Initialize(straight.Get(), GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom)))
+        return fail(L"couldn't convert to premultiplied alpha");
+
+    ComPtr<IWICBitmap> cached;
+    if (FAILED(wicFactory->CreateBitmapFromSource(conv.Get(), WICBitmapCacheOnLoad, &cached)))
+        return fail(L"couldn't cache the decoded bitmap");
+
+    outBitmap = cached;
+    outW = info.xsize;
+    outH = info.ysize;
+    return true;
+}
+
 bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 {
+    g_lastLoadError.clear();
+
     if (!g_wicFactory || !filename || !*filename)
-        return false;
+        return LoadFail(L"Internal error: the image system hasn't finished initializing.");
 
     // ---- Slideshow: snapshot current bitmap + bg before we clobber them ----
     if (g_isSlideshowMode && g_d2dBitmap)
@@ -3596,8 +4024,43 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
     g_lastGifFrameTime = 0;
     g_slideshowBgBitmap.Reset();
 
+    std::wstring extLower = std::filesystem::path(filename).extension().wstring();
+    std::transform(extLower.begin(), extLower.end(), extLower.begin(), ::towlower);
+
+    // --------------------------------------------------------------
+    // AVIF / JPEG XL — decoded ourselves (bundled libavif/dav1d and
+    // libjxl), bypassing WIC's decoder registry entirely. This is what
+    // lets these formats work with no OS/Store codec installed.
+    // --------------------------------------------------------------
+    if (extLower == L".avif")
+    {
+        ComPtr<IWICBitmap> bmp;
+        UINT w = 0, h = 0;
+        std::wstring reason;
+        if (!DecodeAvifToWicBitmap(filename, g_wicFactory.Get(), bmp, w, h, &reason))
+            return LoadFail((L"This AVIF file couldn't be decoded: " + reason).c_str());
+        g_wicBitmapSource = bmp;
+        g_imageWidth   = (int)w;
+        g_imageHeight  = (int)h;
+        g_exifRotation = 0.f;  // AVIF irot/imir transforms aren't applied yet — see DecodeAvifToWicBitmap
+        return FinishImageLoad(hWnd, filename);
+    }
+    else if (extLower == L".jxl")
+    {
+        ComPtr<IWICBitmap> bmp;
+        UINT w = 0, h = 0;
+        std::wstring reason;
+        if (!DecodeJxlToWicBitmap(filename, g_wicFactory.Get(), bmp, w, h, &reason))
+            return LoadFail((L"This JPEG XL file couldn't be decoded: " + reason).c_str());
+        g_wicBitmapSource = bmp;
+        g_imageWidth   = (int)w;
+        g_imageHeight  = (int)h;
+        g_exifRotation = 0.f;
+        return FinishImageLoad(hWnd, filename);
+    }
+
     // --------------------------------------------
-    // Decode container
+    // Decode container (everything else still goes through WIC, as before)
     // --------------------------------------------
 
     Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
@@ -3609,13 +4072,21 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         decoder.GetAddressOf());
 
     if (FAILED(hr) || !decoder)
-        return false;
+    {
+        if (hr == WINCODEC_ERR_COMPONENTNOTFOUND)
+            return LoadFail(L"No decoder is registered for this file type on this system.", hr);
+        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))
+            return LoadFail(L"The file could not be found.", hr);
+        if (hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION))
+            return LoadFail(L"The file is in use by another program and can't be read right now.", hr);
+        return LoadFail(L"This file couldn't be opened - it may be corrupted or not a valid image.", hr);
+    }
 
     UINT frameCount = 0;
     hr = decoder->GetFrameCount(&frameCount);
 
     if (FAILED(hr) || frameCount == 0)
-        return false;
+        return LoadFail(L"This image file has no readable frames.", hr);
 
     GUID container = {};
     decoder->GetContainerFormat(&container);
@@ -3936,7 +4407,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         }
 
         if (g_gifFrames.empty())
-            return false;
+            return LoadFail(L"No animation frames could be decoded from this WebP file.");
 
         // Reuse the existing animated-frame playback pipeline. The name still
         // says GIF, but it now means "WIC-backed animated image".
@@ -3973,7 +4444,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         }
 
         if (canvasW == 0 || canvasH == 0)
-            return false;
+            return LoadFail(L"Couldn't determine this GIF's canvas size.");
 
         // Composition canvas (full size)
         Microsoft::WRL::ComPtr<IWICBitmap> canvas;
@@ -3984,7 +4455,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
             canvas.GetAddressOf());
 
         if (FAILED(hr) || !canvas)
-            return false;
+            return LoadFail(L"Couldn't allocate a canvas to compose this GIF's frames.", hr);
 
         // Clear to transparent
         ClearRect(canvas.Get(), WICRect{ 0, 0, (INT)canvasW, (INT)canvasH });
@@ -4100,7 +4571,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         }
 
         if (g_gifFrames.empty())
-            return false;
+            return LoadFail(L"No frames could be decoded from this GIF.");
 
         g_isAnimatedGif = true;
         g_currentGifFrame = 0;
@@ -4115,7 +4586,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         hr = decoder->GetFrame(0, frame.GetAddressOf());
 
         if (FAILED(hr) || !frame)
-            return false;
+            return LoadFail(L"Couldn't read the image frame from this file.", hr);
 
         // ---- Read EXIF Orientation tag (tag 274) ----
         // Map the 8 EXIF orientation values to clockwise rotation degrees.
@@ -4156,7 +4627,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         hr = g_wicFactory->CreateFormatConverter(converter.GetAddressOf());
 
         if (FAILED(hr) || !converter)
-            return false;
+            return LoadFail(L"Couldn't create a color-format converter for this image.", hr);
 
         hr = converter->Initialize(
             frame.Get(),
@@ -4167,7 +4638,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
             WICBitmapPaletteTypeCustom);
 
         if (FAILED(hr))
-            return false;
+            return LoadFail(L"This image's pixel format isn't supported.", hr);
 
         Microsoft::WRL::ComPtr<IWICBitmap> cached;
         hr = g_wicFactory->CreateBitmapFromSource(
@@ -4176,7 +4647,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
             cached.GetAddressOf());
 
         if (FAILED(hr) || !cached)
-            return false;
+            return LoadFail(L"Couldn't cache the decoded image in memory.", hr);
 
         // Enforce premultiplied invariant for fully transparent pixels.
         // (Prevents speckle/noise if RGB is non-zero under A==0.)
@@ -4212,40 +4683,33 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 
         g_wicBitmapSource = cached;
     }
+
+    return FinishImageLoad(hWnd, filename);
+}
+
+// ============================================================
+//  Shared "tail" of an image load — runs after g_wicBitmapSource (and, for
+//  animated images, g_gifFrames) has been populated by either the WIC path
+//  or the AVIF/JXL paths above. Uploads to the GPU, restores any saved
+//  view state, and updates the filename label.
+// ============================================================
+static bool FinishImageLoad(HWND hWnd, const wchar_t* filename)
+{
     // Create Direct2D Bitmap for the *current device*
     RecreateImageBitmap();
 
-    // Pre-upload all GIF frames to GPU so UpdateEngine can swap bitmaps
-    // without a CPU→GPU upload every frame.
+    // Only frame 0 gets uploaded here (RecreateImageBitmap() just above already
+    // built it, since g_wicBitmapSource points at g_gifFrames[0] for animated
+    // formats). Every other frame is uploaded lazily, one at a time, by
+    // UpdateEngine as playback reaches it - this is what lets a large/long
+    // animated GIF or WebP display its first frame immediately instead of
+    // blocking on every frame hitting the GPU up front.
     if (g_isAnimatedGif && g_renderTarget)
     {
-        g_gifD2DBitmaps.clear();
-        g_gifD2DBitmaps.reserve(g_gifFrames.size());
-        g_gifD3DSRVs.clear();
-        g_gifD3DSRVs.reserve(g_gifFrames.size());
-        for (auto& wicFrame : g_gifFrames)
-        {
-            // D2D bitmap
-            ComPtr<ID2D1Bitmap> bmp;
-            g_renderTarget->CreateBitmapFromWicBitmap(wicFrame.Get(), nullptr, &bmp);
-            g_gifD2DBitmaps.push_back(bmp);
-
-            // D3D11 mip SRV — reuse CreateMipTextureFromSource; grab the SRV it leaves in g_imageSRV
-            if (g_mipPipelineReady)
-            {
-                CreateMipTextureFromSource(wicFrame.Get());
-                g_gifD3DSRVs.push_back(g_imageSRV);
-            }
-            else
-            {
-                g_gifD3DSRVs.push_back(nullptr);
-            }
-        }
-        // Point both pointers at frame 0
-        if (!g_gifD2DBitmaps.empty() && g_gifD2DBitmaps[0])
-            g_d2dBitmap = g_gifD2DBitmaps[0];
-        if (!g_gifD3DSRVs.empty() && g_gifD3DSRVs[0])
-            g_imageSRV = g_gifD3DSRVs[0];
+        g_gifD2DBitmaps.assign(g_gifFrames.size(), nullptr);
+        g_gifD3DSRVs.assign(g_gifFrames.size(), nullptr);
+        if (!g_gifD2DBitmaps.empty())
+            g_gifD2DBitmaps[0] = g_d2dBitmap;   // already built above, no need to re-upload
     }
 
     // ------------------------------------------------------------
@@ -4329,8 +4793,11 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 
     g_textBoxes[TEXTBOX_FILE_NAME].SetText(text);
 
-    return (g_d2dBitmap != nullptr);
-    }
+    if (!g_d2dBitmap)
+        return LoadFail(L"The image decoded, but couldn't be uploaded to the graphics device.");
+
+    return true;
+}
 
 void BuildImageList(const wchar_t* filename)
 {
@@ -4554,7 +5021,10 @@ bool OpenImageFile(HWND hWnd)
     // Load image using Direct2D/WIC
     if (!LoadImageD2D(hWnd, fileName))
     {
-        MessageBox(hWnd, L"Failed to load image.", L"Error", MB_ICONERROR);
+        std::wstring msg = g_lastLoadError.empty()
+            ? L"Failed to load image."
+            : g_lastLoadError;
+        MessageBox(hWnd, msg.c_str(), L"Error", MB_ICONERROR);
         return false;
     }
     BuildImageList(fileName);
@@ -4922,19 +5392,47 @@ void StartThumbnailLoader()
                 if (g_thumbLoaderStop) break;
                 if (idx < 0 || idx >= (int)files.size()) continue;
 
-                Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
-                if (FAILED(wic->CreateDecoderFromFilename(files[idx].c_str(), nullptr,
-                        GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder)) || !decoder)
-                    continue;
-                if (g_thumbLoaderStop) break;
+                std::wstring thumbExt = std::filesystem::path(files[idx]).extension().wstring();
+                std::transform(thumbExt.begin(), thumbExt.end(), thumbExt.begin(), ::towlower);
+                const bool isAvifThumb = (thumbExt == L".avif");
+                const bool isJxlThumb  = (thumbExt == L".jxl");
 
-                Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
-                if (FAILED(decoder->GetFrame(0, &frame)) || !frame) continue;
-                if (g_thumbLoaderStop) break;
-
-                // Read EXIF orientation tag (needed regardless of which decode path we take)
+                // For AVIF/JXL there's no WIC decoder/frame object at all — decode
+                // through the same bundled codecs LoadImageD2D uses, straight into
+                // a full-res IWICBitmapSource, then fall into the same scale-down
+                // path used for every other format below. No embedded-thumbnail
+                // fast path exists for these two (libavif/libjxl don't expose one
+                // through this API), so it's always the "slow path" for them —
+                // still fast enough for a background thread.
+                Microsoft::WRL::ComPtr<IWICBitmapDecoder>     decoder;      // WIC-native formats only
+                Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;        // WIC-native formats only
+                Microsoft::WRL::ComPtr<IWICBitmapSource>      sourceForScale; // what we actually scale from
                 WICBitmapTransformOptions wicTransform = WICBitmapTransformRotate0;
+
+                if (isAvifThumb || isJxlThumb)
                 {
+                    Microsoft::WRL::ComPtr<IWICBitmap> full;
+                    UINT fw = 0, fh = 0;
+                    bool decodedOk = isAvifThumb
+                        ? DecodeAvifToWicBitmap(files[idx].c_str(), wic.Get(), full, fw, fh)
+                        : DecodeJxlToWicBitmap(files[idx].c_str(), wic.Get(), full, fw, fh);
+                    if (!decodedOk || !full) continue;
+                    sourceForScale = full;
+                    // wicTransform stays Rotate0 — AVIF/JXL orientation isn't applied
+                    // yet anywhere in this app (see DecodeAvifToWicBitmap's comment).
+                }
+                else
+                {
+                    if (FAILED(wic->CreateDecoderFromFilename(files[idx].c_str(), nullptr,
+                            GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder)) || !decoder)
+                        continue;
+                    if (g_thumbLoaderStop) break;
+
+                    if (FAILED(decoder->GetFrame(0, &frame)) || !frame) continue;
+                    if (g_thumbLoaderStop) break;
+                    sourceForScale = frame;
+
+                    // Read EXIF orientation tag (WIC-native formats only)
                     Microsoft::WRL::ComPtr<IWICMetadataQueryReader> mqr;
                     if (SUCCEEDED(frame->GetMetadataQueryReader(&mqr)) && mqr)
                     {
@@ -4966,7 +5464,9 @@ void StartThumbnailLoader()
                 Microsoft::WRL::ComPtr<IWICBitmap> thumb;
 
                 // ---- Fast path: use the embedded JPEG thumbnail if it exists
-                // and is at least TARGET_H pixels tall (or wide for 90/270). ----
+                // and is at least TARGET_H pixels tall (or wide for 90/270).
+                // Only WIC-native formats (frame/decoder both non-null) have this. ----
+                if (frame && decoder)
                 {
                     Microsoft::WRL::ComPtr<IWICBitmapSource> embedded;
                     // Try frame thumbnail first, then decoder-level thumbnail.
@@ -4999,11 +5499,13 @@ void StartThumbnailLoader()
                 }
                 if (g_thumbLoaderStop) break;
 
-                // ---- Slow path: decode full frame and scale down. ----
+                // ---- Slow path: decode full source and scale down.
+                // Runs for GIF/PNG/JPEG/etc. without a usable embedded thumbnail,
+                // and unconditionally for AVIF/JXL. ----
                 if (!thumb)
                 {
                     UINT sw = 0, sh = 0;
-                    frame->GetSize(&sw, &sh);
+                    sourceForScale->GetSize(&sw, &sh);
                     if (sw == 0 || sh == 0) continue;
 
                     // Scale using raw (pre-rotation) dimensions so the scaler
@@ -5025,7 +5527,7 @@ void StartThumbnailLoader()
                     Microsoft::WRL::ComPtr<IWICFormatConverter> conv;
 
                     if (FAILED(wic->CreateBitmapScaler(&scaler)) ||
-                        FAILED(scaler->Initialize(frame.Get(), scaleW, scaleH,
+                        FAILED(scaler->Initialize(sourceForScale.Get(), scaleW, scaleH,
                             WICBitmapInterpolationModeHighQualityCubic)) ||
                         FAILED(wic->CreateFormatConverter(&conv)) ||
                         FAILED(conv->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
@@ -5178,6 +5680,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     SetForegroundWindow(hWnd);
                     SetActiveWindow(hWnd);
                 }
+                else
+                {
+                    std::wstring msg = g_lastLoadError.empty()
+                        ? L"Failed to load image."
+                        : g_lastLoadError;
+                    MessageBox(hWnd, msg.c_str(), L"Error", MB_ICONERROR);
+                }
             }
         }
         return 0;
@@ -5214,9 +5723,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         DragFinish(hDrop);
 
-        LoadImageD2D(hWnd, filePath);
-        BuildImageList(filePath);
-        EnterFullscreen();
+        if (LoadImageD2D(hWnd, filePath))
+        {
+            BuildImageList(filePath);
+            EnterFullscreen();
+        }
+        else
+        {
+            std::wstring msg = g_lastLoadError.empty()
+                ? L"Failed to load image."
+                : g_lastLoadError;
+            MessageBox(hWnd, msg.c_str(), L"Error", MB_ICONERROR);
+        }
     }
     break;
 
