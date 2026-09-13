@@ -4,7 +4,7 @@ A lightweight, GPU-accelerated image viewer for Windows with a focus on smooth a
 
 Built with Direct2D, Direct3D 11, and WIC (Windows Imaging Component).
 
-## **Download Windows installer** (latest release) [here](https://github.com/LuisJalabert/Picasso-Pictures/releases/download/1.6/PicassoPicturesSetup_1.6.exe)
+## **Download Windows installer** (latest release) [here](https://github.com/LuisJalabert/Picasso-Pictures/releases/download/1.7/PicassoPicturesSetup_1.7.exe)
 
 [Bug reports](mailto:luisjalabert@gmail.com)
 
@@ -31,7 +31,7 @@ Built with Direct2D, Direct3D 11, and WIC (Windows Imaging Component).
 
 ## Supported Formats
 
-`JPG` · `JPEG` · `PNG` · `BMP` · `GIF` (animated) · `TIFF` · `TIF` · `WEBP` (animated) · `AVIF` · `JXL`
+`JPG` · `JPEG` · `PNG` · `BMP` · `GIF` (animated) · `TIFF` · `TIF` · `WEBP` (animated) · `AVIF` (animated) · `JXL`
 
 ---
 
@@ -101,7 +101,8 @@ Buttons appear when your mouse moves near the bottom of the screen (or the top-r
 | Copy image | Copy image to clipboard |
 | Delete | Send to Recycle Bin (`Shift` for permanent delete) |
 | Open containing folder | Opens Explorer with the file selected |
-| Properties | Shows file properties dialog |
+| Properties | Shows image properties |
+| View metadata | Shows file embedded metadata |
 | Set as wallpaper | Sets the image as the desktop wallpaper |
 
 ---
@@ -126,6 +127,7 @@ Click the **☰** button (top-left) to access:
 | Keyboard shortcuts | Shows all keyboard shortcuts |
 | About | Version and credits |
 | High quality filter | Toggles between trilinear (fast, default) and bicubic (slower, maximum quality) rendering. Setting is saved automatically. |
+| Open images fit to screen | Chooses whether to open images at 100% resolution or fit to screen size |
 | Associate file types | Registers Picasso Pictures as the default viewer for all supported image formats |
 
 ---
@@ -137,8 +139,18 @@ Click the **☰** button (top-left) to access:
 - Visual Studio 2019 or later
 - Windows SDK 10.0+
 
-**Dependencies** (all system libraries, no external packages needed):
+**Dependencies**:
 `d2d1` · `d3d11` · `dxgi` · `dxguid` · `dwrite` · `windowscodecs` · `dwmapi` · `uxtheme` · `shell32` · `comctl32` · `d3dcompiler`
+
+
+** Third-party image codecs (bundled so users don't need OS/Store codecs) **
+Get these via vcpkg (recommended):
+
+  vcpkg install libavif dav1d libjxl
+
+Both build as static libs with the x64-windows-static (or -static-md) triplet, so no extra DLLs need to ship alongside PicassoPictures.exe.
+Library names below match the mainstream vcpkg port output as of this writing — if your build reports different .lib names (this has shifted across libavif/libjxl releases), check vcpkg's install output and adjust the #pragma comment lines to match.
+`avif/avif.h` · `jxl/decode.h` · `jxl/thread_parallel_runner.h`
 
 Open `Picasso Pictures.sln` in Visual Studio and build in Release x64.
 
