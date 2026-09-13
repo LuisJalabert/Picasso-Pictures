@@ -19,6 +19,8 @@
 #include <dwrite.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shlwapi.h>
+#pragma comment(lib, "Shlwapi.lib")
 #include <filesystem>
 #include <dwmapi.h>
 #include <uxtheme.h>
@@ -35,9 +37,21 @@
 #include <wrl.h>
 #include <d2d1effects.h>
 #include <unordered_map>
+#include <d3dcompiler.h>
+
+// ---- Third-party image codecs (bundled so users don't need OS/Store codecs) ----
+// Get these via vcpkg (recommended):
+//     vcpkg install libavif dav1d libjxl
+// Both build as static libs with the x64-windows-static (or -static-md)
+// triplet, so no extra DLLs need to ship alongside PicassoPictures.exe.
+// Library names below match the mainstream vcpkg port output as of this
+// writing — if your build reports different .lib names (this has shifted
+// across libavif/libjxl releases), check vcpkg's install output and adjust
+// the #pragma comment lines to match.
 #include <avif/avif.h>
 #include <jxl/decode.h>
 #include <jxl/thread_parallel_runner.h>
+
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "d2d1.lib")
@@ -51,7 +65,7 @@
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "d3dcompiler.lib")
-#include <d3dcompiler.h>
+
 
 using Microsoft::WRL::ComPtr;
 
@@ -90,12 +104,18 @@ constexpr int IDM_CTX_DELETE      = 2002;
 constexpr int IDM_CTX_OPEN_FOLDER = 2003;
 constexpr int IDM_CTX_PROPERTIES  = 2004;
 constexpr int IDM_CTX_WALLPAPER   = 2005;
+constexpr int IDM_CTX_METADATA    = 2006;
+
+// Metadata viewer window control IDs
+constexpr int IDC_METADATA_EDIT       = 4001;
+constexpr int IDC_METADATA_SELECTALL  = 4002;
 
 // Hamburger menu command IDs
 constexpr int IDM_MENU_SHORTCUTS  = 3001;
 constexpr int IDM_MENU_ABOUT      = 3002;
 constexpr int IDM_MENU_ASSOCIATE  = 3003;
 constexpr int IDM_MENU_HQ_FILTER  = 3004;
+constexpr int IDM_MENU_FIT_TO_SCREEN = 3005;
 
 // Global Variables:
 HINSTANCE                                           hInst;                              // current instance
@@ -135,7 +155,18 @@ bool                                                g_isExiting = false;
 // the render loop can display them.
 bool                                                g_navPendingRender = false;
 bool                                                g_fullScreenInitDone = false;
-bool                                                g_suppressFullscreenExit = false;  // true while a owned dialog (e.g. file open) has focus
+// Reference count of active "don't exit fullscreen" scopes. A plain bool
+// here is fragile: any early return/break between setting it true and
+// setting it false again leaves fullscreen-exit permanently disabled.
+// Use FullscreenExitSuppressor (RAII, defined below) instead of touching
+// this directly — it can't be forgotten because the destructor always runs.
+// This should only be needed for UI that steals OS foreground activation
+// without going through a real owned window (see FullscreenExitSuppressor
+// comment below) — anything created as an owned window of g_mainWindow /
+// g_overlayWindow (DialogBox, MessageBox, our own CreateWindowExW popups,
+// common dialogs with hwndOwner set) is recognized automatically by
+// IsOwnedByOurWindow() in WM_ACTIVATE and needs no manual suppression at all.
+int                                                 g_suppressFullscreenExitDepth = 0;
 std::vector<std::wstring>                           g_imageFiles;
 int                                                 g_currentImageIndex = -1;
 std::wstring                                        g_currentFilePath;
@@ -150,13 +181,35 @@ ComPtr<IDWriteTextFormat>                           g_textFormat;
 bool                                                g_launchedWithFile = false;
 float                                               g_smooth = 0.13f;
 bool                                                g_pendingPreserveView = false;
-std::vector<ComPtr<IWICBitmapSource>>               g_gifFrames;
-std::vector<ComPtr<ID2D1Bitmap>>                    g_gifD2DBitmaps;         // pre-uploaded GPU bitmaps for each GIF frame
-std::vector<ComPtr<ID3D11ShaderResourceView>>       g_gifD3DSRVs;            // pre-uploaded D3D11 mip SRVs for each GIF frame
-ULONGLONG                                           g_lastGifFrameTime = 0;
-std::vector<UINT>                                   g_gifFrameDelays;
-UINT                                                g_currentGifFrame = 0;
-bool                                                g_isAnimatedGif = false;
+// ---- Animated-image playback state (shared by GIF, WebP, and AVIF) ----
+// Every animated format this app supports (GIF, WebP, and AVIF) is decoded
+// into this same set of frame vectors and played back through the same code
+// in UpdateEngine/RecreateImageBitmap — only the per-frame *decode* routine
+// differs (DecodeGifCompositeFrames / DecodeWebpFrames / DecodeAvifFrames),
+// because GIF frames must be composited against prior frames' disposal
+// state, while WebP and AVIF frames each decode (or seek) independently.
+// See LoadImageD2D for where the three formats' loaders meet back up and
+// populate this shared state.
+std::vector<ComPtr<IWICBitmapSource>>               g_animFrames;
+std::vector<ComPtr<ID2D1Bitmap>>                    g_animD2DBitmaps;         // pre-uploaded GPU bitmaps for each animation frame
+std::vector<ComPtr<ID3D11ShaderResourceView>>       g_animD3DSRVs;            // pre-uploaded D3D11 mip SRVs for each animation frame (stays null; animated images skip the mip pipeline)
+ULONGLONG                                           g_lastAnimFrameTime = 0;
+std::vector<UINT>                                   g_animFrameDelays;
+UINT                                                g_currentAnimFrame = 0;
+bool                                                g_isAnimatedImage = false;   // true for animated GIF, animated WebP, and animated AVIF alike
+// ---- Background animated-frame decoding ----
+// Frame 0 is decoded synchronously in LoadImageD2D so the window can open
+// immediately; every later frame is decoded/composited on this thread. For
+// GIF specifically this can't be parallelized across frames (disposal makes
+// frames inherently sequential - frame N's canvas state depends on frame
+// N-1's disposal), only moved off the UI thread; WebP frames are independent
+// but are still decoded on this same background thread for a uniform
+// loading path. g_animFramesReadyUpTo is the count of frames, starting from
+// 0, that are safe to display right now; it only ever grows, and only this
+// thread writes past index 0.
+std::thread                                         g_animDecodeThread;
+std::atomic<bool>                                   g_animDecodeStop{ false };
+std::atomic<int>                                    g_animFramesReadyUpTo{ 0 };
 ComPtr<ID3D11Device>                                g_d3dDevice;
 ComPtr<ID3D11DeviceContext>                         g_d3dContext;
 ComPtr<ID2D1Device>                                 g_d2dDevice;
@@ -186,6 +239,7 @@ ComPtr<ID3D11DepthStencilState>                     g_imageDS;
 ComPtr<ID3D11RenderTargetView>                      g_swapRTV;              // RTV wrapping swap-chain buffer 0
 bool                                                g_mipPipelineReady = false;
 bool                                                g_useHQFilter      = false;  // when true, forces D2D HIGH_QUALITY_CUBIC instead of D3D11 trilinear
+bool                                                g_openFitToScreen  = false;  // when true, images open scaled to fit the screen instead of 100%
 
 // Custom window message posted by the directory watcher thread
 #define WM_APP_DIRCHANGE  (WM_APP + 1)
@@ -261,6 +315,7 @@ constexpr UINT                                      SLIDESHOW_INTERVAL_MS       
 bool                                                g_slideshowPreFade           = false; // true from button-press until first overlay Present()
 float                                               g_slideshowPreFadeAlpha      = 0.0f;  // 0=current view visible, 1=fully black
 HWND                                                g_blackCoverWindow           = nullptr;
+HWND                                                g_metadataViewerWnd          = nullptr;
 
 // ---- Fullscreen exit fade ----
 // While g_pendingExitFullscreen is true the overlay stays alive while
@@ -295,6 +350,58 @@ void UpdateTargetZoom(float newZoom);
 void EnterFullscreen(bool preserveView, bool needsDelay);
 void ExitFullscreen(bool immediate = false);
 static void CompleteExitFullscreen();
+
+// ---- Fullscreen exit suppression ---------------------------------------
+//
+// WM_ACTIVATE(WA_INACTIVE) fires on g_mainWindow/g_overlayWindow whenever
+// OS foreground activation moves away from them — both for a genuine
+// focus loss (Alt+Tab, clicking another app) and for the harmless case of
+// one of our *own* windows (About box, metadata viewer, a common dialog)
+// taking focus. We only want to exit fullscreen for the former.
+//
+// WM_ACTIVATE's lParam gives us the HWND that is becoming active, so we
+// can tell the two cases apart structurally: walk that window's owner
+// chain and see if it leads back to one of our own top-level windows.
+// Any window we create as an *owned* window (DialogBox's parent hWnd,
+// MessageBox's hWnd, CreateWindowExW's hWndParent, a common dialog's
+// hwndOwner) is caught by this automatically — no per-call-site flag to
+// remember. That means new dialogs added later are safe by default,
+// instead of silently missing suppression until someone notices (as
+// happened with one of the context-menu handlers under the old scheme,
+// where the manual flag was simply never added at that call site).
+//
+// NOTE: IDM_CTX_PROPERTIES used to invoke the shell's external "Properties"
+// verb, which wasn't one of our own owned windows and so needed manual
+// carve-out here. It's since been replaced by ShowImageProperties(), an
+// in-app DialogBox (IDD_PROPERTIES, same style of bespoke dialog template
+// as "Keyboard shortcuts"), so it's now covered automatically by
+// IsOwnedByOurWindow() like everything else — no special case needed.
+//
+// A manual suppression scope (FullscreenExitSuppressor) is only needed
+// for UI that steals foreground activation *without* being an owned
+// window of ours — e.g. temporarily forcing foreground onto our own
+// window before TrackPopupMenu. Use it as an RAII guard, never as a
+// raw true/false pair: the destructor always runs, so it can't be left
+// stuck on by an early return/break the way the old bool could.
+static bool IsOwnedByOurWindow(HWND hwnd)
+{
+    HWND w = hwnd;
+    for (int i = 0; w != nullptr && i < 8; ++i)   // bounded: owner chains are shallow
+    {
+        if (w == g_mainWindow || w == g_overlayWindow)
+            return true;
+        w = GetWindow(w, GW_OWNER);
+    }
+    return false;
+}
+
+struct FullscreenExitSuppressor
+{
+    FullscreenExitSuppressor()  { ++g_suppressFullscreenExitDepth; }
+    ~FullscreenExitSuppressor() { --g_suppressFullscreenExitDepth; }
+    FullscreenExitSuppressor(const FullscreenExitSuppressor&) = delete;
+    FullscreenExitSuppressor& operator=(const FullscreenExitSuppressor&) = delete;
+};
 void EnterSlideshowMode();
 void ExitSlideshowMode();
 void CreateSlideshowBgBitmap();
@@ -321,10 +428,45 @@ void OpenNextImage(HWND hWnd);
 void OpenPrevImage(HWND hWnd);
 void DeleteCurrentImage(HWND hWnd, bool permanent);
 void AssociateFileTypes(HWND hWnd);
+void ShowImageMetadata(HWND hWnd);
+void ShowImageProperties(HWND hWnd);
+INT_PTR CALLBACK PropertiesDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
+void ShowMetadataViewerWindow(HWND owner, const std::wstring& title, const std::wstring& body);
 bool ZoomIntoImage(HWND hWnd, short delta, POINT* optionalPt);
 void MakeZoomVisible(HWND hWnd);
 void StopThumbnailLoader();
 void StartThumbnailLoader();
+static void StopAnimDecodeThread();
+static UINT DecodeGifCompositeFrames(
+    IWICImagingFactory* wicFactory,
+    IWICBitmapDecoder* decoder,
+    UINT frameCount,
+    UINT maxFrames,
+    const std::atomic<bool>* stopFlag,
+    UINT* outCanvasW,
+    UINT* outCanvasH,
+    const std::function<void(UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)>& onFrame);
+static UINT DecodeWebpFrames(
+    IWICImagingFactory* wicFactory,
+    IWICBitmapDecoder* decoder,
+    UINT frameCount,
+    UINT startFrame,
+    UINT maxFrames,
+    const std::atomic<bool>* stopFlag,
+    UINT* outW,
+    UINT* outH,
+    const std::function<void(UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)>& onFrame);
+static UINT DecodeAvifFrames(
+    const wchar_t* path,
+    IWICImagingFactory* wicFactory,
+    UINT startFrame,
+    UINT maxFrames,
+    const std::atomic<bool>* stopFlag,
+    UINT* outW,
+    UINT* outH,
+    const std::function<void(UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)>& onFrame,
+    std::wstring* outReason = nullptr);
+static UINT AvifPeekFrameCount(const wchar_t* path);
 void DrawThumbnailStrip(float visibility);
 void StartDirectoryWatcher(const std::wstring& dir);
 void StopDirectoryWatcher();
@@ -433,6 +575,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         RegGetValueW(HKEY_CURRENT_USER, L"Software\\PicassoPictures",
                      L"HQFilter", RRF_RT_REG_DWORD, nullptr, &hqVal, &cb);
         g_useHQFilter = (hqVal != 0);
+
+        DWORD fitVal = 0; cb = sizeof(fitVal);
+        RegGetValueW(HKEY_CURRENT_USER, L"Software\\PicassoPictures",
+                     L"FitToScreen", RRF_RT_REG_DWORD, nullptr, &fitVal, &cb);
+        g_openFitToScreen = (fitVal != 0);
     }
 
     if (FAILED(CoInitialize(nullptr)))
@@ -816,8 +963,8 @@ void DiscardDeviceResources()
     g_slideshowBgBitmap.Reset();
     g_prevSlideshowBgBitmap.Reset();
     g_prevD2DBitmap.Reset();
-    g_gifD2DBitmaps.clear();
-    g_gifD3DSRVs.clear();
+    g_animD2DBitmaps.clear();
+    g_animD3DSRVs.clear();
 
     // Clear GPU-side thumbnail bitmaps (WIC source survives for re-upload)
     for (auto& t : g_thumbs)
@@ -858,34 +1005,47 @@ void DiscardDeviceResources()
 
 void UpdateEngine(float dt)
 {
-    if (g_isAnimatedGif && !g_gifFrames.empty())
+    if (g_isAnimatedImage && !g_animFrames.empty())
     {
         ULONGLONG now = GetTickCount64();
-        if (now - g_lastGifFrameTime >= g_gifFrameDelays[g_currentGifFrame])
+        if (now - g_lastAnimFrameTime >= g_animFrameDelays[g_currentAnimFrame])
         {
-            g_currentGifFrame =
-                (g_currentGifFrame + 1) % g_gifFrames.size();
+            const UINT nextFrame = (g_currentAnimFrame + 1) % g_animFrames.size();
+            const UINT readyCount = (UINT)max(0, g_animFramesReadyUpTo.load());
 
-            // Already uploaded? Just swap the pointer — no CPU→GPU work.
-            if (g_currentGifFrame < g_gifD2DBitmaps.size() && g_gifD2DBitmaps[g_currentGifFrame])
+            // While the background decode thread is still working through a
+            // large animated image (GIF, WebP, or AVIF), don't advance past
+            // the last frame it's actually produced yet (this also blocks
+            // wrapping around to frame 0 before the tail end of a long
+            // animation has been decoded even once). Just hold on the
+            // current frame and check again next tick — once fully caught
+            // up, readyCount == frame count and this condition is always
+            // true, i.e. normal playback resumes.
+            if (nextFrame < readyCount || readyCount >= g_animFrames.size())
             {
-                g_d2dBitmap = g_gifD2DBitmaps[g_currentGifFrame];
-                g_imageSRV.Reset();  // animated formats never carry a mip SRV
-            }
-            else
-            {
-                // First time reaching this frame: decode/upload it now, and
-                // cache the result so it's never re-uploaded on later loops.
-                g_wicBitmapSource = g_gifFrames[g_currentGifFrame];
-                RecreateImageBitmap();
+                g_currentAnimFrame = nextFrame;
 
-                if (g_currentGifFrame < g_gifD2DBitmaps.size())
-                    g_gifD2DBitmaps[g_currentGifFrame] = g_d2dBitmap;
-                if (g_currentGifFrame < g_gifD3DSRVs.size())
-                    g_gifD3DSRVs[g_currentGifFrame] = g_imageSRV;  // stays null (animated = no mips)
+                // Already uploaded? Just swap the pointer — no CPU→GPU work.
+                if (g_currentAnimFrame < g_animD2DBitmaps.size() && g_animD2DBitmaps[g_currentAnimFrame])
+                {
+                    g_d2dBitmap = g_animD2DBitmaps[g_currentAnimFrame];
+                    g_imageSRV.Reset();  // animated formats never carry a mip SRV
+                }
+                else
+                {
+                    // First time reaching this frame: decode/upload it now, and
+                    // cache the result so it's never re-uploaded on later loops.
+                    g_wicBitmapSource = g_animFrames[g_currentAnimFrame];
+                    RecreateImageBitmap();
+
+                    if (g_currentAnimFrame < g_animD2DBitmaps.size())
+                        g_animD2DBitmaps[g_currentAnimFrame] = g_d2dBitmap;
+                    if (g_currentAnimFrame < g_animD3DSRVs.size())
+                        g_animD3DSRVs[g_currentAnimFrame] = g_imageSRV;  // stays null (animated = no mips)
+                }
             }
 
-            g_lastGifFrameTime = now;
+            g_lastAnimFrameTime = now;
         }
     }
 
@@ -2541,7 +2701,7 @@ void RecreateImageBitmap()
 
     // Also build the D3D11 mip texture for cache-friendly trilinear rendering.
     // We pass the (possibly downscaled) WIC source so the texture matches the D2D bitmap size.
-    if (g_mipPipelineReady && !g_isAnimatedGif)
+    if (g_mipPipelineReady && !g_isAnimatedImage)
     {
         CreateMipTextureFromSource(bitmapSourceForD2D.Get());
 
@@ -2550,7 +2710,7 @@ void RecreateImageBitmap()
         // This small bitmap is created once per image load and reused every frame.
         g_shadowSourceBitmap = ExtractMipAsD2DBitmap(256u);
     }
-    else if (g_isAnimatedGif)
+    else if (g_isAnimatedImage)
     {
         // Animated formats: skip the D3D11 mip chain entirely (no benefit -
         // trilinear filtering isn't worth a per-frame upload+GenerateMips
@@ -2593,8 +2753,10 @@ void InitializeImageLayout(HWND hWnd, bool hard = false)
     else
         g_overlayAlpha = 0.0f;
 
-    // If image is larger than screen, scale down to ~95% of screen
-    if (g_isSlideshowMode || fitW > windowWidth || fitH > windowHeight)
+    // If image is larger than screen, scale down to ~95% of screen.
+    // g_openFitToScreen forces the same fit-to-screen scaling used by
+    // slideshow mode even when the image would otherwise open at 100%.
+    if (g_isSlideshowMode || g_openFitToScreen || fitW > windowWidth || fitH > windowHeight)
     {
         float scaleX = (windowWidth  * 0.95f) / fitW;
         float scaleY = (windowHeight * 0.95f) / fitH;
@@ -2701,13 +2863,38 @@ void InitializeMenuButtons()
             AppendMenuW(hMenu, MF_SEPARATOR, 0,                            nullptr);
             AppendMenuW(hMenu, MF_STRING | (g_useHQFilter ? MF_CHECKED : MF_UNCHECKED),
                                                       IDM_MENU_HQ_FILTER, L"High quality filter");
+            AppendMenuW(hMenu, MF_STRING | (g_openFitToScreen ? MF_CHECKED : MF_UNCHECKED),
+                                                      IDM_MENU_FIT_TO_SCREEN, L"Open images fit to screen");
             AppendMenuW(hMenu, MF_SEPARATOR, 0,                            nullptr);
             AppendMenuW(hMenu, MF_STRING,             IDM_MENU_ASSOCIATE, L"Associate file types");
 
             POINT pt;
             GetCursorPos(&pt);
-            SetForegroundWindow(g_mainWindow);
-            TrackPopupMenu(hMenu, TPM_LEFTBUTTON, pt.x, pt.y, 0, g_mainWindow, nullptr);
+            // Anchor the menu (and shift foreground) to whichever window is
+            // actually visible/interactive right now — the overlay in
+            // fullscreen, the main window otherwise. Hardcoding g_mainWindow
+            // here was the real problem: in fullscreen it permanently dragged
+            // OS foreground/activation onto the invisible main window and
+            // never gave it back, so the very next real click on the image
+            // (landing on the overlay) triggered a genuine main->overlay
+            // activation switch that looked like focus loss and exited
+            // fullscreen — even though the menu interaction itself was fine.
+            HWND ownerWnd = (g_isFullscreen && g_overlayWindow && IsWindow(g_overlayWindow))
+                                ? g_overlayWindow
+                                : g_mainWindow;
+            // TrackPopupMenu's internal menu window isn't a window we own
+            // (IsOwnedByOurWindow won't recognize it), and SetForegroundWindow
+            // itself is what fires WA_INACTIVE (it steals activation) — so this
+            // needs an explicit suppression scope, opened BEFORE shifting
+            // foreground focus, covering both calls. It closes automatically
+            // when the guard goes out of scope after TrackPopupMenu returns,
+            // so a genuine focus loss (Alt+Tab, etc.) still exits fullscreen
+            // normally afterward.
+            {
+                FullscreenExitSuppressor guard;
+                SetForegroundWindow(ownerWnd);
+                TrackPopupMenu(hMenu, TPM_LEFTBUTTON, pt.x, pt.y, 0, ownerWnd, nullptr);
+            }
             DestroyMenu(hMenu);
         });
     g_buttons[BUTTON_HELP].UpdateLayout(g_renderTarget.Get());
@@ -3141,16 +3328,16 @@ void Render(HWND hWnd)
     // On device loss, GIF D2D bitmaps are cleared — re-upload only the frame
     // currently on screen. The rest are re-created lazily by UpdateEngine as
     // playback reaches them, same as the initial-load path.
-    if (g_isAnimatedGif && !g_gifFrames.empty() && g_gifD2DBitmaps.empty())
+    if (g_isAnimatedImage && !g_animFrames.empty() && g_animD2DBitmaps.empty())
     {
-        g_gifD2DBitmaps.assign(g_gifFrames.size(), nullptr);
-        g_gifD3DSRVs.assign(g_gifFrames.size(), nullptr);
+        g_animD2DBitmaps.assign(g_animFrames.size(), nullptr);
+        g_animD3DSRVs.assign(g_animFrames.size(), nullptr);
 
-        if (g_currentGifFrame < g_gifFrames.size())
+        if (g_currentAnimFrame < g_animFrames.size())
         {
             ComPtr<ID2D1Bitmap> bmp;
-            g_renderTarget->CreateBitmapFromWicBitmap(g_gifFrames[g_currentGifFrame].Get(), nullptr, &bmp);
-            g_gifD2DBitmaps[g_currentGifFrame] = bmp;
+            g_renderTarget->CreateBitmapFromWicBitmap(g_animFrames[g_currentAnimFrame].Get(), nullptr, &bmp);
+            g_animD2DBitmaps[g_currentAnimFrame] = bmp;
             g_d2dBitmap = bmp;
         }
     }
@@ -3678,132 +3865,264 @@ static std::wstring SniffIsobmffBrands(const wchar_t* path)
     return result;
 }
 
-static bool DecodeAvifToWicBitmap(const wchar_t* path, IWICImagingFactory* wicFactory, ComPtr<IWICBitmap>& outBitmap, UINT& outW, UINT& outH, std::wstring* outReason)
+// avifResultToString() returns a narrow (const char*) string — convert to
+// wide so it can flow into g_lastLoadError / MessageBox alongside every
+// other error path in this file. Shared by every AVIF failure path below.
+static std::wstring AvifResultToWide(avifResult r)
 {
-    auto fail = [&](const wchar_t* why) -> bool
-    {
-        if (outReason) *outReason = why;
-        return false;
-    };
-    // avifResultToString() returns a narrow (const char*) string — convert
-    // to wide so it can flow into g_lastLoadError / MessageBox alongside
-    // everything else.
-    auto failAvif = [&](avifResult r) -> bool
-    {
-        if (outReason)
-        {
-            const char* narrow = avifResultToString(r);
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, narrow, -1, nullptr, 0);
-            if (wlen > 0)
-            {
-                std::wstring wide(wlen, L'\0');
-                MultiByteToWideChar(CP_UTF8, 0, narrow, -1, wide.data(), wlen);
-                if (!wide.empty() && wide.back() == L'\0') wide.pop_back();
-                *outReason = wide;
-            }
-        }
-        return false;
-    };
+    const char* narrow = avifResultToString(r);
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, narrow, -1, nullptr, 0);
+    if (wlen <= 0) return L"";
+    std::wstring wide(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, narrow, -1, wide.data(), wlen);
+    if (!wide.empty() && wide.back() == L'\0') wide.pop_back();
+    return wide;
+}
 
+// Creates an avifDecoder, points it at the given file, and parses the
+// container (reads its box structure and frame count, but doesn't decode
+// any pixel data yet). Shared by every AVIF entry point below — the
+// static-image decode, the animated per-frame decode, and the frame-count
+// peek LoadImageD2D uses to choose between them all start with exactly
+// this. Caller owns the returned decoder and must call avifDecoderDestroy()
+// on it; returns nullptr on failure.
+static avifDecoder* AvifOpenAndParse(const wchar_t* path, std::wstring* outReason = nullptr)
+{
     int utf8Len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr, nullptr);
-    if (utf8Len <= 0) return fail(L"invalid file path");
+    if (utf8Len <= 0)
+    {
+        if (outReason) *outReason = L"invalid file path";
+        return nullptr;
+    }
     std::string utf8Path(utf8Len, '\0');
     WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8Path.data(), utf8Len, nullptr, nullptr);
 
     avifDecoder* decoder = avifDecoderCreate();
-    if (!decoder) return fail(L"couldn't create AVIF decoder");
-
-    bool ok = false;
+    if (!decoder)
+    {
+        if (outReason) *outReason = L"couldn't create AVIF decoder";
+        return nullptr;
+    }
 
     avifResult r = avifDecoderSetIOFile(decoder, utf8Path.c_str());
     if (r != AVIF_RESULT_OK)
     {
-        failAvif(r);
+        if (outReason) *outReason = AvifResultToWide(r);
+        avifDecoderDestroy(decoder);
+        return nullptr;
     }
-    else if ((r = avifDecoderParse(decoder)) != AVIF_RESULT_OK)
+
+    r = avifDecoderParse(decoder);
+    if (r != AVIF_RESULT_OK)
     {
         // Most common real-world cause of "some AVIF files won't open": a
         // container libavif's demuxer can't parse (truncated file, unusual
         // brand, or a feature this libavif build wasn't compiled with).
         // Sniff the ftyp box so the error names the actual problem instead
         // of just repeating libavif's generic "BMFF parsing failed".
-        failAvif(r);
         if (outReason)
         {
+            *outReason = AvifResultToWide(r);
             std::wstring brands = SniffIsobmffBrands(path);
             if (!brands.empty())
                 *outReason += L" - " + brands;
         }
+        avifDecoderDestroy(decoder);
+        return nullptr;
     }
-    else if ((r = avifDecoderNextImage(decoder)) != AVIF_RESULT_OK)
+
+    return decoder;
+}
+
+// Converts a decoded avifImage's pixels to a premultiplied-alpha WIC
+// bitmap. Shared by the static (single still image) and animated
+// (per-frame) AVIF decode paths below — the YUV→RGB conversion and WIC
+// wrapping is identical either way; only where the avifImage comes from
+// (decoder->image after avifDecoderNextImage vs. avifDecoderNthImage)
+// differs.
+static bool ConvertAvifImageToWicBitmap(const avifImage* image, IWICImagingFactory* wicFactory,
+    ComPtr<IWICBitmap>& outBitmap, UINT& outW, UINT& outH, std::wstring* outReason = nullptr)
+{
+    auto fail = [&](const wchar_t* why) -> bool
     {
-        // Most common cause here: 10/12-bit HDR content, or a AV1 profile
-        // dav1d in this build doesn't support.
-        failAvif(r);
+        if (outReason) *outReason = why;
+        return false;
+    };
+
+    avifRGBImage rgb;
+    avifRGBImageSetDefaults(&rgb, image);
+    rgb.format = AVIF_RGB_FORMAT_BGRA;   // byte order WIC's 32bppBGRA expects
+    rgb.depth  = 8;                      // downconvert HDR bit depths to 8-bit for display
+
+    if (avifRGBImageAllocatePixels(&rgb) != AVIF_RESULT_OK)
+        return fail(L"couldn't allocate pixel buffer");
+
+    avifResult r = avifImageYUVToRGB(image, &rgb);
+    if (r != AVIF_RESULT_OK)
+    {
+        if (outReason) *outReason = AvifResultToWide(r);
+        avifRGBImageFreePixels(&rgb);
+        return false;
+    }
+
+    bool ok = false;
+    ComPtr<IWICBitmap> straight;
+    if (FAILED(wicFactory->CreateBitmapFromMemory(
+            rgb.width, rgb.height,
+            GUID_WICPixelFormat32bppBGRA,   // straight (non-premultiplied) alpha
+            rgb.rowBytes,
+            rgb.rowBytes * rgb.height,
+            rgb.pixels,
+            straight.GetAddressOf())))
+    {
+        fail(L"WIC couldn't wrap the decoded pixels");
     }
     else
     {
-        avifRGBImage rgb;
-        avifRGBImageSetDefaults(&rgb, decoder->image);
-        rgb.format = AVIF_RGB_FORMAT_BGRA;   // byte order WIC's 32bppBGRA expects
-        rgb.depth  = 8;                      // downconvert HDR bit depths to 8-bit for display
-
-        if (avifRGBImageAllocatePixels(&rgb) != AVIF_RESULT_OK)
+        ComPtr<IWICFormatConverter> conv;
+        if (FAILED(wicFactory->CreateFormatConverter(&conv)) ||
+            FAILED(conv->Initialize(straight.Get(), GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom)))
         {
-            fail(L"couldn't allocate pixel buffer");
+            fail(L"couldn't convert to premultiplied alpha");
         }
         else
         {
-            r = avifImageYUVToRGB(decoder->image, &rgb);
-            if (r != AVIF_RESULT_OK)
+            ComPtr<IWICBitmap> cached;
+            if (FAILED(wicFactory->CreateBitmapFromSource(conv.Get(), WICBitmapCacheOnLoad, &cached)))
             {
-                failAvif(r);
+                fail(L"couldn't cache the decoded bitmap");
             }
             else
             {
-                ComPtr<IWICBitmap> straight;
-                if (FAILED(wicFactory->CreateBitmapFromMemory(
-                        rgb.width, rgb.height,
-                        GUID_WICPixelFormat32bppBGRA,   // straight (non-premultiplied) alpha
-                        rgb.rowBytes,
-                        rgb.rowBytes * rgb.height,
-                        rgb.pixels,
-                        straight.GetAddressOf())))
-                {
-                    fail(L"WIC couldn't wrap the decoded pixels");
-                }
-                else
-                {
-                    ComPtr<IWICFormatConverter> conv;
-                    if (FAILED(wicFactory->CreateFormatConverter(&conv)) ||
-                        FAILED(conv->Initialize(straight.Get(), GUID_WICPixelFormat32bppPBGRA,
-                            WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom)))
-                    {
-                        fail(L"couldn't convert to premultiplied alpha");
-                    }
-                    else
-                    {
-                        ComPtr<IWICBitmap> cached;
-                        if (FAILED(wicFactory->CreateBitmapFromSource(conv.Get(), WICBitmapCacheOnLoad, &cached)))
-                        {
-                            fail(L"couldn't cache the decoded bitmap");
-                        }
-                        else
-                        {
-                            outBitmap = cached;
-                            outW = rgb.width;
-                            outH = rgb.height;
-                            ok = true;
-                        }
-                    }
-                }
+                outBitmap = cached;
+                outW = rgb.width;
+                outH = rgb.height;
+                ok = true;
             }
-            avifRGBImageFreePixels(&rgb);
         }
+    }
+
+    avifRGBImageFreePixels(&rgb);
+    return ok;
+}
+
+static bool DecodeAvifToWicBitmap(const wchar_t* path, IWICImagingFactory* wicFactory, ComPtr<IWICBitmap>& outBitmap, UINT& outW, UINT& outH, std::wstring* outReason)
+{
+    avifDecoder* decoder = AvifOpenAndParse(path, outReason);
+    if (!decoder)
+        return false;
+
+    bool ok = false;
+    avifResult r = avifDecoderNextImage(decoder);
+    if (r != AVIF_RESULT_OK)
+    {
+        // Most common cause here: 10/12-bit HDR content, or a AV1 profile
+        // dav1d in this build doesn't support.
+        if (outReason) *outReason = AvifResultToWide(r);
+    }
+    else
+    {
+        ok = ConvertAvifImageToWicBitmap(decoder->image, wicFactory, outBitmap, outW, outH, outReason);
     }
 
     avifDecoderDestroy(decoder);
     return ok;
+}
+
+// Parses just far enough to report an AVIF file's frame count, without
+// decoding any image data, so LoadImageD2D can choose between the static
+// and animated AVIF paths there. Returns 0 on any failure (including a
+// perfectly ordinary still AVIF that just has one frame) — the static
+// path's own DecodeAvifToWicBitmap call surfaces the real error message if
+// there is one.
+static UINT AvifPeekFrameCount(const wchar_t* path)
+{
+    avifDecoder* decoder = AvifOpenAndParse(path);
+    if (!decoder)
+        return 0;
+    UINT count = (UINT)decoder->imageCount;
+    avifDecoderDestroy(decoder);
+    return count;
+}
+
+// ============================================================
+//  Animated AVIF frame decode — analogous to DecodeWebpFrames above (and,
+//  through it, to DecodeGifCompositeFrames), but AVIF's own thing: it's
+//  decoded via libavif rather than WIC, so this opens its own avifDecoder
+//  from the file path instead of taking a pre-opened IWICBitmapDecoder.
+//  wicFactory is only used for the final YUV→RGB→WIC wrapping step (via
+//  ConvertAvifImageToWicBitmap) and must belong to whichever thread is
+//  calling this, same reasoning as DecodeGifCompositeFrames.
+//
+//  avifDecoderNthImage() can seek straight to any frame index — it
+//  transparently decodes forward from the nearest keyframe as needed - so
+//  like WebP, and unlike GIF's manual disposal replay, frames here don't
+//  need to be redecoded from 0 to reach an arbitrary starting point. That's
+//  what lets the background continuation for AVIF (in LoadImageD2D below)
+//  start at frame 1 directly, the same as WebP.
+// ============================================================
+static UINT DecodeAvifFrames(
+    const wchar_t* path,
+    IWICImagingFactory* wicFactory,
+    UINT startFrame,
+    UINT maxFrames,
+    const std::atomic<bool>* stopFlag,
+    UINT* outW,
+    UINT* outH,
+    const std::function<void(UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)>& onFrame,
+    std::wstring* outReason)
+{
+    if (outW) *outW = 0;
+    if (outH) *outH = 0;
+
+    avifDecoder* decoder = AvifOpenAndParse(path, outReason);
+    if (!decoder)
+        return 0;
+
+    const UINT frameCount = (UINT)decoder->imageCount;
+    if (frameCount == 0 || startFrame >= frameCount)
+    {
+        avifDecoderDestroy(decoder);
+        return 0;
+    }
+
+    const UINT endFrame = (maxFrames == 0) ? frameCount : min(startFrame + maxFrames, frameCount);
+    UINT produced = 0;
+
+    for (UINT i = startFrame; i < endFrame; ++i)
+    {
+        if (stopFlag && stopFlag->load())
+            break;
+
+        if (avifDecoderNthImage(decoder, i) != AVIF_RESULT_OK)
+            continue;
+
+        ComPtr<IWICBitmap> bmp;
+        UINT w = 0, h = 0;
+        if (!ConvertAvifImageToWicBitmap(decoder->image, wicFactory, bmp, w, h))
+            continue;
+
+        // decoder->imageTiming is populated by the NthImage call just above
+        // (duration is in seconds); AVIF delays are effectively continuous,
+        // unlike GIF/WebP's integer-millisecond delays, so this is the one
+        // place among the three formats that needs a unit conversion.
+        UINT delayMs = (UINT)(decoder->imageTiming.duration * 1000.0 + 0.5);
+        if (delayMs < 10)
+            delayMs = 100;   // fallback for degenerate/zero timing
+
+        if (produced == 0 && outW && outH)
+        {
+            *outW = w;
+            *outH = h;
+        }
+
+        onFrame(i, bmp, delayMs);
+        ++produced;
+    }
+
+    avifDecoderDestroy(decoder);
+    return produced;
 }
 
 // ============================================================
@@ -3963,146 +4282,35 @@ static bool DecodeJxlToWicBitmap(const wchar_t* path, IWICImagingFactory* wicFac
     return true;
 }
 
-bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
+// ============================================================
+//  GIF frame decode/composite — extracted so it can run identically on the
+//  main thread (just frame 0, for an immediate first paint) and on the
+//  background continuation thread (the rest of the frames). GIF disposal
+//  methods make this inherently sequential: each frame's starting canvas
+//  state depends on how the previous frame was disposed, so frames cannot
+//  be decoded out of order or in parallel — only moved off the UI thread.
+//
+//  wicFactory and decoder must both belong to whichever thread is calling
+//  this (WIC objects aren't safely shared across the apartment boundary —
+//  same reason the thumbnail loader creates its own per-thread factory).
+//  maxFrames=0 means "decode all frames"; pass 1 to get just frame 0.
+//  Returns the number of frames actually produced (onFrame was called that
+//  many times).
+// ============================================================
+static UINT DecodeGifCompositeFrames(
+    IWICImagingFactory* wicFactory,
+    IWICBitmapDecoder* decoder,
+    UINT frameCount,
+    UINT maxFrames,
+    const std::atomic<bool>* stopFlag,
+    UINT* outCanvasW,
+    UINT* outCanvasH,
+    const std::function<void(UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)>& onFrame)
 {
-    g_lastLoadError.clear();
-
-    if (!g_wicFactory || !filename || !*filename)
-        return LoadFail(L"Internal error: the image system hasn't finished initializing.");
-
-    // ---- Slideshow: snapshot current bitmap + bg before we clobber them ----
-    if (g_isSlideshowMode && g_d2dBitmap)
-    {
-        g_prevD2DBitmap         = g_d2dBitmap;
-        g_prevSlideshowBgBitmap = g_slideshowBgBitmap;
-        g_prevImageZoom         = g_zoom;
-        g_prevImageOffX         = g_offsetX;
-        g_prevImageOffY         = g_offsetY;
-        g_prevImageRotation     = g_imageRotationAngle;
-
-        // Reset so Render recreates it for the new image
-        g_slideshowBgBitmap.Reset();
-
-        // Kick off the fade-in
-        g_slideshowTransitionAlpha = 0.0f;
-        g_slideshowTargetAlpha     = 1.0f;
-    }
-        
-    // ------------------------------------------------------------
-    // Save previous image state
-    // ------------------------------------------------------------
-    if (!g_currentFilePath.empty() && g_d2dBitmap)
-    {
-    
-        D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
-
-        float panX = 0.f, panY = 0.f;
-        float targetPanX = 0.f, targetPanY = 0.f;
-
-        if (PanFromOffsets(hWnd, g_zoom, g_offsetX, g_offsetY,
-                           imgSize.width, imgSize.height, panX, panY) &&
-            PanFromOffsets(hWnd, g_targetZoom, g_targetOffsetX, g_targetOffsetY,
-                           imgSize.width, imgSize.height, targetPanX, targetPanY))
-        {
-            g_imageStates[g_currentFilePath] = {
-                g_zoom, panX, panY,
-                g_targetZoom, targetPanX, targetPanY,
-                g_imageRotationAngle, g_targetRotationAngle
-            };
-        }
-    }
-    
-    // Clear previous state
-    g_d2dBitmap.Reset();
-    g_wicBitmapSource.Reset();
-    g_gifFrames.clear();
-    g_gifFrameDelays.clear();
-    g_gifD2DBitmaps.clear();
-    g_gifD3DSRVs.clear();
-    g_isAnimatedGif = false;
-    g_currentGifFrame = 0;
-    g_lastGifFrameTime = 0;
-    g_slideshowBgBitmap.Reset();
-
-    std::wstring extLower = std::filesystem::path(filename).extension().wstring();
-    std::transform(extLower.begin(), extLower.end(), extLower.begin(), ::towlower);
-
-    // --------------------------------------------------------------
-    // AVIF / JPEG XL — decoded ourselves (bundled libavif/dav1d and
-    // libjxl), bypassing WIC's decoder registry entirely. This is what
-    // lets these formats work with no OS/Store codec installed.
-    // --------------------------------------------------------------
-    if (extLower == L".avif")
-    {
-        ComPtr<IWICBitmap> bmp;
-        UINT w = 0, h = 0;
-        std::wstring reason;
-        if (!DecodeAvifToWicBitmap(filename, g_wicFactory.Get(), bmp, w, h, &reason))
-            return LoadFail((L"This AVIF file couldn't be decoded: " + reason).c_str());
-        g_wicBitmapSource = bmp;
-        g_imageWidth   = (int)w;
-        g_imageHeight  = (int)h;
-        g_exifRotation = 0.f;  // AVIF irot/imir transforms aren't applied yet — see DecodeAvifToWicBitmap
-        return FinishImageLoad(hWnd, filename);
-    }
-    else if (extLower == L".jxl")
-    {
-        ComPtr<IWICBitmap> bmp;
-        UINT w = 0, h = 0;
-        std::wstring reason;
-        if (!DecodeJxlToWicBitmap(filename, g_wicFactory.Get(), bmp, w, h, &reason))
-            return LoadFail((L"This JPEG XL file couldn't be decoded: " + reason).c_str());
-        g_wicBitmapSource = bmp;
-        g_imageWidth   = (int)w;
-        g_imageHeight  = (int)h;
-        g_exifRotation = 0.f;
-        return FinishImageLoad(hWnd, filename);
-    }
-
-    // --------------------------------------------
-    // Decode container (everything else still goes through WIC, as before)
-    // --------------------------------------------
-
-    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
-    HRESULT hr = g_wicFactory->CreateDecoderFromFilename(
-        filename,
-        nullptr,
-        GENERIC_READ,
-        WICDecodeMetadataCacheOnLoad,
-        decoder.GetAddressOf());
-
-    if (FAILED(hr) || !decoder)
-    {
-        if (hr == WINCODEC_ERR_COMPONENTNOTFOUND)
-            return LoadFail(L"No decoder is registered for this file type on this system.", hr);
-        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))
-            return LoadFail(L"The file could not be found.", hr);
-        if (hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION))
-            return LoadFail(L"The file is in use by another program and can't be read right now.", hr);
-        return LoadFail(L"This file couldn't be opened - it may be corrupted or not a valid image.", hr);
-    }
-
-    UINT frameCount = 0;
-    hr = decoder->GetFrameCount(&frameCount);
-
-    if (FAILED(hr) || frameCount == 0)
-        return LoadFail(L"This image file has no readable frames.", hr);
-
-    GUID container = {};
-    decoder->GetContainerFormat(&container);
-
-    // GUID_ContainerFormatWebp is only present in newer Windows SDKs, so use
-    // a local GUID constant to keep the project buildable with older SDKs too.
-    static const GUID kContainerFormatWebp =
-        { 0xe094b0e2, 0x67f2, 0x45b3, { 0xb0, 0xea, 0x11, 0x53, 0x37, 0xca, 0x7c, 0xf3 } };
-
-    const bool isGifContainer  = IsEqualGUID(container, GUID_ContainerFormatGif);
-    const bool isWebpContainer = IsEqualGUID(container, kContainerFormatWebp);
-
-    // --------------------------------------------
-    // Small local helpers (avoid min/max macros)
-    // --------------------------------------------
-    
+    if (outCanvasW) *outCanvasW = 0;
+    if (outCanvasH) *outCanvasH = 0;
+    if (!wicFactory || !decoder || frameCount == 0)
+        return 0;
 
     auto imin = [](int a, int b) { return (a < b) ? a : b; };
     auto imax = [](int a, int b) { return (a > b) ? a : b; };
@@ -4145,7 +4353,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         Microsoft::WRL::ComPtr<IWICBitmap> clone;
         if (src)
         {
-            if (SUCCEEDED(g_wicFactory->CreateBitmapFromSource(
+            if (SUCCEEDED(wicFactory->CreateBitmapFromSource(
                 src, WICBitmapCacheOnLoad, clone.GetAddressOf())))
             {
                 return clone;
@@ -4187,9 +4395,8 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         if (FAILED(src->GetSize(&w, &h)) || w == 0 || h == 0)
             return false;
 
-        // Convert to 32bppPBGRA
         Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
-        HRESULT hrc = g_wicFactory->CreateFormatConverter(converter.GetAddressOf());
+        HRESULT hrc = wicFactory->CreateFormatConverter(converter.GetAddressOf());
 
         if (FAILED(hrc) || !converter)
             return false;
@@ -4209,7 +4416,6 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 
         if (optionalCopyRect)
         {
-            // Clamp copy rect to source bounds
             int cx = imax(0, optionalCopyRect->X);
             int cy = imax(0, optionalCopyRect->Y);
             int cw = imin(optionalCopyRect->Width,  (int)w - cx);
@@ -4235,8 +4441,6 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         if (FAILED(hrc))
             return false;
 
-        // CRITICAL: enforce correct premultiplied invariant:
-        // if A==0 then RGB MUST be 0, or you get dark speckles/noise.
         for (size_t p = 0; p + 3 < outPixels.size(); p += 4)
         {
             if (outPixels[p + 3] == 0)
@@ -4323,7 +4527,6 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
                     continue;
                 }
 
-                // Premultiplied source-over
                 const UINT inv = 255u - sa;
                 const UINT db = dRow[x * 4 + 0];
                 const UINT dg = dRow[x * 4 + 1];
@@ -4338,247 +4541,795 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
         }
     };
 
+    // Logical screen size (canvas size)
+    UINT canvasW = 0, canvasH = 0;
+    {
+        Microsoft::WRL::ComPtr<IWICMetadataQueryReader> decMeta;
+        if (SUCCEEDED(decoder->GetMetadataQueryReader(decMeta.GetAddressOf())) && decMeta)
+        {
+            ReadUIntMeta(decMeta.Get(), L"/logscrdesc/Width",  canvasW);
+            ReadUIntMeta(decMeta.Get(), L"/logscrdesc/Height", canvasH);
+        }
+    }
+    if (canvasW == 0 || canvasH == 0)
+    {
+        Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> f0;
+        if (SUCCEEDED(decoder->GetFrame(0, f0.GetAddressOf())) && f0)
+            f0->GetSize(&canvasW, &canvasH);
+    }
+    if (canvasW == 0 || canvasH == 0)
+        return 0;
+
+    if (outCanvasW) *outCanvasW = canvasW;
+    if (outCanvasH) *outCanvasH = canvasH;
+
+    Microsoft::WRL::ComPtr<IWICBitmap> canvas;
+    HRESULT hr = wicFactory->CreateBitmap(
+        canvasW, canvasH, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, canvas.GetAddressOf());
+    if (FAILED(hr) || !canvas)
+        return 0;
+
+    ClearRect(canvas.Get(), WICRect{ 0, 0, (INT)canvasW, (INT)canvasH });
+    UINT prevDisposal = 0;
+    WICRect prevFrameRect{ 0,0,0,0 };
+    Microsoft::WRL::ComPtr<IWICBitmap> savedCanvasForDisposal3;
+
+    const UINT limit = (maxFrames == 0) ? frameCount : min(maxFrames, frameCount);
+    UINT produced = 0;
+
+    for (UINT i = 0; i < limit; ++i)
+    {
+        if (stopFlag && stopFlag->load())
+            break;
+
+        if (i > 0)
+        {
+            if (prevDisposal == 2)
+            {
+                if (prevFrameRect.Width > 0 && prevFrameRect.Height > 0)
+                    ClearRect(canvas.Get(), prevFrameRect);
+            }
+            else if (prevDisposal == 3 && savedCanvasForDisposal3)
+            {
+                canvas = savedCanvasForDisposal3;
+                savedCanvasForDisposal3.Reset();
+            }
+        }
+
+        Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+        if (FAILED(decoder->GetFrame(i, frame.GetAddressOf())) || !frame)
+            continue;
+
+        UINT left = 0, top = 0;
+        UINT w = 0, h = 0;
+        UINT disposal = 0;
+        UINT delayMs = 100;
+        UINT frameW = 0, frameH = 0;
+        frame->GetSize(&frameW, &frameH);
+        Microsoft::WRL::ComPtr<IWICMetadataQueryReader> meta;
+
+        if (SUCCEEDED(frame->GetMetadataQueryReader(meta.GetAddressOf())) && meta)
+        {
+            ReadUIntMeta(meta.Get(), L"/imgdesc/Left",   left);
+            ReadUIntMeta(meta.Get(), L"/imgdesc/Top",    top);
+            ReadUIntMeta(meta.Get(), L"/imgdesc/Width",  w);
+            ReadUIntMeta(meta.Get(), L"/imgdesc/Height", h);
+            ReadUIntMeta(meta.Get(), L"/grctlext/Disposal", disposal);
+            UINT delay10ms = 0;
+            if (ReadUIntMeta(meta.Get(), L"/grctlext/Delay", delay10ms))
+                delayMs = delay10ms * 10;
+        }
+
+        if (delayMs < 10) delayMs = 100;
+        if (w == 0) w = frameW;
+        if (h == 0) h = frameH;
+        if (left >= canvasW || top >= canvasH)
+            continue;
+
+        const UINT dstW = umin(w, canvasW - left);
+        const UINT dstH = umin(h, canvasH - top);
+        if (dstW == 0 || dstH == 0)
+            continue;
+
+        WICRect frameRect{ (INT)left, (INT)top, (INT)dstW, (INT)dstH };
+
+        if (disposal == 3)
+            savedCanvasForDisposal3 = CloneBitmap(canvas.Get());
+        else
+            savedCanvasForDisposal3.Reset();
+
+        std::vector<BYTE> src;
+        UINT srcW = 0, srcH = 0, srcStride = 0;
+        WICRect copyRect{ 0,0,(INT)frameW,(INT)frameH };
+        const WICRect* copyRectPtr = nullptr;
+        if (frameW >= left + dstW && frameH >= top + dstH &&
+            (frameW != dstW || frameH != dstH) && (left != 0 || top != 0))
+        {
+            copyRect = WICRect{ (INT)left, (INT)top, (INT)dstW, (INT)dstH };
+            copyRectPtr = &copyRect;
+        }
+
+        if (!DecodeToPBGRA(frame.Get(), copyRectPtr, src, srcW, srcH, srcStride))
+            continue;
+        const UINT drawW = umin(dstW, srcW);
+        const UINT drawH = umin(dstH, srcH);
+
+        BlendSrcOverCanvas(canvas.Get(), (int)left, (int)top, src.data(), drawW, drawH, srcStride);
+
+        auto composedFrame = CloneBitmap(canvas.Get());
+        if (!composedFrame)
+            continue;
+
+        prevDisposal = disposal;
+        prevFrameRect = frameRect;
+
+        onFrame(i, composedFrame, delayMs);
+        ++produced;
+    }
+
+    return produced;
+}
+
+// ============================================================
+//  WebP frame decode — analogous to DecodeGifCompositeFrames above, but
+//  simpler: WIC composites WebP animation frames internally (unlike GIF,
+//  where this app has to manually replay disposal methods), so each frame
+//  is independent and decode can start at any index without needing to
+//  replay anything before it. That's why the background continuation for
+//  WebP (in LoadImageD2D below) starts at frame 1 directly, instead of
+//  redoing frame 0 the way the GIF continuation has to.
+//
+//  wicFactory and decoder must both belong to whichever thread is calling
+//  this, same reasoning as DecodeGifCompositeFrames. maxFrames=0 means
+//  "decode through the end"; outW/outH report the first decoded frame's
+//  dimensions (frame 0 unless startFrame skips it).
+// ============================================================
+static UINT DecodeWebpFrames(
+    IWICImagingFactory* wicFactory,
+    IWICBitmapDecoder* decoder,
+    UINT frameCount,
+    UINT startFrame,
+    UINT maxFrames,
+    const std::atomic<bool>* stopFlag,
+    UINT* outW,
+    UINT* outH,
+    const std::function<void(UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)>& onFrame)
+{
+    if (outW) *outW = 0;
+    if (outH) *outH = 0;
+    if (!wicFactory || !decoder || frameCount == 0 || startFrame >= frameCount)
+        return 0;
+
+    auto imin = [](int a, int b) { return (a < b) ? a : b; };
+    auto imax = [](int a, int b) { return (a > b) ? a : b; };
+
+    auto ReadUIntMeta = [&](IWICMetadataQueryReader* reader, const wchar_t* name, UINT& outVal) -> bool
+    {
+        if (!reader) return false;
+
+        PROPVARIANT var;
+        PropVariantInit(&var);
+        HRESULT h = reader->GetMetadataByName(name, &var);
+
+        if (FAILED(h))
+        {
+            PropVariantClear(&var);
+            return false;
+        }
+
+        UINT v = 0;
+        switch (var.vt)
+        {
+            case VT_UI1: v = var.bVal;  break;
+            case VT_UI2: v = var.uiVal; break;
+            case VT_UI4: v = var.ulVal; break;
+            case VT_I2:  v = (var.iVal < 0) ? 0u : (UINT)var.iVal; break;
+            case VT_I4:  v = (var.lVal < 0) ? 0u : (UINT)var.lVal; break;
+        default:
+            PropVariantClear(&var);
+            return false;
+        }
+
+        PropVariantClear(&var);
+        outVal = v;
+        return true;
+    };
+
+    auto DecodeToPBGRA = [&](IWICBitmapSource* src,
+                            const WICRect* optionalCopyRect,
+                            std::vector<BYTE>& outPixels,
+                            UINT& outW2, UINT& outH2, UINT& outStride) -> bool
+    {
+        if (!src) return false;
+
+        UINT w = 0, h = 0;
+        if (FAILED(src->GetSize(&w, &h)) || w == 0 || h == 0)
+            return false;
+
+        Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+        HRESULT hrc = wicFactory->CreateFormatConverter(converter.GetAddressOf());
+
+        if (FAILED(hrc) || !converter)
+            return false;
+
+        hrc = converter->Initialize(
+            src,
+            GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone,
+            nullptr,
+            0.0f,
+            WICBitmapPaletteTypeCustom);
+
+        if (FAILED(hrc))
+            return false;
+
+        WICRect rc = { 0, 0, (INT)w, (INT)h };
+
+        if (optionalCopyRect)
+        {
+            int cx = imax(0, optionalCopyRect->X);
+            int cy = imax(0, optionalCopyRect->Y);
+            int cw = imin(optionalCopyRect->Width,  (int)w - cx);
+            int ch = imin(optionalCopyRect->Height, (int)h - cy);
+
+            if (cw <= 0 || ch <= 0) return false;
+
+            rc = { cx, cy, cw, ch };
+        }
+
+        const UINT copyW = (UINT)rc.Width;
+        const UINT copyH = (UINT)rc.Height;
+        const UINT stride = copyW * 4;
+        const size_t bufSize = (size_t)stride * copyH;
+        outPixels.assign(bufSize, 0);
+
+        hrc = converter->CopyPixels(
+            optionalCopyRect ? &rc : nullptr,
+            stride,
+            (UINT)bufSize,
+            outPixels.data());
+
+        if (FAILED(hrc))
+            return false;
+
+        for (size_t p = 0; p + 3 < outPixels.size(); p += 4)
+        {
+            if (outPixels[p + 3] == 0)
+            {
+                outPixels[p + 0] = 0;
+                outPixels[p + 1] = 0;
+                outPixels[p + 2] = 0;
+            }
+        }
+
+        outW2 = copyW;
+        outH2 = copyH;
+        outStride = stride;
+        return true;
+    };
+
+    const UINT endFrame = (maxFrames == 0) ? frameCount : min(startFrame + maxFrames, frameCount);
+    UINT produced = 0;
+
+    for (UINT i = startFrame; i < endFrame; ++i)
+    {
+        if (stopFlag && stopFlag->load())
+            break;
+
+        Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+        if (FAILED(decoder->GetFrame(i, frame.GetAddressOf())) || !frame)
+            continue;
+
+        UINT delayMs = 100; // WebP delays are milliseconds; fallback = 100ms
+
+        Microsoft::WRL::ComPtr<IWICMetadataQueryReader> meta;
+        if (SUCCEEDED(frame->GetMetadataQueryReader(meta.GetAddressOf())) && meta)
+        {
+            UINT v = 0;
+
+            // WIC's WebP ANMF metadata exposes WICWebpAnmfFrameDuration
+            // (property id 1) in milliseconds. Different systems/SDKs have
+            // used slightly different query-reader paths, so try the common
+            // forms and fall back gracefully if none are present.
+            if (ReadUIntMeta(meta.Get(), L"/ANMF/{uint=1}", v) ||
+                ReadUIntMeta(meta.Get(), L"/anmf/{uint=1}", v) ||
+                ReadUIntMeta(meta.Get(), L"/ANMF/FrameDuration", v) ||
+                ReadUIntMeta(meta.Get(), L"/anmf/FrameDuration", v) ||
+                ReadUIntMeta(meta.Get(), L"/webpanmf/{uint=1}", v) ||
+                ReadUIntMeta(meta.Get(), L"/webpanmf/FrameDuration", v))
+            {
+                delayMs = v;
+            }
+        }
+
+        if (delayMs < 10)
+            delayMs = 100;
+
+        std::vector<BYTE> pixels;
+        UINT w = 0, h = 0, stride = 0;
+        if (!DecodeToPBGRA(frame.Get(), nullptr, pixels, w, h, stride))
+            continue;
+
+        Microsoft::WRL::ComPtr<IWICBitmap> cached;
+        HRESULT hrFrame = wicFactory->CreateBitmapFromMemory(
+            w, h, GUID_WICPixelFormat32bppPBGRA, stride,
+            (UINT)pixels.size(), pixels.data(), cached.GetAddressOf());
+
+        if (FAILED(hrFrame) || !cached)
+            continue;
+
+        if (produced == 0 && outW && outH)
+        {
+            *outW = w;
+            *outH = h;
+        }
+
+        onFrame(i, cached, delayMs);
+        ++produced;
+    }
+
+    return produced;
+}
+
+// Stops (and joins) the background GIF/WebP/AVIF-frame-decoding thread, if
+// one is running. Every LoadImageD2D call starts with this - the thread it
+// might stop belongs to whatever image was previously loaded, and must not
+// be left writing into g_animFrames/g_animFrameDelays after those vectors
+// get reassigned for the new image.
+static void StopAnimDecodeThread()
+{
+    g_animDecodeStop = true;
+    if (g_animDecodeThread.joinable())
+        g_animDecodeThread.join();
+    g_animDecodeStop = false;
+}
+
+// ============================================================
+//  Shared animated-image loading glue (GIF + WebP + AVIF)
+// ------------------------------------------------------------
+//  All three formats follow the exact same shape once their frame-0 is
+//  decoded: publish the shared g_anim* state, then hand the remaining
+//  frames off to a background thread. Only the actual per-frame decode
+//  call differs (DecodeGifCompositeFrames vs. DecodeWebpFrames vs.
+//  DecodeAvifFrames, and where each one needs to start), so that's the one
+//  thing callers still provide themselves, as a small lambda — including
+//  opening whatever thread-local decode resources their format needs
+//  (OpenThreadLocalWicDecoder for GIF/WebP; DecodeAvifFrames opens its own
+//  avifDecoder internally, so AVIF only needs OpenThreadLocalWicFactory).
+// ============================================================
+
+// Publishes g_animFrames[0] (already decoded by the caller) as the current
+// frame and marks the image as animated. Common tail of all three formats'
+// synchronous frame-0 decode step.
+static void BeginAnimatedPlayback(UINT firstFrameW, UINT firstFrameH)
+{
+    g_isAnimatedImage = true;
+    g_currentAnimFrame = 0;
+    g_wicBitmapSource = g_animFrames[0];
+    g_lastAnimFrameTime = GetTickCount64();
+    g_imageWidth = (int)firstFrameW;
+    g_imageHeight = (int)firstFrameH;
+    g_animFramesReadyUpTo.store(1);
+}
+
+// Opens a fresh WIC factory for use on a background thread. WIC objects
+// aren't safely shared across the apartment boundary (see
+// DecodeGifCompositeFrames's comment), so every background continuation
+// below creates its own rather than reusing the main thread's g_wicFactory.
+static bool OpenThreadLocalWicFactory(ComPtr<IWICImagingFactory>& outFactory)
+{
+    return SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&outFactory))) && outFactory;
+}
+
+// Same, plus a WIC decoder for the given file — what the GIF and WebP
+// background continuations need (AVIF doesn't: DecodeAvifFrames opens its
+// own avifDecoder from the path instead, and only needs the factory).
+static bool OpenThreadLocalWicDecoder(const std::wstring& path,
+    ComPtr<IWICImagingFactory>& outFactory, ComPtr<IWICBitmapDecoder>& outDecoder)
+{
+    if (!OpenThreadLocalWicFactory(outFactory))
+        return false;
+    return SUCCEEDED(outFactory->CreateDecoderFromFilename(path.c_str(), nullptr,
+        GENERIC_READ, WICDecodeMetadataCacheOnLoad, &outDecoder)) && outDecoder;
+}
+
+// Signature every format's "decode the rest of the frames" callback must
+// match: given the total frame count, decode whatever frames remain and
+// publish each one via onFrame.
+using DecodeRemainingFramesFn = std::function<UINT(
+    UINT frameCount,
+    const std::atomic<bool>* stopFlag,
+    const std::function<void(UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)>& onFrame)>;
+
+// Spawns the background thread that decodes every animation frame not
+// already handled by the synchronous frame-0 decode. This is the part that
+// used to be duplicated almost line-for-line between the GIF and WebP
+// branches of LoadImageD2D (and would have been a third time over for
+// AVIF): initialize COM for the thread, run decodeRestFn, and publish each
+// frame into the shared g_anim* vectors as it arrives.
+static void SpawnAnimDecodeThread(UINT frameCount, DecodeRemainingFramesFn decodeRestFn)
+{
+    g_animDecodeThread = std::thread([frameCount, decodeRestFn]()
+    {
+        if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)))
+            return;
+
+        decodeRestFn(frameCount, &g_animDecodeStop,
+            [](UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)
+            {
+                if (index < g_animFrames.size())
+                {
+                    g_animFrames[index] = bmp;
+                    g_animFrameDelays[index] = delayMs;
+                    // Frames are produced strictly in order by this single
+                    // thread, so it's always safe to publish index+1 here.
+                    g_animFramesReadyUpTo.store((int)(index + 1));
+                }
+            });
+
+        CoUninitialize();
+    });
+}
+
+bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
+{
+    g_lastLoadError.clear();
+
+    if (!g_wicFactory || !filename || !*filename)
+        return LoadFail(L"Internal error: the image system hasn't finished initializing.");
+
+    // Stop any background GIF-frame decode left over from the previously
+    // loaded image before we touch g_animFrames/g_animFrameDelays below — see
+    // StopAnimDecodeThread's comment.
+    StopAnimDecodeThread();
+
+    // ---- Slideshow: snapshot current bitmap + bg before we clobber them ----
+    if (g_isSlideshowMode && g_d2dBitmap)
+    {
+        g_prevD2DBitmap         = g_d2dBitmap;
+        g_prevSlideshowBgBitmap = g_slideshowBgBitmap;
+        g_prevImageZoom         = g_zoom;
+        g_prevImageOffX         = g_offsetX;
+        g_prevImageOffY         = g_offsetY;
+        g_prevImageRotation     = g_imageRotationAngle;
+
+        // Reset so Render recreates it for the new image
+        g_slideshowBgBitmap.Reset();
+
+        // Kick off the fade-in
+        g_slideshowTransitionAlpha = 0.0f;
+        g_slideshowTargetAlpha     = 1.0f;
+    }
+        
+    // ------------------------------------------------------------
+    // Save previous image state
+    // ------------------------------------------------------------
+    if (!g_currentFilePath.empty() && g_d2dBitmap)
+    {
+    
+        D2D1_SIZE_F imgSize = g_d2dBitmap->GetSize();
+
+        float panX = 0.f, panY = 0.f;
+        float targetPanX = 0.f, targetPanY = 0.f;
+
+        if (PanFromOffsets(hWnd, g_zoom, g_offsetX, g_offsetY,
+                           imgSize.width, imgSize.height, panX, panY) &&
+            PanFromOffsets(hWnd, g_targetZoom, g_targetOffsetX, g_targetOffsetY,
+                           imgSize.width, imgSize.height, targetPanX, targetPanY))
+        {
+            g_imageStates[g_currentFilePath] = {
+                g_zoom, panX, panY,
+                g_targetZoom, targetPanX, targetPanY,
+                g_imageRotationAngle, g_targetRotationAngle
+            };
+        }
+    }
+    
+    // Clear previous state
+    g_d2dBitmap.Reset();
+    g_wicBitmapSource.Reset();
+    g_animFrames.clear();
+    g_animFrameDelays.clear();
+    g_animD2DBitmaps.clear();
+    g_animD3DSRVs.clear();
+    g_isAnimatedImage = false;
+    g_currentAnimFrame = 0;
+    g_lastAnimFrameTime = 0;
+    g_slideshowBgBitmap.Reset();
+
+    std::wstring extLower = std::filesystem::path(filename).extension().wstring();
+    std::transform(extLower.begin(), extLower.end(), extLower.begin(), ::towlower);
+
+    // --------------------------------------------------------------
+    // AVIF / JPEG XL — decoded ourselves (bundled libavif/dav1d and
+    // libjxl), bypassing WIC's decoder registry entirely. This is what
+    // lets these formats work with no OS/Store codec installed.
+    // --------------------------------------------------------------
+    if (extLower == L".avif")
+    {
+        // Peek the frame count first so we know whether this is a still
+        // image or an animated AVIF (an 'avis'-brand image *sequence*);
+        // parsing just the container structure is cheap - the actual
+        // per-frame decode work happens in whichever path we take below.
+        const UINT avifFrameCount = AvifPeekFrameCount(filename);
+
+        if (avifFrameCount > 1)
+        {
+            // Animated AVIF — same shape as the animated-WebP branch further
+            // down (see the comment there): decode frame 0 synchronously so
+            // the window opens immediately, then hand the rest to a
+            // background thread via SpawnAnimDecodeThread. AVIF's
+            // avifDecoderNthImage() can seek to any frame directly, the same
+            // as WebP, so the continuation starts right at frame 1.
+            g_animFrames.assign(avifFrameCount, nullptr);
+            g_animFrameDelays.assign(avifFrameCount, 100);
+            g_animFramesReadyUpTo.store(0);
+
+            UINT frameW = 0, frameH = 0;
+            std::wstring reason;
+            UINT produced = DecodeAvifFrames(
+                filename, g_wicFactory.Get(), /*startFrame=*/0, /*maxFrames=*/1, nullptr,
+                &frameW, &frameH,
+                [&](UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)
+                {
+                    if (index < g_animFrames.size())
+                    {
+                        g_animFrames[index] = bmp;
+                        g_animFrameDelays[index] = delayMs;
+                    }
+                }, &reason);
+
+            if (produced == 0 || !g_animFrames[0])
+                return LoadFail((L"No animation frames could be decoded from this AVIF file: " + reason).c_str());
+
+            BeginAnimatedPlayback(frameW, frameH);
+            g_exifRotation = 0.f;  // AVIF irot/imir transforms aren't applied yet — see DecodeAvifToWicBitmap
+
+            std::wstring filePathCopy = filename;
+            SpawnAnimDecodeThread(avifFrameCount,
+                [filePathCopy](UINT fc, const std::atomic<bool>* stopFlag,
+                                const std::function<void(UINT, ComPtr<IWICBitmap>, UINT)>& onFrame) -> UINT
+                {
+                    ComPtr<IWICImagingFactory> wic;
+                    if (!OpenThreadLocalWicFactory(wic))
+                        return 0;
+                    // Starts at frame 1 (not 0) — same reasoning as WebP.
+                    return DecodeAvifFrames(filePathCopy.c_str(), wic.Get(), /*startFrame=*/1, /*maxFrames=*/0,
+                                             stopFlag, nullptr, nullptr, onFrame);
+                });
+
+            return FinishImageLoad(hWnd, filename);
+        }
+
+        // Static AVIF (single image)
+        ComPtr<IWICBitmap> bmp;
+        UINT w = 0, h = 0;
+        std::wstring reason;
+        if (!DecodeAvifToWicBitmap(filename, g_wicFactory.Get(), bmp, w, h, &reason))
+            return LoadFail((L"This AVIF file couldn't be decoded: " + reason).c_str());
+        g_wicBitmapSource = bmp;
+        g_imageWidth   = (int)w;
+        g_imageHeight  = (int)h;
+        g_exifRotation = 0.f;  // AVIF irot/imir transforms aren't applied yet — see DecodeAvifToWicBitmap
+        return FinishImageLoad(hWnd, filename);
+    }
+    else if (extLower == L".jxl")
+    {
+        ComPtr<IWICBitmap> bmp;
+        UINT w = 0, h = 0;
+        std::wstring reason;
+        if (!DecodeJxlToWicBitmap(filename, g_wicFactory.Get(), bmp, w, h, &reason))
+            return LoadFail((L"This JPEG XL file couldn't be decoded: " + reason).c_str());
+        g_wicBitmapSource = bmp;
+        g_imageWidth   = (int)w;
+        g_imageHeight  = (int)h;
+        g_exifRotation = 0.f;
+        return FinishImageLoad(hWnd, filename);
+    }
+
+    // --------------------------------------------
+    // Decode container (everything else still goes through WIC, as before)
+    // --------------------------------------------
+
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+    HRESULT hr = g_wicFactory->CreateDecoderFromFilename(
+        filename,
+        nullptr,
+        GENERIC_READ,
+        WICDecodeMetadataCacheOnLoad,
+        decoder.GetAddressOf());
+
+    if (FAILED(hr) || !decoder)
+    {
+        if (hr == WINCODEC_ERR_COMPONENTNOTFOUND)
+            return LoadFail(L"No decoder is registered for this file type on this system.", hr);
+        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))
+            return LoadFail(L"The file could not be found.", hr);
+        if (hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION))
+            return LoadFail(L"The file is in use by another program and can't be read right now.", hr);
+        return LoadFail(L"This file couldn't be opened - it may be corrupted or not a valid image.", hr);
+    }
+
+    UINT frameCount = 0;
+    hr = decoder->GetFrameCount(&frameCount);
+
+    if (FAILED(hr) || frameCount == 0)
+        return LoadFail(L"This image file has no readable frames.", hr);
+
+    GUID container = {};
+    decoder->GetContainerFormat(&container);
+
+    // GUID_ContainerFormatWebp is only present in newer Windows SDKs, so use
+    // a local GUID constant to keep the project buildable with older SDKs too.
+    static const GUID kContainerFormatWebp =
+        { 0xe094b0e2, 0x67f2, 0x45b3, { 0xb0, 0xea, 0x11, 0x53, 0x37, 0xca, 0x7c, 0xf3 } };
+
+    const bool isGifContainer  = IsEqualGUID(container, GUID_ContainerFormatGif);
+    const bool isWebpContainer = IsEqualGUID(container, kContainerFormatWebp);
+
+    // --------------------------------------------
+    // Small local helpers (avoid min/max macros)
+    // --------------------------------------------
+    
+
+    // --------------------------------------------
+    // Small local helper
+    // --------------------------------------------
+    // Note: imin/imax/umin/DecodeToPBGRA/CloneBitmap/ClearRect/
+    // BlendSrcOverCanvas used to live here too, but both the GIF-composite
+    // and WebP-frame decode paths that needed them now run through the
+    // standalone DecodeGifCompositeFrames()/DecodeWebpFrames() (above this
+    // function in the file), which have their own copies so they can run on
+    // a background thread. ReadUIntMeta is the only one still needed here -
+    // by the static-image EXIF-orientation read further down.
+
+    auto ReadUIntMeta = [&](IWICMetadataQueryReader* reader, const wchar_t* name, UINT& outVal) -> bool
+    {
+        if (!reader) return false;
+
+        PROPVARIANT var;
+        PropVariantInit(&var);
+        HRESULT h = reader->GetMetadataByName(name, &var);
+
+        if (FAILED(h))
+        {
+            PropVariantClear(&var);
+            return false;
+        }
+
+        UINT v = 0;
+        switch (var.vt)
+        {
+            case VT_UI1: v = var.bVal;  break;
+            case VT_UI2: v = var.uiVal; break;
+            case VT_UI4: v = var.ulVal; break;
+            case VT_I2:  v = (var.iVal < 0) ? 0u : (UINT)var.iVal; break;
+            case VT_I4:  v = (var.lVal < 0) ? 0u : (UINT)var.lVal; break;
+        default:
+            PropVariantClear(&var);
+            return false;
+        }
+
+        PropVariantClear(&var);
+        outVal = v;
+        return true;
+    };
+
     // ============================================================
-    // Animated WebP
+    // Animated WebP / animated GIF
+    // ------------------------------------------------------------
+    // (Animated AVIF is handled earlier, in the .avif branch above — it
+    // bypasses WIC's decoder registry entirely the same way static AVIF
+    // does, so it can't share the WIC decoder this function opens below.
+    // It still goes through the exact same BeginAnimatedPlayback /
+    // SpawnAnimDecodeThread glue as these two, though — see the comment on
+    // that section for why all three end up looking so similar.)
+    //
+    // Both branches below follow the same shape (assign the shared g_anim*
+    // vectors, decode frame 0 synchronously so the window opens right away,
+    // then call SpawnAnimDecodeThread for the rest) via BeginAnimatedPlayback
+    // and SpawnAnimDecodeThread above. What's left here is genuinely
+    // format-specific: which Decode*Frames function to call, and — because
+    // WIC composites WebP frames internally while GIF frames must be
+    // replayed through prior frames' disposal state — where each one needs
+    // to start decoding from.
     // ============================================================
-    // Windows WIC WebP animation support exposes each animation frame via
-    // IWICBitmapDecoder::GetFrame. WIC handles the WebP-specific frame
-    // composition internally, so unlike GIF we should NOT manually apply GIF
-    // disposal logic here. We simply cache each decoded frame as full PBGRA.
     if (isWebpContainer && frameCount > 1)
     {
-        for (UINT i = 0; i < frameCount; ++i)
-        {
-            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
-            if (FAILED(decoder->GetFrame(i, frame.GetAddressOf())) || !frame)
-                continue;
+        g_animFrames.assign(frameCount, nullptr);
+        g_animFrameDelays.assign(frameCount, 100);
+        g_animFramesReadyUpTo.store(0);
 
-            UINT delayMs = 100; // WebP delays are milliseconds; fallback = 100ms
-
-            Microsoft::WRL::ComPtr<IWICMetadataQueryReader> meta;
-            if (SUCCEEDED(frame->GetMetadataQueryReader(meta.GetAddressOf())) && meta)
+        // Decode just frame 0 synchronously, on the main thread, using the
+        // decoder we already have open - this is what lets the window open
+        // immediately.
+        UINT frameW = 0, frameH = 0;
+        UINT produced = DecodeWebpFrames(
+            g_wicFactory.Get(), decoder.Get(), frameCount, /*startFrame=*/0, /*maxFrames=*/1, nullptr,
+            &frameW, &frameH,
+            [&](UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)
             {
-                UINT v = 0;
-
-                // WIC's WebP ANMF metadata exposes WICWebpAnmfFrameDuration
-                // (property id 1) in milliseconds. Different systems/SDKs have
-                // used slightly different query-reader paths, so try the common
-                // forms and fall back gracefully if none are present.
-                if (ReadUIntMeta(meta.Get(), L"/ANMF/{uint=1}", v) ||
-                    ReadUIntMeta(meta.Get(), L"/anmf/{uint=1}", v) ||
-                    ReadUIntMeta(meta.Get(), L"/ANMF/FrameDuration", v) ||
-                    ReadUIntMeta(meta.Get(), L"/anmf/FrameDuration", v) ||
-                    ReadUIntMeta(meta.Get(), L"/webpanmf/{uint=1}", v) ||
-                    ReadUIntMeta(meta.Get(), L"/webpanmf/FrameDuration", v))
+                if (index < g_animFrames.size())
                 {
-                    delayMs = v;
+                    g_animFrames[index] = bmp;
+                    g_animFrameDelays[index] = delayMs;
                 }
-            }
+            });
 
-            if (delayMs < 10)
-                delayMs = 100;
-
-            std::vector<BYTE> pixels;
-            UINT w = 0, h = 0, stride = 0;
-            if (!DecodeToPBGRA(frame.Get(), nullptr, pixels, w, h, stride))
-                continue;
-
-            Microsoft::WRL::ComPtr<IWICBitmap> cached;
-            HRESULT hrFrame = g_wicFactory->CreateBitmapFromMemory(
-                w,
-                h,
-                GUID_WICPixelFormat32bppPBGRA,
-                stride,
-                (UINT)pixels.size(),
-                pixels.data(),
-                cached.GetAddressOf());
-
-            if (FAILED(hrFrame) || !cached)
-                continue;
-
-            g_gifFrames.push_back(cached);
-            g_gifFrameDelays.push_back(delayMs);
-
-            if (i == 0)
-            {
-                g_imageWidth  = (int)w;
-                g_imageHeight = (int)h;
-            }
-        }
-
-        if (g_gifFrames.empty())
+        if (produced == 0 || !g_animFrames[0])
             return LoadFail(L"No animation frames could be decoded from this WebP file.");
 
-        // Reuse the existing animated-frame playback pipeline. The name still
-        // says GIF, but it now means "WIC-backed animated image".
-        g_isAnimatedGif = true;
-        g_currentGifFrame = 0;
-        g_wicBitmapSource = g_gifFrames[0];
-        g_lastGifFrameTime = GetTickCount64();
-    }
-    // ============================================================
-    // Animated GIF (compose frames properly)
-    // ============================================================
+        BeginAnimatedPlayback(frameW, frameH);
 
+        std::wstring filePathCopy = filename;
+        SpawnAnimDecodeThread(frameCount,
+            [filePathCopy](UINT fc, const std::atomic<bool>* stopFlag,
+                            const std::function<void(UINT, ComPtr<IWICBitmap>, UINT)>& onFrame) -> UINT
+            {
+                ComPtr<IWICImagingFactory> wic;
+                ComPtr<IWICBitmapDecoder> localDecoder;
+                if (!OpenThreadLocalWicDecoder(filePathCopy, wic, localDecoder))
+                    return 0;
+                // Starts at frame 1 (not 0) - unlike GIF, WebP frames are
+                // independent, so there's no state to rebuild by redoing frame 0.
+                return DecodeWebpFrames(wic.Get(), localDecoder.Get(), fc, /*startFrame=*/1, /*maxFrames=*/0,
+                                         stopFlag, nullptr, nullptr, onFrame);
+            });
+    }
     else if (isGifContainer && frameCount > 1)
     {
-        // Logical screen size (canvas size)
+        g_animFrames.assign(frameCount, nullptr);
+        g_animFrameDelays.assign(frameCount, 100);
+        g_animFramesReadyUpTo.store(0);
+
+        // Decode just frame 0 synchronously, on the main thread, using the
+        // decoder we already have open — this is what lets the window open
+        // immediately instead of stalling on the whole animation.
         UINT canvasW = 0, canvasH = 0;
-        {
-            Microsoft::WRL::ComPtr<IWICMetadataQueryReader> decMeta;
-
-            if (SUCCEEDED(decoder->GetMetadataQueryReader(decMeta.GetAddressOf())) && decMeta)
+        UINT produced = DecodeGifCompositeFrames(
+            g_wicFactory.Get(), decoder.Get(), frameCount, /*maxFrames=*/1, nullptr,
+            &canvasW, &canvasH,
+            [&](UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)
             {
-                ReadUIntMeta(decMeta.Get(), L"/logscrdesc/Width",  canvasW);
-                ReadUIntMeta(decMeta.Get(), L"/logscrdesc/Height", canvasH);
-            }
-        }
-
-        if (canvasW == 0 || canvasH == 0)
-        {
-            // Fallback: first frame size
-            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> f0;
-
-            if (SUCCEEDED(decoder->GetFrame(0, f0.GetAddressOf())) && f0)
-                f0->GetSize(&canvasW, &canvasH);
-        }
-
-        if (canvasW == 0 || canvasH == 0)
-            return LoadFail(L"Couldn't determine this GIF's canvas size.");
-
-        // Composition canvas (full size)
-        Microsoft::WRL::ComPtr<IWICBitmap> canvas;
-        hr = g_wicFactory->CreateBitmap(
-            canvasW, canvasH,
-            GUID_WICPixelFormat32bppPBGRA,
-            WICBitmapCacheOnLoad,
-            canvas.GetAddressOf());
-
-        if (FAILED(hr) || !canvas)
-            return LoadFail(L"Couldn't allocate a canvas to compose this GIF's frames.", hr);
-
-        // Clear to transparent
-        ClearRect(canvas.Get(), WICRect{ 0, 0, (INT)canvasW, (INT)canvasH });
-        UINT prevDisposal = 0;
-        WICRect prevFrameRect{ 0,0,0,0 };
-        Microsoft::WRL::ComPtr<IWICBitmap> savedCanvasForDisposal3;
-
-        for (UINT i = 0; i < frameCount; ++i)
-        {
-            // Apply previous frame disposal BEFORE drawing this frame
-            if (i > 0)
-            {
-                if (prevDisposal == 2)
+                if (index < g_animFrames.size())
                 {
-                    // Restore to background (use transparent)
-                    if (prevFrameRect.Width > 0 && prevFrameRect.Height > 0)
-                        ClearRect(canvas.Get(), prevFrameRect);
+                    g_animFrames[index] = bmp;
+                    g_animFrameDelays[index] = delayMs;
                 }
+            });
 
-                else if (prevDisposal == 3 && savedCanvasForDisposal3)
-                {
-                    // Restore to previous
-                    canvas = savedCanvasForDisposal3;
-                    savedCanvasForDisposal3.Reset();
-                }
-            }
-
-            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
-
-            if (FAILED(decoder->GetFrame(i, frame.GetAddressOf())) || !frame)
-                continue;
-
-            // Frame defaults
-            UINT left = 0, top = 0;
-            UINT w = 0, h = 0;
-            UINT disposal = 0;
-            UINT delayMs = 100; // default 100ms
-            UINT frameW = 0, frameH = 0;
-            frame->GetSize(&frameW, &frameH);
-            Microsoft::WRL::ComPtr<IWICMetadataQueryReader> meta;
-
-            if (SUCCEEDED(frame->GetMetadataQueryReader(meta.GetAddressOf())) && meta)
-            {
-                ReadUIntMeta(meta.Get(), L"/imgdesc/Left",   left);
-                ReadUIntMeta(meta.Get(), L"/imgdesc/Top",    top);
-                ReadUIntMeta(meta.Get(), L"/imgdesc/Width",  w);
-                ReadUIntMeta(meta.Get(), L"/imgdesc/Height", h);
-                ReadUIntMeta(meta.Get(), L"/grctlext/Disposal", disposal);
-                UINT delay10ms = 0;
-
-                if (ReadUIntMeta(meta.Get(), L"/grctlext/Delay", delay10ms))
-                    delayMs = delay10ms * 10;
-            }
-
-            if (delayMs < 10) delayMs = 100;
-            if (w == 0) w = frameW;
-            if (h == 0) h = frameH;
-            if (left >= canvasW || top >= canvasH)
-                continue;
-
-            const UINT dstW = umin(w, canvasW - left);
-            const UINT dstH = umin(h, canvasH - top);
-
-            if (dstW == 0 || dstH == 0)
-                continue;
-
-            WICRect frameRect{ (INT)left, (INT)top, (INT)dstW, (INT)dstH };
-
-            // If this frame uses "restore to previous", save canvas BEFORE drawing it.
-            if (disposal == 3)
-                savedCanvasForDisposal3 = CloneBitmap(canvas.Get());
-            else
-                savedCanvasForDisposal3.Reset();
-
-            // Decode pixels.
-            // If the frame decode surface is larger than the described subimage rect,
-            // copy only the described region to avoid undefined pixels (black noise).
-
-            std::vector<BYTE> src;
-            UINT srcW = 0, srcH = 0, srcStride = 0;
-            WICRect copyRect{ 0,0,(INT)frameW,(INT)frameH };
-            const WICRect* copyRectPtr = nullptr;
-            if (frameW >= left + dstW && frameH >= top + dstH &&
-                (frameW != dstW || frameH != dstH) && (left != 0 || top != 0))
-            {
-                // Pull only the subimage region out of a full-size frame surface.
-                copyRect = WICRect{ (INT)left, (INT)top, (INT)dstW, (INT)dstH };
-                copyRectPtr = &copyRect;
-            }
-
-            if (!DecodeToPBGRA(frame.Get(), copyRectPtr, src, srcW, srcH, srcStride))
-                continue;
-            const UINT drawW = umin(dstW, srcW);
-            const UINT drawH = umin(dstH, srcH);
-
-            // Blend onto the composition canvas at (left, top)
-            BlendSrcOverCanvas(canvas.Get(), (int)left, (int)top,
-                               src.data(), drawW, drawH, srcStride);
-
-            // Snapshot the composed full canvas as the visible frame
-            auto composedFrame = CloneBitmap(canvas.Get());
-
-            if (!composedFrame)
-                continue;
-
-            g_gifFrames.push_back(composedFrame);
-            g_gifFrameDelays.push_back(delayMs);
-            prevDisposal = disposal;
-            prevFrameRect = frameRect;
-
-            g_imageWidth  = (int)canvasW;
-            g_imageHeight = (int)canvasH;
-        }
-
-        if (g_gifFrames.empty())
+        if (produced == 0 || !g_animFrames[0])
             return LoadFail(L"No frames could be decoded from this GIF.");
 
-        g_isAnimatedGif = true;
-        g_currentGifFrame = 0;
-        g_wicBitmapSource = g_gifFrames[0];
-        g_lastGifFrameTime = GetTickCount64();
+        BeginAnimatedPlayback(canvasW, canvasH);
+
+        // Unlike WebP, the background thread here has to redecode from frame
+        // 0 to rebuild identical canvas/disposal state before it can
+        // continue past where the synchronous pass left off (see
+        // DecodeGifCompositeFrames's comment) — so its onFrame callback
+        // skips republishing frame 0, which the main thread already
+        // published above via BeginAnimatedPlayback. The one-frame repeat is
+        // cheap; sharing the WIC canvas object across threads instead would
+        // not be safe.
+        SpawnAnimDecodeThread(frameCount,
+            [filePathCopy = std::wstring(filename)](UINT fc, const std::atomic<bool>* stopFlag,
+                const std::function<void(UINT, ComPtr<IWICBitmap>, UINT)>& onFrame) -> UINT
+            {
+                ComPtr<IWICImagingFactory> wic;
+                ComPtr<IWICBitmapDecoder> localDecoder;
+                if (!OpenThreadLocalWicDecoder(filePathCopy, wic, localDecoder))
+                    return 0;
+                return DecodeGifCompositeFrames(wic.Get(), localDecoder.Get(), fc, /*maxFrames=*/0, stopFlag,
+                    nullptr, nullptr,
+                    [&](UINT index, ComPtr<IWICBitmap> bmp, UINT delayMs)
+                    {
+                        if (index == 0) return;  // main thread already published frame 0
+                        onFrame(index, bmp, delayMs);
+                    });
+            });
     }
-    // Static image (or non-GIF multi-frame): load frame 0
+    // Static image (or non-GIF/WebP multi-frame): load frame 0
     // ============================================================
     else
     {
@@ -4689,7 +5440,7 @@ bool LoadImageD2D(HWND hWnd, const wchar_t* filename)
 
 // ============================================================
 //  Shared "tail" of an image load — runs after g_wicBitmapSource (and, for
-//  animated images, g_gifFrames) has been populated by either the WIC path
+//  animated images, g_animFrames) has been populated by either the WIC path
 //  or the AVIF/JXL paths above. Uploads to the GPU, restores any saved
 //  view state, and updates the filename label.
 // ============================================================
@@ -4699,17 +5450,17 @@ static bool FinishImageLoad(HWND hWnd, const wchar_t* filename)
     RecreateImageBitmap();
 
     // Only frame 0 gets uploaded here (RecreateImageBitmap() just above already
-    // built it, since g_wicBitmapSource points at g_gifFrames[0] for animated
+    // built it, since g_wicBitmapSource points at g_animFrames[0] for animated
     // formats). Every other frame is uploaded lazily, one at a time, by
     // UpdateEngine as playback reaches it - this is what lets a large/long
-    // animated GIF or WebP display its first frame immediately instead of
+    // animated GIF, WebP, or AVIF display its first frame immediately instead of
     // blocking on every frame hitting the GPU up front.
-    if (g_isAnimatedGif && g_renderTarget)
+    if (g_isAnimatedImage && g_renderTarget)
     {
-        g_gifD2DBitmaps.assign(g_gifFrames.size(), nullptr);
-        g_gifD3DSRVs.assign(g_gifFrames.size(), nullptr);
-        if (!g_gifD2DBitmaps.empty())
-            g_gifD2DBitmaps[0] = g_d2dBitmap;   // already built above, no need to re-upload
+        g_animD2DBitmaps.assign(g_animFrames.size(), nullptr);
+        g_animD3DSRVs.assign(g_animFrames.size(), nullptr);
+        if (!g_animD2DBitmaps.empty())
+            g_animD2DBitmaps[0] = g_d2dBitmap;   // already built above, no need to re-upload
     }
 
     // ------------------------------------------------------------
@@ -4834,10 +5585,17 @@ void BuildImageList(const wchar_t* filename)
             g_imageFiles.push_back(path);
     }
 
+    // Explorer's default "Name" sort is a natural/logical sort (e.g. "img2"
+    // before "img10"), not a plain character-by-character comparison — a
+    // naive _wcsicmp would put "img10" before "img2" since '1' < '2'.
+    // StrCmpLogicalW is the actual API Explorer uses for this, so sorting
+    // with it here matches Explorer's order exactly. Comparing full paths
+    // (rather than just filenames) is fine since every entry shares the
+    // same parent directory prefix.
     std::sort(g_imageFiles.begin(), g_imageFiles.end(),
         [](const std::wstring& a, const std::wstring& b)
         {
-            return _wcsicmp(a.c_str(), b.c_str()) < 0;
+            return StrCmpLogicalW(a.c_str(), b.c_str()) < 0;
         });
 
     for (size_t i = 0; i < g_imageFiles.size(); ++i)
@@ -4980,6 +5738,1223 @@ void AssociateFileTypes(HWND hWnd)
     }
 }
 
+// ---------------------------------------------------------------------
+// Image metadata (EXIF / PNG text chunk) viewer
+// ---------------------------------------------------------------------
+
+// WIC stores EXIF RATIONAL values packed into a single UI8: the numerator
+// in the high 32 bits, the denominator in the low 32 bits.
+static bool RationalFromPackedUI8(ULONGLONG packed, double& outValue)
+{
+    UINT32 numerator   = static_cast<UINT32>(packed >> 32);
+    UINT32 denominator = static_cast<UINT32>(packed & 0xFFFFFFFFull);
+    if (denominator == 0)
+        return false;
+    outValue = static_cast<double>(numerator) / static_cast<double>(denominator);
+    return true;
+}
+
+// Pulls a displayable string out of the PROPVARIANT types WIC's EXIF/PNG
+// metadata readers actually return. Returns false if the variant is empty
+// or of a type this viewer doesn't render.
+static bool PropVariantToDisplayString(const PROPVARIANT& pv, std::wstring& out)
+{
+    switch (pv.vt)
+    {
+    case VT_LPWSTR:
+        if (!pv.pwszVal) return false;
+        out = pv.pwszVal;
+        return !out.empty();
+
+    case VT_LPSTR:  // EXIF ASCII fields (Make, Model, DateTime, ...) come back narrow
+    {
+        if (!pv.pszVal) return false;
+        std::string s(pv.pszVal);
+        while (!s.empty() && (s.back() == '\0' || s.back() == ' '))
+            s.pop_back();
+        out.assign(s.begin(), s.end());
+        return !out.empty();
+    }
+
+    case VT_UI1: out = std::to_wstring(static_cast<unsigned>(pv.bVal));  return true;
+    case VT_UI2: out = std::to_wstring(static_cast<unsigned>(pv.uiVal)); return true;
+    case VT_UI4: out = std::to_wstring(static_cast<unsigned long>(pv.ulVal)); return true;
+    case VT_I4:  out = std::to_wstring(static_cast<long>(pv.lVal));      return true;
+    case VT_UI8: out = std::to_wstring(static_cast<unsigned long long>(pv.uhVal.QuadPart)); return true;
+
+    // Some readers hand back a single-element vector instead of a scalar
+    // (ISOSpeedRatings is the classic example).
+    case (VT_VECTOR | VT_UI2):
+        if (pv.caui.cElems == 0) return false;
+        out = std::to_wstring(static_cast<unsigned>(pv.caui.pElems[0]));
+        return true;
+    case (VT_VECTOR | VT_UI4):
+        if (pv.caul.cElems == 0) return false;
+        out = std::to_wstring(static_cast<unsigned long>(pv.caul.pElems[0]));
+        return true;
+
+    default:
+        return false;
+    }
+}
+
+// Reads one tag by WIC metadata query path and appends "label: value\n" to
+// 'out' if present. Returns true if the field was found.
+static bool AppendSimpleField(IWICMetadataQueryReader* reader, const wchar_t* path,
+                               const wchar_t* label, std::wstring& out)
+{
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    bool found = false;
+    if (SUCCEEDED(reader->GetMetadataByName(path, &pv)))
+    {
+        std::wstring val;
+        if (PropVariantToDisplayString(pv, val))
+        {
+            out += std::wstring(label) + L": " + val + L"\n";
+            found = true;
+        }
+    }
+    PropVariantClear(&pv);
+    return found;
+}
+
+// Same idea but reads a packed EXIF rational and applies custom formatting —
+// exposure time as a fraction of a second, f-number/focal length as decimals.
+static bool AppendRationalField(IWICMetadataQueryReader* reader, const wchar_t* path,
+                                 const wchar_t* label, const wchar_t* fmt,
+                                 std::wstring& out, bool asShutterFraction = false)
+{
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    bool found = false;
+    if (SUCCEEDED(reader->GetMetadataByName(path, &pv)) && pv.vt == VT_UI8)
+    {
+        double value;
+        if (RationalFromPackedUI8(pv.uhVal.QuadPart, value) && value > 0.0)
+        {
+            wchar_t buf[64];
+            if (asShutterFraction && value < 1.0)
+                swprintf_s(buf, L"1/%.0f s", 1.0 / value);
+            else
+                swprintf_s(buf, fmt, value);
+            out += std::wstring(label) + L": " + buf + L"\n";
+            found = true;
+        }
+    }
+    PropVariantClear(&pv);
+    return found;
+}
+
+// GPS latitude/longitude are each three packed rationals (degrees, minutes,
+// seconds) plus a hemisphere reference ("N"/"S", "E"/"W"). 'ifdGpsRoot' is
+// the container-specific root path (e.g. "/app1/ifd/gps" for JPEG,
+// "/ifd/gps" for PNG/WebP).
+static bool AppendGpsCoordinate(IWICMetadataQueryReader* reader, const wchar_t* ifdGpsRoot, std::wstring& out)
+{
+    PROPVARIANT latRef, lat, lonRef, lon;
+    PropVariantInit(&latRef); PropVariantInit(&lat);
+    PropVariantInit(&lonRef); PropVariantInit(&lon);
+
+    std::wstring root = ifdGpsRoot;
+    bool ok =
+        SUCCEEDED(reader->GetMetadataByName((root + L"/{ushort=1}").c_str(), &latRef)) &&
+        SUCCEEDED(reader->GetMetadataByName((root + L"/{ushort=2}").c_str(), &lat))    &&
+        SUCCEEDED(reader->GetMetadataByName((root + L"/{ushort=3}").c_str(), &lonRef)) &&
+        SUCCEEDED(reader->GetMetadataByName((root + L"/{ushort=4}").c_str(), &lon))    &&
+        lat.vt == (VT_VECTOR | VT_UI8) && lat.cauh.cElems == 3 &&
+        lon.vt == (VT_VECTOR | VT_UI8) && lon.cauh.cElems == 3;
+
+    if (ok)
+    {
+        auto toDecimalDegrees = [](const PROPVARIANT& dms) -> double
+        {
+            double deg = 0.0, min = 0.0, sec = 0.0;
+            RationalFromPackedUI8(dms.cauh.pElems[0].QuadPart, deg);
+            RationalFromPackedUI8(dms.cauh.pElems[1].QuadPart, min);
+            RationalFromPackedUI8(dms.cauh.pElems[2].QuadPart, sec);
+            return deg + min / 60.0 + sec / 3600.0;
+        };
+
+        double latDec = toDecimalDegrees(lat);
+        double lonDec = toDecimalDegrees(lon);
+
+        std::wstring latRefStr, lonRefStr;
+        PropVariantToDisplayString(latRef, latRefStr);
+        PropVariantToDisplayString(lonRef, lonRefStr);
+
+        if (!latRefStr.empty() && towlower(latRefStr[0]) == L's')
+            latDec = -latDec;
+        if (!lonRefStr.empty() && towlower(lonRefStr[0]) == L'w')
+            lonDec = -lonDec;
+
+        wchar_t buf[128];
+        swprintf_s(buf, L"GPS location: %.6f, %.6f\n", latDec, lonDec);
+        out += buf;
+    }
+
+    PropVariantClear(&latRef); PropVariantClear(&lat);
+    PropVariantClear(&lonRef); PropVariantClear(&lon);
+    return ok;
+}
+
+// Human-readable EXIF Orientation (tag 274) values: 1-8, describing the
+// rotation/mirroring needed to display the image upright.
+static const wchar_t* OrientationName(unsigned value)
+{
+    switch (value)
+    {
+    case 1: return L"Normal";
+    case 2: return L"Flipped horizontally";
+    case 3: return L"Rotated 180\u00B0";
+    case 4: return L"Flipped vertically";
+    case 5: return L"Rotated 90\u00B0 CW, then flipped horizontally";
+    case 6: return L"Rotated 90\u00B0 CW";
+    case 7: return L"Rotated 90\u00B0 CCW, then flipped horizontally";
+    case 8: return L"Rotated 90\u00B0 CCW";
+    default: return L"Unknown";
+    }
+}
+
+// EXIF ColorSpace (tag 40961): 1 = sRGB, 0xFFFF = "Uncalibrated" — the
+// latter is what Adobe RGB and other non-sRGB workflows typically write,
+// since EXIF has no tag that names the calibrated space directly.
+static bool AppendColorSpaceField(IWICMetadataQueryReader* reader, const wchar_t* path, std::wstring& out)
+{
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    bool found = false;
+    if (SUCCEEDED(reader->GetMetadataByName(path, &pv)))
+    {
+        unsigned v = (pv.vt == VT_UI2) ? pv.uiVal : (pv.vt == VT_UI4 ? pv.ulVal : 0u);
+        if (v == 1)
+        {
+            out += L"Color space: sRGB\n";
+            found = true;
+        }
+        else if (v == 0xFFFF)
+        {
+            out += L"Color space: Uncalibrated (non-sRGB)\n";
+            found = true;
+        }
+    }
+    PropVariantClear(&pv);
+    return found;
+}
+
+// EXIF Orientation (tag 274). See OrientationName() above for the mapping.
+static bool AppendOrientationField(IWICMetadataQueryReader* reader, const wchar_t* path, std::wstring& out)
+{
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    bool found = false;
+    if (SUCCEEDED(reader->GetMetadataByName(path, &pv)))
+    {
+        unsigned v = (pv.vt == VT_UI2) ? pv.uiVal : (pv.vt == VT_UI4 ? pv.ulVal : 0u);
+        if (v >= 1 && v <= 8)
+        {
+            out += std::wstring(L"Orientation: ") + OrientationName(v) + L"\n";
+            found = true;
+        }
+    }
+    PropVariantClear(&pv);
+    return found;
+}
+
+// ---- Bare-value variants for the "Properties" dialog (IDD_PROPERTIES) ----
+// The AppendXField() helpers above build "label: value\n" lines for the
+// free-form "View metadata" text dump. The Properties dialog instead has a
+// dedicated static control per field, so these return just the value (no
+// label, no trailing newline) for SetDlgItemTextW to drop straight in.
+
+static bool ReadDateTakenValue(IWICMetadataQueryReader* reader, const wchar_t* path, std::wstring& out)
+{
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    bool found = false;
+    if (SUCCEEDED(reader->GetMetadataByName(path, &pv)))
+        found = PropVariantToDisplayString(pv, out);
+    PropVariantClear(&pv);
+    return found;
+}
+
+static bool ReadColorSpaceValue(IWICMetadataQueryReader* reader, const wchar_t* path, std::wstring& out)
+{
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    bool found = false;
+    if (SUCCEEDED(reader->GetMetadataByName(path, &pv)))
+    {
+        unsigned v = (pv.vt == VT_UI2) ? pv.uiVal : (pv.vt == VT_UI4 ? pv.ulVal : 0u);
+        if (v == 1)          { out = L"sRGB";                        found = true; }
+        else if (v == 0xFFFF) { out = L"Uncalibrated (non-sRGB)";     found = true; }
+    }
+    PropVariantClear(&pv);
+    return found;
+}
+
+static bool ReadOrientationValue(IWICMetadataQueryReader* reader, const wchar_t* path, std::wstring& out)
+{
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    bool found = false;
+    if (SUCCEEDED(reader->GetMetadataByName(path, &pv)))
+    {
+        unsigned v = (pv.vt == VT_UI2) ? pv.uiVal : (pv.vt == VT_UI4 ? pv.ulVal : 0u);
+        if (v >= 1 && v <= 8)
+        {
+            out = OrientationName(v);
+            found = true;
+        }
+    }
+    PropVariantClear(&pv);
+    return found;
+}
+
+// Renders a byte count the way Explorer's Properties dialog does: a
+// human-scaled size followed by the exact byte count in parentheses.
+static std::wstring FormatFileSizeW(ULONGLONG bytes)
+{
+    wchar_t buf[96];
+    if (bytes < 1024ULL)
+        swprintf_s(buf, L"%llu bytes", bytes);
+    else if (bytes < 1024ULL * 1024)
+        swprintf_s(buf, L"%.1f KB (%llu bytes)", bytes / 1024.0, bytes);
+    else if (bytes < 1024ULL * 1024 * 1024)
+        swprintf_s(buf, L"%.2f MB (%llu bytes)", bytes / (1024.0 * 1024.0), bytes);
+    else
+        swprintf_s(buf, L"%.2f GB (%llu bytes)", bytes / (1024.0 * 1024.0 * 1024.0), bytes);
+    return buf;
+}
+
+// Formats a FILETIME (as returned by GetFileAttributesEx, i.e. UTC) using
+// the user's locale short-date and time formats.
+static std::wstring FormatFileTimeW(const FILETIME& ftUtc)
+{
+    if (ftUtc.dwLowDateTime == 0 && ftUtc.dwHighDateTime == 0)
+        return L"Unknown";
+
+    FILETIME ftLocal;
+    SYSTEMTIME st;
+    if (!FileTimeToLocalFileTime(&ftUtc, &ftLocal) || !FileTimeToSystemTime(&ftLocal, &st))
+        return L"Unknown";
+
+    wchar_t dateBuf[64] = {};
+    wchar_t timeBuf[64] = {};
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &st, nullptr, dateBuf, ARRAYSIZE(dateBuf), nullptr);
+    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, nullptr, timeBuf, ARRAYSIZE(timeBuf));
+    return std::wstring(dateBuf) + L"  " + timeBuf;
+}
+
+// Maps this app's supported file extensions to a display-friendly format
+// name. Kept in sync with the extension list in IsSupportedImage.
+static const wchar_t* ImageFormatNameFromExtension(const std::wstring& extLower)
+{
+    if (extLower == L".jpg" || extLower == L".jpeg") return L"JPEG";
+    if (extLower == L".png")                          return L"PNG";
+    if (extLower == L".bmp")                           return L"BMP";
+    if (extLower == L".gif")                           return L"GIF";
+    if (extLower == L".tif" || extLower == L".tiff")   return L"TIFF";
+    if (extLower == L".webp")                          return L"WebP";
+    if (extLower == L".avif")                          return L"AVIF";
+    if (extLower == L".jxl")                            return L"JPEG XL";
+    return L"Unknown";
+}
+
+// ---------------------------------------------------------------------
+// Raw PNG text-chunk reader (tEXt / iTXt).
+//
+// WIC's PNG metadata query reader only surfaces a tEXt/iTXt chunk if you
+// query it by its exact keyword, and there's no fixed list of keywords
+// to try — AI generation tools (Stable Diffusion, ComfyUI, Automatic1111)
+// embed their data under arbitrary keywords like "prompt", "workflow", or
+// "parameters" that aren't part of any standard set. Parsing the PNG
+// chunk stream directly finds every text chunk regardless of keyword.
+// ---------------------------------------------------------------------
+struct PngTextField
+{
+    std::wstring keyword;
+    std::wstring value;
+};
+
+static std::wstring Latin1BytesToWide(const char* data, size_t len)
+{
+    // Each Latin-1 byte maps 1:1 to the Unicode code point of the same
+    // value, so this widen is exact — no conversion table needed.
+    std::wstring w;
+    w.reserve(len);
+    for (size_t i = 0; i < len; ++i)
+        w.push_back(static_cast<wchar_t>(static_cast<unsigned char>(data[i])));
+    return w;
+}
+
+static std::wstring Utf8BytesToWide(const char* data, size_t len)
+{
+    if (len == 0) return L"";
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, data, static_cast<int>(len), nullptr, 0);
+    if (wlen <= 0) return L"";
+    std::wstring w(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, data, static_cast<int>(len), &w[0], wlen);
+    return w;
+}
+
+static bool ReadPngTextChunks(const std::wstring& path, std::vector<PngTextField>& out)
+{
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER sizeLI = {};
+    if (!GetFileSizeEx(hFile, &sizeLI) || sizeLI.QuadPart <= 0)
+    {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    // Metadata chunks are conventionally written right after IHDR, well
+    // before the (often large) IDAT pixel data, so capping how much we
+    // read keeps this cheap even on big files without missing anything
+    // in practice. 8 MB comfortably covers even large embedded workflow
+    // JSON blobs from tools like ComfyUI.
+    constexpr DWORD kMaxRead = 8 * 1024 * 1024;
+    DWORD toRead = static_cast<DWORD>(min(sizeLI.QuadPart, (LONGLONG)kMaxRead));
+
+    std::vector<BYTE> buf(toRead);
+    DWORD bytesRead = 0;
+    bool ok = ReadFile(hFile, buf.data(), toRead, &bytesRead, nullptr) != 0;
+    CloseHandle(hFile);
+    if (!ok || bytesRead < 8)
+        return false;
+
+    static const BYTE kSig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    if (memcmp(buf.data(), kSig, 8) != 0)
+        return false;
+
+    auto readBE32 = [&](size_t at) -> UINT32
+    {
+        return (UINT32(buf[at]) << 24) | (UINT32(buf[at + 1]) << 16) |
+               (UINT32(buf[at + 2]) << 8) | UINT32(buf[at + 3]);
+    };
+
+    size_t pos = 8;
+    while (pos + 8 <= bytesRead)
+    {
+        UINT32 len = readBE32(pos);
+        char type[5] = {};
+        memcpy(type, &buf[pos + 4], 4);
+        size_t dataStart = pos + 8;
+
+        if (dataStart + len > bytesRead)
+            break;  // chunk runs past what we read — stop rather than misread
+
+        if (strcmp(type, "IEND") == 0)
+            break;
+
+        const char* data = reinterpret_cast<const char*>(&buf[dataStart]);
+
+        if (strcmp(type, "tEXt") == 0)
+        {
+            // keyword \0 text — both Latin-1
+            size_t nul = 0;
+            while (nul < len && data[nul] != '\0') ++nul;
+            if (nul < len)
+            {
+                PngTextField f;
+                f.keyword = Latin1BytesToWide(data, nul);
+                f.value   = Latin1BytesToWide(data + nul + 1, len - nul - 1);
+                out.push_back(std::move(f));
+            }
+        }
+        else if (strcmp(type, "iTXt") == 0)
+        {
+            // keyword \0 compressionFlag(1) compressionMethod(1) languageTag \0 translatedKeyword \0 text
+            size_t nul1 = 0;
+            while (nul1 < len && data[nul1] != '\0') ++nul1;
+            if (nul1 + 2 < len)
+            {
+                unsigned char compressionFlag = static_cast<unsigned char>(data[nul1 + 1]);
+                size_t i = nul1 + 3;
+                size_t nul2 = i;
+                while (nul2 < len && data[nul2] != '\0') ++nul2;        // language tag
+                size_t nul3 = (nul2 < len) ? nul2 + 1 : nul2;
+                while (nul3 < len && data[nul3] != '\0') ++nul3;        // translated keyword
+                size_t textStart = (nul3 < len) ? nul3 + 1 : len;
+
+                // Compressed iTXt (compressionFlag == 1) is skipped — the
+                // tools that embed generation metadata this way virtually
+                // always leave it uncompressed.
+                if (compressionFlag == 0 && textStart <= len)
+                {
+                    PngTextField f;
+                    f.keyword = Latin1BytesToWide(data, nul1);
+                    f.value   = Utf8BytesToWide(data + textStart, len - textStart);
+                    out.push_back(std::move(f));
+                }
+            }
+        }
+        // zTXt (zlib-compressed tEXt) intentionally skipped — no zlib
+        // dependency in this project to decompress it.
+
+        pos = dataStart + len + 4;  // + 4-byte CRC
+    }
+
+    return !out.empty();
+}
+
+// ---------------------------------------------------------------------
+// Raw WebP XMP-chunk reader.
+//
+// WIC's WebP decoder doesn't surface the "XMP " RIFF chunk through its
+// metadata query reader at all, so any XMP payload — hand-edited, or
+// written by a tool that stashes arbitrary fields there the same way
+// Stable Diffusion / ComfyUI stash them in PNG tEXt chunks — is otherwise
+// invisible. This walks the RIFF chunk list directly, grabs the "XMP "
+// chunk's XML payload, and pulls out every child element of every
+// rdf:Description block regardless of namespace prefix or tag name — the
+// same "don't assume a fixed keyword list" approach as the PNG reader
+// above.
+// ---------------------------------------------------------------------
+static std::wstring DecodeXmlEntities(const std::wstring& in)
+{
+    std::wstring out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); )
+    {
+        if (in[i] == L'&')
+        {
+            size_t semi = in.find(L';', i);
+            if (semi != std::wstring::npos && semi - i <= 10)
+            {
+                std::wstring ent = in.substr(i + 1, semi - i - 1);
+                if (ent == L"amp")  { out += L'&';  i = semi + 1; continue; }
+                if (ent == L"lt")   { out += L'<';  i = semi + 1; continue; }
+                if (ent == L"gt")   { out += L'>';  i = semi + 1; continue; }
+                if (ent == L"quot") { out += L'"';  i = semi + 1; continue; }
+                if (ent == L"apos") { out += L'\''; i = semi + 1; continue; }
+                if (ent.size() > 1 && ent[0] == L'#')
+                {
+                    bool hex = ent.size() > 2 && (ent[1] == L'x' || ent[1] == L'X');
+                    wchar_t* end = nullptr;
+                    long code = wcstol(ent.c_str() + (hex ? 2 : 1), &end, hex ? 16 : 10);
+                    if (code > 0)
+                    {
+                        out += static_cast<wchar_t>(code);
+                        i = semi + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out += in[i++];
+    }
+    return out;
+}
+
+// Strips nested tags (e.g. the rdf:Alt/rdf:li wrapper some tools put
+// around simple text values) so only the visible text remains.
+static std::wstring StripXmlTags(const std::wstring& in)
+{
+    std::wstring out;
+    out.reserve(in.size());
+    bool inTag = false;
+    for (wchar_t c : in)
+    {
+        if (c == L'<')      { inTag = true;  continue; }
+        else if (c == L'>') { inTag = false; continue; }
+        else if (!inTag)    out += c;
+    }
+    return out;
+}
+
+static std::wstring TrimWhitespace(const std::wstring& in)
+{
+    size_t start = in.find_first_not_of(L" \t\r\n");
+    if (start == std::wstring::npos) return L"";
+    size_t end = in.find_last_not_of(L" \t\r\n");
+    return in.substr(start, end - start + 1);
+}
+
+// Finds the end of an XML opening tag (the '>' that isn't inside a quoted
+// attribute value). Returns the index of that '>', or npos.
+static size_t FindTagEnd(const std::wstring& xml, size_t from, size_t limit)
+{
+    bool inQuote = false;
+    wchar_t quoteChar = 0;
+    for (size_t i = from; i < limit; ++i)
+    {
+        wchar_t c = xml[i];
+        if (inQuote) { if (c == quoteChar) inQuote = false; }
+        else if (c == L'"' || c == L'\'') { inQuote = true; quoteChar = c; }
+        else if (c == L'>') return i;
+    }
+    return std::wstring::npos;
+}
+
+static bool ReadWebpXmpFields(const std::wstring& path, std::vector<PngTextField>& out)
+{
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER sizeLI = {};
+    if (!GetFileSizeEx(hFile, &sizeLI) || sizeLI.QuadPart <= 0)
+    {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    // XMP payloads carrying large JSON blobs (ComfyUI workflows etc.) can be
+    // sizeable; 16 MB comfortably covers them without reading huge amounts
+    // of trailing pixel data unnecessarily.
+    constexpr DWORD kMaxRead = 16 * 1024 * 1024;
+    DWORD toRead = static_cast<DWORD>(min(sizeLI.QuadPart, (LONGLONG)kMaxRead));
+
+    std::vector<BYTE> buf(toRead);
+    DWORD bytesRead = 0;
+    bool ok = ReadFile(hFile, buf.data(), toRead, &bytesRead, nullptr) != 0;
+    CloseHandle(hFile);
+    if (!ok || bytesRead < 12)
+        return false;
+
+    if (memcmp(&buf[0], "RIFF", 4) != 0 || memcmp(&buf[8], "WEBP", 4) != 0)
+        return false;
+
+    auto readLE32 = [&](size_t at) -> UINT32
+    {
+        return UINT32(buf[at]) | (UINT32(buf[at + 1]) << 8) |
+               (UINT32(buf[at + 2]) << 16) | (UINT32(buf[at + 3]) << 24);
+    };
+
+    // Walk the RIFF chunk list looking for "XMP " (the standard WebP
+    // metadata FourCC for an embedded XMP packet).
+    std::string xmpUtf8;
+    size_t pos = 12;
+    while (pos + 8 <= bytesRead)
+    {
+        UINT32 chunkLen = readLE32(pos + 4);
+        size_t dataStart = pos + 8;
+
+        if (dataStart + chunkLen > bytesRead)
+            break;  // chunk runs past what we read — stop rather than misread
+
+        if (memcmp(&buf[pos], "XMP ", 4) == 0)
+        {
+            xmpUtf8.assign(reinterpret_cast<const char*>(&buf[dataStart]), chunkLen);
+            break;
+        }
+
+        pos = dataStart + chunkLen + (chunkLen & 1);  // chunks are word-aligned
+    }
+
+    if (xmpUtf8.empty())
+        return false;
+
+    std::wstring xmp = Utf8BytesToWide(xmpUtf8.data(), xmpUtf8.size());
+
+    // Pull out every child element of every rdf:Description block. (A
+    // document can legally have more than one, so keep scanning instead of
+    // stopping at the first.)
+    size_t searchFrom = 0;
+    while (true)
+    {
+        size_t descStart = xmp.find(L"<rdf:Description", searchFrom);
+        if (descStart == std::wstring::npos)
+            break;
+
+        size_t openEnd = FindTagEnd(xmp, descStart, xmp.size());
+        if (openEnd == std::wstring::npos)
+            break;
+
+        bool selfClosing = (openEnd > 0 && xmp[openEnd - 1] == L'/');
+        size_t contentStart = openEnd + 1;
+
+        size_t descEnd = xmp.find(L"</rdf:Description>", contentStart);
+        if (descEnd == std::wstring::npos)
+            descEnd = xmp.size();
+
+        if (!selfClosing)
+        {
+            size_t p = contentStart;
+            while (p < descEnd)
+            {
+                size_t tagOpen = xmp.find(L'<', p);
+                if (tagOpen == std::wstring::npos || tagOpen >= descEnd)
+                    break;
+
+                if (xmp[tagOpen + 1] == L'/')  // stray/unexpected close tag
+                {
+                    p = tagOpen + 1;
+                    continue;
+                }
+
+                size_t nameEnd = tagOpen + 1;
+                while (nameEnd < descEnd && !iswspace(xmp[nameEnd]) &&
+                       xmp[nameEnd] != L'>' && xmp[nameEnd] != L'/')
+                    ++nameEnd;
+                std::wstring tagName = xmp.substr(tagOpen + 1, nameEnd - tagOpen - 1);
+
+                size_t childOpenEnd = FindTagEnd(xmp, nameEnd, descEnd);
+                if (childOpenEnd == std::wstring::npos)
+                    break;
+
+                bool childSelfClosing = (childOpenEnd > 0 && xmp[childOpenEnd - 1] == L'/');
+                size_t innerStart = childOpenEnd + 1;
+
+                if (childSelfClosing || tagName.empty())
+                {
+                    p = innerStart;
+                    continue;
+                }
+
+                std::wstring closeTag = L"</" + tagName + L">";
+                size_t innerEnd = xmp.find(closeTag, innerStart);
+                if (innerEnd == std::wstring::npos || innerEnd > descEnd)
+                {
+                    p = innerStart;
+                    continue;
+                }
+
+                std::wstring rawValue = xmp.substr(innerStart, innerEnd - innerStart);
+                std::wstring value = TrimWhitespace(DecodeXmlEntities(StripXmlTags(rawValue)));
+
+                if (!value.empty())
+                {
+                    size_t colon = tagName.find(L':');
+                    std::wstring keyword = (colon != std::wstring::npos) ? tagName.substr(colon + 1) : tagName;
+
+                    PngTextField f;
+                    f.keyword = keyword;
+                    f.value   = value;
+                    out.push_back(std::move(f));
+                }
+
+                p = innerEnd + closeTag.size();
+            }
+        }
+
+        searchFrom = descEnd + 1;
+    }
+
+    return !out.empty();
+}
+
+void ShowImageMetadata(HWND hWnd)
+{
+    if (g_currentFilePath.empty() || !g_wicFactory)
+        return;
+
+    // AVIF/JXL go through this app's own custom decoders rather than a WIC
+    // codec, so there's no WIC metadata query reader to pull tags from.
+    std::wstring extLower = g_currentFilePath.substr(g_currentFilePath.rfind(L'.'));
+    std::transform(extLower.begin(), extLower.end(), extLower.begin(), ::towlower);
+    if (extLower == L".avif" || extLower == L".jxl")
+    {
+        TaskDialog(hWnd, hInst, L"Image metadata", L"Not supported for this format",
+            L"Reading embedded metadata isn't supported for AVIF/JXL files yet.",
+            TDCBF_OK_BUTTON, TD_INFORMATION_ICON, nullptr);
+        return;
+    }
+
+    std::wstring body;
+    bool foundAny = false;
+
+    // PNG text chunks — parsed directly from the file so arbitrary keywords
+    // (Stable Diffusion / ComfyUI's "prompt"/"workflow", Automatic1111's
+    // "parameters", etc.) are found regardless of what they're named.
+    if (extLower == L".png")
+    {
+        std::vector<PngTextField> fields;
+        if (ReadPngTextChunks(g_currentFilePath, fields))
+        {
+            // Shown in a scrollable, selectable edit control (see
+            // ShowMetadataViewerWindow below), so there's no need to
+            // truncate long fields like Stable Diffusion / ComfyUI
+            // "prompt"/"workflow" text — show it in full.
+            for (auto& f : fields)
+            {
+                body += f.keyword + L":\n" + f.value + L"\n\n";
+                foundAny = true;
+            }
+        }
+    }
+
+    // WebP XMP chunk — same idea as the PNG text chunks above, but WIC's
+    // WebP decoder doesn't expose "XMP " through its metadata query reader
+    // at all, so this is parsed straight from the RIFF chunk list.
+    if (extLower == L".webp")
+    {
+        std::vector<PngTextField> fields;
+        if (ReadWebpXmpFields(g_currentFilePath, fields))
+        {
+            for (auto& f : fields)
+            {
+                body += f.keyword + L":\n" + f.value + L"\n\n";
+                foundAny = true;
+            }
+        }
+    }
+
+    // EXIF / TIFF-style tags via WIC — present on JPEG and TIFF files from
+    // cameras, and occasionally on PNG (eXIf chunk) or WebP (EXIF chunk)
+    // files exported from editing tools. JPEG exposes these under
+    // "/app1/ifd/..." (the APP1 marker), but PNG/WebP containers expose the
+    // same tags under "/ifd/..." instead — no APP1 marker, since that's a
+    // JPEG-specific concept — so both roots are tried for every tag.
+    ComPtr<IWICBitmapDecoder> decoder;
+    HRESULT hr = g_wicFactory->CreateDecoderFromFilename(
+        g_currentFilePath.c_str(), nullptr, GENERIC_READ,
+        WICDecodeMetadataCacheOnDemand, &decoder);
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    if (SUCCEEDED(hr))
+        hr = decoder->GetFrame(0, &frame);
+
+    ComPtr<IWICMetadataQueryReader> reader;
+    if (SUCCEEDED(hr))
+        hr = frame->GetMetadataQueryReader(&reader);
+
+    if (SUCCEEDED(hr) && reader)
+    {
+        foundAny |= AppendSimpleField(reader.Get(),   L"/app1/ifd/{ushort=271}",        L"Camera make",   body)
+                 || AppendSimpleField(reader.Get(),   L"/ifd/{ushort=271}",             L"Camera make",   body);
+        foundAny |= AppendSimpleField(reader.Get(),   L"/app1/ifd/{ushort=272}",        L"Camera model",  body)
+                 || AppendSimpleField(reader.Get(),   L"/ifd/{ushort=272}",             L"Camera model",  body);
+        foundAny |= AppendSimpleField(reader.Get(),   L"/app1/ifd/exif/{ushort=36867}", L"Date taken",    body)
+                 || AppendSimpleField(reader.Get(),   L"/ifd/exif/{ushort=36867}",      L"Date taken",    body);
+        foundAny |= AppendSimpleField(reader.Get(),   L"/app1/ifd/{ushort=306}",        L"Date modified", body)
+                 || AppendSimpleField(reader.Get(),   L"/ifd/{ushort=306}",             L"Date modified", body);
+        foundAny |= AppendRationalField(reader.Get(), L"/app1/ifd/exif/{ushort=33434}", L"Exposure time", L"%.3g s", body, /*asShutterFraction=*/true)
+                 || AppendRationalField(reader.Get(), L"/ifd/exif/{ushort=33434}",      L"Exposure time", L"%.3g s", body, /*asShutterFraction=*/true);
+        foundAny |= AppendRationalField(reader.Get(), L"/app1/ifd/exif/{ushort=33437}", L"F-number",      L"f/%.1f", body)
+                 || AppendRationalField(reader.Get(), L"/ifd/exif/{ushort=33437}",      L"F-number",      L"f/%.1f", body);
+        foundAny |= AppendSimpleField(reader.Get(),   L"/app1/ifd/exif/{ushort=34855}", L"ISO speed",     body)
+                 || AppendSimpleField(reader.Get(),   L"/ifd/exif/{ushort=34855}",      L"ISO speed",     body);
+        foundAny |= AppendRationalField(reader.Get(), L"/app1/ifd/exif/{ushort=37386}", L"Focal length",  L"%.1f mm", body)
+                 || AppendRationalField(reader.Get(), L"/ifd/exif/{ushort=37386}",      L"Focal length",  L"%.1f mm", body);
+        foundAny |= AppendSimpleField(reader.Get(),   L"/app1/ifd/{ushort=305}",        L"Software",      body)
+                 || AppendSimpleField(reader.Get(),   L"/ifd/{ushort=305}",             L"Software",      body);
+        foundAny |= AppendSimpleField(reader.Get(),   L"/app1/ifd/{ushort=315}",        L"Artist",        body)
+                 || AppendSimpleField(reader.Get(),   L"/ifd/{ushort=315}",             L"Artist",        body);
+        foundAny |= AppendSimpleField(reader.Get(),   L"/app1/ifd/{ushort=33432}",      L"Copyright",     body)
+                 || AppendSimpleField(reader.Get(),   L"/ifd/{ushort=33432}",           L"Copyright",     body);
+        foundAny |= AppendGpsCoordinate(reader.Get(), L"/app1/ifd/gps", body)
+                 || AppendGpsCoordinate(reader.Get(), L"/ifd/gps",      body);
+    }
+
+    if (!foundAny)
+    {
+        TaskDialog(hWnd, hInst, L"Image metadata", L"No metadata found",
+            L"This image doesn't contain any readable embedded metadata.",
+            TDCBF_OK_BUTTON, TD_INFORMATION_ICON, nullptr);
+        return;
+    }
+
+    std::wstring windowTitle = L"Image metadata \u2014 " + g_currentFileName;
+    ShowMetadataViewerWindow(hWnd, windowTitle, body);
+}
+
+// A resizable window with a read-only multiline edit control showing the
+// full metadata text. Unlike TaskDialog (used previously), this supports
+// mouse-wheel scrolling, text selection/copying, and doesn't truncate long
+// content.
+LRESULT CALLBACK MetadataViewerWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    static HFONT  s_font      = nullptr;
+    static HBRUSH s_editBrush = nullptr;
+    static HBRUSH s_bkBrush   = nullptr;
+
+    switch (message)
+    {
+    case WM_CREATE:
+    {
+        HWND hEdit = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"EDIT", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP |
+            ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_LEFT,
+            0, 0, 0, 0, hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_METADATA_EDIT)),
+            hInst, nullptr);
+
+        // Remove the ~30k-character default cap so long fields (e.g. full
+        // Stable Diffusion / ComfyUI prompt+workflow text) display in full.
+        SendMessageW(hEdit, EM_SETLIMITTEXT, 0, 0);
+
+        NONCLIENTMETRICSW ncm = { sizeof(ncm) };
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+        {
+            if (s_font) DeleteObject(s_font);
+            s_font = CreateFontIndirectW(&ncm.lfMessageFont);
+            SendMessageW(hEdit, WM_SETFONT, reinterpret_cast<WPARAM>(s_font), TRUE);
+        }
+
+        auto* cs   = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        auto* body = reinterpret_cast<const std::wstring*>(cs->lpCreateParams);
+        if (body)
+            SetWindowTextW(hEdit, body->c_str());
+
+        EnableDarkTitleBar(hWnd);
+        break;
+    }
+    case WM_SIZE:
+    {
+        HWND hEdit = GetDlgItem(hWnd, IDC_METADATA_EDIT);
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        constexpr int margin = 8;
+        MoveWindow(hEdit, margin, margin,
+            (rc.right - rc.left) - margin * 2,
+            (rc.bottom - rc.top) - margin * 2, TRUE);
+        break;
+    }
+    case WM_CTLCOLOREDIT:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, RGB(225, 225, 225));
+        SetBkColor(hdc, RGB(32, 32, 32));
+        if (!s_editBrush)
+            s_editBrush = CreateSolidBrush(RGB(32, 32, 32));
+        return reinterpret_cast<LRESULT>(s_editBrush);
+    }
+    case WM_ERASEBKGND:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        if (!s_bkBrush)
+            s_bkBrush = CreateSolidBrush(RGB(24, 24, 24));
+        FillRect(hdc, &rc, s_bkBrush);
+        return 1;
+    }
+    case WM_SETFOCUS:
+        SetFocus(GetDlgItem(hWnd, IDC_METADATA_EDIT));
+        break;
+    case WM_GETMINMAXINFO:
+    {
+        auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+        mmi->ptMinTrackSize.x = 480;
+        mmi->ptMinTrackSize.y = 360;
+        break;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDCANCEL)
+        {
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_METADATA_SELECTALL)
+        {
+            SendMessageW(GetDlgItem(hWnd, IDC_METADATA_EDIT), EM_SETSEL, 0, -1);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hWnd);
+        return 0;
+    case WM_DESTROY:
+        if (s_font)      { DeleteObject(s_font);      s_font      = nullptr; }
+        if (s_editBrush) { DeleteObject(s_editBrush);  s_editBrush = nullptr; }
+        if (s_bkBrush)   { DeleteObject(s_bkBrush);    s_bkBrush   = nullptr; }
+        g_metadataViewerWnd = nullptr;
+        break;
+    }
+    return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+ATOM RegisterMetadataViewerClass(HINSTANCE hInstance)
+{
+    WNDCLASSEXW wcex   = {};
+    wcex.cbSize        = sizeof(WNDCLASSEX);
+    wcex.style         = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc   = MetadataViewerWndProc;
+    wcex.hInstance     = hInstance;
+    wcex.hIcon         = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_PICASSOPICTURES));
+    wcex.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+    wcex.hbrBackground = nullptr; // painted manually in WM_ERASEBKGND for the dark theme
+    wcex.lpszClassName = L"MetadataViewerClass";
+    wcex.hIconSm       = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL));
+    return RegisterClassExW(&wcex);
+}
+
+// Shows the metadata text in a resizable, ownerdrawn-dark window with a
+// read-only multiline edit control (mouse-wheel scroll, text selection,
+// and Ctrl+C copying all work natively; no truncation). Runs its own
+// message loop so it behaves like a modal dialog, matching the previous
+// TaskDialog behavior.
+void ShowMetadataViewerWindow(HWND owner, const std::wstring& title, const std::wstring& body)
+{
+    static bool s_classRegistered = false;
+    if (!s_classRegistered)
+    {
+        RegisterMetadataViewerClass(hInst);
+        s_classRegistered = true;
+    }
+
+    if (g_metadataViewerWnd)
+    {
+        DestroyWindow(g_metadataViewerWnd);
+        g_metadataViewerWnd = nullptr;
+    }
+
+    // Size relative to the monitor's work area so the window is roomy on
+    // large displays instead of the small fixed size used previously.
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mi);
+    const int workW = mi.rcWork.right  - mi.rcWork.left;
+    const int workH = mi.rcWork.bottom - mi.rcWork.top;
+
+    int width  = static_cast<int>(workW * 0.75);
+    int height = static_cast<int>(workH * 0.85);
+
+    RECT ownerRc;
+    GetWindowRect(owner, &ownerRc);
+    const int x = ownerRc.left + ((ownerRc.right - ownerRc.left) - width) / 2;
+    const int y = ownerRc.top  + ((ownerRc.bottom - ownerRc.top) - height) / 2;
+
+    g_metadataViewerWnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW,
+        L"MetadataViewerClass", title.c_str(),
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+        x, y, width, height,
+        owner, nullptr, hInst, const_cast<std::wstring*>(&body));
+
+    if (!g_metadataViewerWnd)
+        return;
+
+    ShowWindow(g_metadataViewerWnd, SW_SHOW);
+    UpdateWindow(g_metadataViewerWnd);
+
+    // Disable the owner and pump our own messages while the viewer is open
+    // so it behaves like a modal dialog (same UX as the TaskDialog it
+    // replaces), and so Escape / Ctrl+A work no matter which child has
+    // focus.
+    EnableWindow(owner, FALSE);
+
+    ACCEL accels[] = {
+        { FVIRTKEY,            VK_ESCAPE, IDCANCEL },
+        { FVIRTKEY | FCONTROL, L'A',      IDC_METADATA_SELECTALL },
+    };
+    HACCEL hAccel = CreateAcceleratorTable(accels, ARRAYSIZE(accels));
+
+    MSG msg;
+    while (IsWindow(g_metadataViewerWnd) && GetMessage(&msg, nullptr, 0, 0))
+    {
+        if (hAccel && (msg.hwnd == g_metadataViewerWnd || IsChild(g_metadataViewerWnd, msg.hwnd)) &&
+            TranslateAccelerator(g_metadataViewerWnd, hAccel, &msg))
+            continue;
+
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    if (hAccel)
+        DestroyAcceleratorTable(hAccel);
+
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+}
+
+// Plain data carried into PropertiesDlgProc via DialogBoxParamW's lParam.
+// Every field is pre-formatted display text; fields that don't apply to
+// the current image (e.g. "Date taken" on a screenshot) are left as an
+// em dash rather than the row being hidden, so the dialog's layout is
+// completely static — same spirit as IDD_COMMANDBOX.
+struct ImagePropertiesFields
+{
+    std::wstring windowTitle;
+    std::wstring fileName;
+    std::wstring location;
+    std::wstring size;
+    std::wstring format;
+    std::wstring dimensions;
+    std::wstring bitDepth;
+    std::wstring transparency;
+    std::wstring resolution;
+    std::wstring created;
+    std::wstring modified;
+    std::wstring dateTaken;
+    std::wstring colorSpace;
+    std::wstring orientation;
+};
+
+// Dialog proc for IDD_PROPERTIES — a bespoke, fixed-layout dialog template
+// (built the same way as IDD_COMMANDBOX / "Keyboard shortcuts": static
+// labels baked into the .rc, values filled in at WM_INITDIALOG) rather than
+// the resizable MetadataViewerClass window used by "View metadata". Modal,
+// like About() and the shortcuts box, so no manual message pump is needed.
+INT_PTR CALLBACK PropertiesDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_INITDIALOG:
+    {
+        const auto* f = reinterpret_cast<const ImagePropertiesFields*>(lParam);
+        if (f)
+        {
+            SetWindowTextW(hDlg, f->windowTitle.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_FILENAME,     f->fileName.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_LOCATION,     f->location.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_SIZE,         f->size.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_FORMAT,       f->format.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_DIMENSIONS,   f->dimensions.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_BITDEPTH,     f->bitDepth.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_TRANSPARENCY, f->transparency.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_RESOLUTION,   f->resolution.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_CREATED,      f->created.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_MODIFIED,     f->modified.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_DATETAKEN,    f->dateTaken.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_COLORSPACE,   f->colorSpace.c_str());
+            SetDlgItemTextW(hDlg, IDC_PROP_ORIENTATION,  f->orientation.c_str());
+        }
+        return (INT_PTR)TRUE;
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(hDlg, LOWORD(wParam));
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
+// Shows an in-app "Properties" dialog for the current image, built as its
+// own DIALOGEX template (IDD_PROPERTIES) — a bespoke, fixed-size window in
+// the same style as "Keyboard shortcuts", rather than reusing the
+// resizable free-text viewer behind "View metadata". Covers the
+// file-system-level facts Explorer's own Properties dialog leads with
+// (name, location, size, timestamps) plus a handful of quick image-level
+// facts (format, dimensions, bit depth, transparency, resolution, color
+// space, orientation, date taken). Full embedded EXIF (camera/lens/GPS/
+// software/etc.) is intentionally left to "View metadata" rather than
+// duplicated here.
+void ShowImageProperties(HWND hWnd)
+{
+    if (g_currentFilePath.empty())
+        return;
+
+    std::wstring extLower = g_currentFilePath.substr(g_currentFilePath.rfind(L'.'));
+    std::transform(extLower.begin(), extLower.end(), extLower.begin(), ::towlower);
+
+    const wchar_t* kNotAvailable = L"\u2014"; // em dash, shown for fields that don't apply
+    ImagePropertiesFields f;
+
+    // ---- File-system properties ----
+    f.fileName = g_currentFileName;
+
+    std::wstring location = g_currentFilePath;
+    size_t slash = location.find_last_of(L"\\/");
+    f.location = (slash != std::wstring::npos) ? location.substr(0, slash) : L".";
+
+    f.size = f.created = f.modified = kNotAvailable;
+    WIN32_FILE_ATTRIBUTE_DATA attr = {};
+    if (GetFileAttributesExW(g_currentFilePath.c_str(), GetFileExInfoStandard, &attr))
+    {
+        ULARGE_INTEGER size;
+        size.HighPart = attr.nFileSizeHigh;
+        size.LowPart  = attr.nFileSizeLow;
+        f.size     = FormatFileSizeW(size.QuadPart);
+        f.created  = FormatFileTimeW(attr.ftCreationTime);
+        f.modified = FormatFileTimeW(attr.ftLastWriteTime);
+    }
+
+    f.format = ImageFormatNameFromExtension(extLower);
+
+    // ---- Image properties (from the already-decoded WIC source, so this
+    // doesn't need to touch disk again) ----
+    f.dimensions = f.bitDepth = f.transparency = f.resolution = kNotAvailable;
+
+    if (g_imageWidth > 0 && g_imageHeight > 0)
+    {
+        wchar_t dimBuf[64];
+        swprintf_s(dimBuf, L"%d \u00D7 %d pixels", g_imageWidth, g_imageHeight);
+        f.dimensions = dimBuf;
+    }
+
+    if (g_wicBitmapSource && g_wicFactory)
+    {
+        WICPixelFormatGUID pf;
+        if (SUCCEEDED(g_wicBitmapSource->GetPixelFormat(&pf)))
+        {
+            ComPtr<IWICComponentInfo> compInfo;
+            if (SUCCEEDED(g_wicFactory->CreateComponentInfo(pf, &compInfo)))
+            {
+                ComPtr<IWICPixelFormatInfo2> pfInfo;
+                if (SUCCEEDED(compInfo.As(&pfInfo)))
+                {
+                    UINT bpp = 0;
+                    if (SUCCEEDED(pfInfo->GetBitsPerPixel(&bpp)) && bpp > 0)
+                        f.bitDepth = std::to_wstring(bpp) + L" bits per pixel";
+
+                    BOOL hasAlpha = FALSE;
+                    if (SUCCEEDED(pfInfo->SupportsTransparency(&hasAlpha)))
+                        f.transparency = hasAlpha ? L"Yes" : L"No";
+                }
+            }
+        }
+
+        double dpiX = 0.0, dpiY = 0.0;
+        if (SUCCEEDED(g_wicBitmapSource->GetResolution(&dpiX, &dpiY)) && dpiX > 0.0 && dpiY > 0.0)
+        {
+            wchar_t dpiBuf[64];
+            if (std::lround(dpiX) == std::lround(dpiY))
+                swprintf_s(dpiBuf, L"%.0f DPI", dpiX);
+            else
+                swprintf_s(dpiBuf, L"%.0f x %.0f DPI", dpiX, dpiY);
+            f.resolution = dpiBuf;
+        }
+    }
+
+    // A few EXIF fields that belong on "Properties" as much as on the raw
+    // metadata dump. AVIF/JXL go through this app's own decoders rather
+    // than a WIC codec, so there's no metadata query reader to read these
+    // from — same limitation as "View metadata".
+    f.dateTaken = f.colorSpace = f.orientation = kNotAvailable;
+
+    if (extLower != L".avif" && extLower != L".jxl" && g_wicFactory)
+    {
+        ComPtr<IWICBitmapDecoder> decoder;
+        HRESULT hr = g_wicFactory->CreateDecoderFromFilename(
+            g_currentFilePath.c_str(), nullptr, GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand, &decoder);
+
+        ComPtr<IWICBitmapFrameDecode> frame;
+        if (SUCCEEDED(hr))
+            hr = decoder->GetFrame(0, &frame);
+
+        ComPtr<IWICMetadataQueryReader> reader;
+        if (SUCCEEDED(hr))
+            hr = frame->GetMetadataQueryReader(&reader);
+
+        if (SUCCEEDED(hr) && reader)
+        {
+            std::wstring val;
+            if (ReadDateTakenValue(reader.Get(), L"/app1/ifd/exif/{ushort=36867}", val)
+                || ReadDateTakenValue(reader.Get(), L"/ifd/exif/{ushort=36867}", val))
+                f.dateTaken = val;
+
+            val.clear();
+            if (ReadColorSpaceValue(reader.Get(), L"/app1/ifd/exif/{ushort=40961}", val)
+                || ReadColorSpaceValue(reader.Get(), L"/ifd/exif/{ushort=40961}", val))
+                f.colorSpace = val;
+
+            val.clear();
+            if (ReadOrientationValue(reader.Get(), L"/app1/ifd/{ushort=274}", val)
+                || ReadOrientationValue(reader.Get(), L"/ifd/{ushort=274}", val))
+                f.orientation = val;
+        }
+    }
+
+    f.windowTitle = L"Properties \u2014 " + g_currentFileName;
+
+    // Owned by hWnd, so IsOwnedByOurWindow() in WM_ACTIVATE recognizes it
+    // automatically — no manual fullscreen-exit suppression needed.
+    DialogBoxParamW(hInst, MAKEINTRESOURCE(IDD_PROPERTIES), hWnd, PropertiesDlgProc,
+        reinterpret_cast<LPARAM>(&f));
+}
+
 bool OpenImageFile(HWND hWnd)
 {
     // Buffer that will receive the selected file path
@@ -5003,17 +6978,14 @@ bool OpenImageFile(HWND hWnd)
     ofn.lpstrDefExt = L"jpg";
 
     // In fullscreen the overlay is the real render target.  Use it as the
-    // dialog owner so that (a) focus-change messages target the overlay and
-    // (b) the suppress guard below keeps the WM_ACTIVATE(WA_INACTIVE) that
-    // fires during the dialog lifetime from leaking past the guard window.
+    // dialog owner so that focus-change messages target the overlay. This
+    // also makes the dialog an owned window of g_overlayWindow, which
+    // IsOwnedByOurWindow() recognizes in WM_ACTIVATE — no manual suppression
+    // needed here anymore.
     if (g_isFullscreen && g_overlayWindow && IsWindow(g_overlayWindow))
         ofn.hwndOwner = g_overlayWindow;
 
-    // Suppress the WM_ACTIVATE/WA_INACTIVE exit that fires when the dialog
-    // steals focus from the fullscreen overlay.
-    g_suppressFullscreenExit = true;
     bool got = GetOpenFileName(&ofn) != FALSE;
-    g_suppressFullscreenExit = false;
 
     if (!got)
         return false;   // User cancelled
@@ -5698,7 +7670,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (LOWORD(wParam) == WA_INACTIVE)
         {
-            if (g_isFullscreen && g_fullScreenInitDone && !g_suppressFullscreenExit)
+            // lParam is the HWND becoming active. If it's one of our own
+            // owned windows (About box, metadata viewer, a common dialog,
+            // etc.) this isn't a real focus loss — see IsOwnedByOurWindow.
+            HWND becoming = reinterpret_cast<HWND>(lParam);
+            bool ownWindowTookFocus = becoming && IsOwnedByOurWindow(becoming);
+
+            if (g_isFullscreen && g_fullScreenInitDone &&
+                g_suppressFullscreenExitDepth == 0 && !ownWindowTookFocus)
             {
                 // Post rather than call directly — ExitFullscreen destroys the
                 // overlay and calls SetFocus while Windows is mid-focus-change,
@@ -5748,6 +7727,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             OpenImageFile(hWnd);
             break;
         case IDM_ABOUT:
+            // DialogBox is owned by hWnd, so IsOwnedByOurWindow() in
+            // WM_ACTIVATE recognizes it automatically — no manual
+            // suppression needed.
             DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
             break;
         case IDM_EXIT:
@@ -5767,6 +7749,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         case IDM_MENU_HQ_FILTER:
         {
+            // Pure registry write, no window involved — never needed
+            // suppression in the first place.
             g_useHQFilter = !g_useHQFilter;
             DWORD val = g_useHQFilter ? 1 : 0;
             HKEY hKey;
@@ -5780,7 +7764,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             break;
         }
 
+        case IDM_MENU_FIT_TO_SCREEN:
+        {
+            // Pure registry write, no window involved — never needed
+            // suppression in the first place.
+            g_openFitToScreen = !g_openFitToScreen;
+            DWORD val = g_openFitToScreen ? 1 : 0;
+            HKEY hKey;
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\PicassoPictures",
+                                0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+            {
+                RegSetValueExW(hKey, L"FitToScreen", 0, REG_DWORD,
+                               reinterpret_cast<const BYTE*>(&val), sizeof(val));
+                RegCloseKey(hKey);
+            }
+            break;
+        }
+
         case IDM_MENU_ASSOCIATE:
+            // AssociateFileTypes shows a TaskDialogIndirect owned by hWnd —
+            // recognized automatically by IsOwnedByOurWindow().
             AssociateFileTypes(hWnd);
             break;
 
@@ -5846,20 +7849,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
 
         case IDM_CTX_PROPERTIES:
-        {
-            if (g_currentFilePath.empty()) break;
-            SHELLEXECUTEINFOW sei = {};
-            sei.cbSize = sizeof(sei);
-            sei.fMask  = SEE_MASK_INVOKEIDLIST;
-            sei.hwnd   = hWnd;
-            sei.lpVerb = L"properties";
-            sei.lpFile = g_currentFilePath.c_str();
-            ShellExecuteExW(&sei);
+            // ShowImageProperties's dialog is owned by hWnd — recognized
+            // automatically by IsOwnedByOurWindow(), same as "View
+            // metadata" below.
+            ShowImageProperties(hWnd);
             break;
-        }
+
+        case IDM_CTX_METADATA:
+            // ShowImageMetadata's viewer window is owned by hWnd —
+            // recognized automatically by IsOwnedByOurWindow().
+            ShowImageMetadata(hWnd);
+            break;
 
         case IDM_CTX_WALLPAPER:
         {
+            // Both MessageBoxW calls below are owned by hWnd, so they're
+            // recognized automatically by IsOwnedByOurWindow() — no manual
+            // suppression needed. (The old version set the suppress flag
+            // true at the top of this block and had two early `break`s
+            // before the reset at the bottom, which used to leave
+            // fullscreen-exit permanently disabled after hitting either
+            // one — that whole class of bug goes away once nothing here
+            // has to set/reset a flag by hand.)
             if (g_currentFilePath.empty()) break;
             auto ext = g_currentFilePath.substr(g_currentFilePath.rfind(L'.'));
             std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
@@ -5975,13 +7986,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         AppendMenuW(hMenu, MF_SEPARATOR, 0,                    nullptr);
         AppendMenuW(hMenu, MF_STRING,    IDM_CTX_OPEN_FOLDER, L"Open containing folder");
         AppendMenuW(hMenu, MF_STRING,    IDM_CTX_PROPERTIES,  L"Properties");
+        AppendMenuW(hMenu, MF_STRING,    IDM_CTX_METADATA,    L"View metadata");
         AppendMenuW(hMenu, MF_SEPARATOR, 0,                    nullptr);
         AppendMenuW(hMenu, MF_STRING,    IDM_CTX_WALLPAPER,   L"Set as wallpaper");
 
         POINT pt;
         GetCursorPos(&pt);
-        SetForegroundWindow(hWnd);
-        TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+        // Same reasoning as the hamburger menu: TrackPopupMenu's internal
+        // menu window isn't one of our owned windows, and SetForegroundWindow
+        // is what fires WA_INACTIVE — so this needs an explicit suppression
+        // scope around both calls.
+        {
+            FullscreenExitSuppressor guard;
+            SetForegroundWindow(hWnd);
+            TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+        }
         DestroyMenu(hMenu);
         return 0;
     }
@@ -6501,7 +8520,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     
     case WM_APP_EXITFULLSCREEN:
     {
-        if (g_isFullscreen)
+        // Re-check the suppress depth here, not just at post-time. This
+        // message is posted (queued), so by the time it's actually
+        // dispatched — which can happen well after the WM_ACTIVATE
+        // (WA_INACTIVE) that posted it, e.g. once a modal popup menu's
+        // internal message pump gets around to it — an intervening guard
+        // (hamburger menu, etc.) may have opened a new suppression scope.
+        // Without this check the stale post fires anyway and exits
+        // fullscreen out from under whatever UI is currently suppressing it.
+        if (g_isFullscreen && g_suppressFullscreenExitDepth == 0)
             ExitFullscreen();
         return 0;
     }
@@ -6543,6 +8570,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
             StopDirectoryWatcher();
             StopThumbnailLoader();
+            StopAnimDecodeThread();
             DiscardDeviceResources();
             g_wicDefaultBackground.Reset();
             g_wicBackground.Reset();
@@ -6581,6 +8609,7 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
         }
         return (INT_PTR)TRUE;
     }
+
 
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
