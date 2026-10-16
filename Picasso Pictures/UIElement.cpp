@@ -1,4 +1,4 @@
-﻿#include "UIElement.h"
+#include "UIElement.h"
 #include <cmath>
 
 void UIElement::SetLayout(const Layout& layout)
@@ -198,7 +198,7 @@ void UIElement::UpdateLayoutForSize(float rtWidth, float rtHeight)
 void UIElement::UpdateProximity(float mouseX, float mouseY, float windowWidth, float windowHeight)
 {
     // Track whether the cursor is directly over the element's own visual rect.
-    // This is used by the tooltip dwell timer � independent of the activation zone.
+    // This is used by the tooltip dwell timer - independent of the activation zone.
     m_mouseOverSelf = (mouseX >= m_rect.left && mouseX <= m_rect.right &&
                        mouseY >= m_rect.top  && mouseY <= m_rect.bottom);
 

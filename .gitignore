@@ -361,3 +361,26 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# ---- project-specific (added when the 8-file split finished) ----
+
+# Editor / agent tooling directories - local config, never part of the project
+.continue/
+.localpilot/
+.vscode/
+
+# Local-only PowerShell helpers (build wrapper, grep, split/refactor tools).
+# They stay in the working copy for whoever does the next refactor, but the app
+# does not need them and they are not part of the .vcxproj.
+*.ps1
+
+# Snapshot that split_helper.ps1 slice writes before a move. Git history is the
+# real snapshot; this file only exists to re-verify one slice.
+*.bak
+
+
+# Session handoff notes, not project documentation: KICKOFF.md is the "what to do
+# next" brief for the next session, TODO.md is the working bug list, hello.txt is
+# free-form scratch space. All three stay in the working copy only.
+KICKOFF.md
+hello.txt
+TODO.md

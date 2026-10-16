@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wrl/client.h>
@@ -57,7 +57,7 @@ public:
         float referenceWidth = 0.f;
         float referenceHeight = 0.f;
 
-        // Tooltip font size — relative to uiPixelScale, same for all elements.
+        // Tooltip font size - relative to uiPixelScale, same for all elements.
         // Override only if you need a custom size; the default matches a comfortable
         // small label that stays readable at typical screen sizes.
         float tooltipFontSize = 0.013f;
@@ -120,7 +120,7 @@ protected:
     // Called automatically by UpdateLayout on scale change and by InitializeLayout.
     void EnsureTextFormat();
 
-    // Shared DWrite factory � set by derived class during Initialize.
+    // Shared DWrite factory - set by derived class during Initialize.
     Microsoft::WRL::ComPtr<IDWriteFactory>     m_dwriteFactory;
     Microsoft::WRL::ComPtr<IDWriteTextFormat>  m_textFormat;
 

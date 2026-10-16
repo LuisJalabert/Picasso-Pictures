@@ -147,6 +147,15 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
+    <ClInclude Include="Globals.h" />
+    <ClInclude Include="ViewMath.h" />
+    <ClInclude Include="Fullscreen.h" />
+    <ClInclude Include="Rendering.h" />
+    <ClInclude Include="Decoding.h" />
+    <ClInclude Include="Thumbnails.h" />
+    <ClInclude Include="UI.h" />
+    <ClInclude Include="Metadata.h" />
+    <ClInclude Include="Dialogs.h" />
     <ClInclude Include="AnimatedButton.h" />
     <ClInclude Include="UIElement.h" />
     <ClInclude Include="UITextBox.h" />
@@ -155,6 +164,15 @@
     <ClInclude Include="targetver.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Globals.cpp" />
+    <ClCompile Include="ViewMath.cpp" />
+    <ClCompile Include="Fullscreen.cpp" />
+    <ClCompile Include="Rendering.cpp" />
+    <ClCompile Include="Decoding.cpp" />
+    <ClCompile Include="Thumbnails.cpp" />
+    <ClCompile Include="UI.cpp" />
+    <ClCompile Include="Metadata.cpp" />
+    <ClCompile Include="Dialogs.cpp" />
     <ClCompile Include="UIElement.cpp" />
     <ClCompile Include="UITextBox.cpp" />
     <ClCompile Include="Picasso Pictures.cpp" />
