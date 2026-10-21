@@ -81,9 +81,19 @@ int GetMonitorRefreshRate(HWND hWnd)
                             ENUM_CURRENT_SETTINGS,
                             &dm))
     {
-        int refreshRate = dm.dmDisplayFrequency;
-        return refreshRate;
+        // EnumDisplaySettings can succeed with dmDisplayFrequency left at 0
+        // (some remote/virtual displays), and every caller divides by this
+        // value - g_view.smooth * 60.0f / refreshRate - so 0 would produce inf
+        // or NaN and break the zoom spring. Treat it the same as "unknown".
+        if (dm.dmDisplayFrequency > 0)
+            return dm.dmDisplayFrequency;
     }
     return 60; // Default to 60 Hz if we can't get the actual refresh rate
+}
+
+float SmoothAlpha(float perFrameAt60Hz, float dt)
+{
+    const float a = perFrameAt60Hz * dt * 60.0f;
+    return (a > 1.0f) ? 1.0f : a;
 }
 

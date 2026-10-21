@@ -75,7 +75,21 @@ void AssociateFileTypes(HWND hWnd)
     // 2. Write registry entries
     // ----------------------------------------------------------------
     wchar_t exePath[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    DWORD pathLen = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (pathLen == 0 || pathLen >= MAX_PATH)
+    {
+        // 0 = failed, MAX_PATH = the path did not fit and was truncated. Either way
+        // the open command written below would be empty or cut off mid-path, which is
+        // a broken association that the result dialog would still have reported as a
+        // success - so nothing is registered at all.
+        TaskDialog(hWnd, g_app.instance,
+            L"File association",
+            L"Could not determine the program path",
+            L"Picasso Pictures could not find its own executable, so no file "
+            L"associations were changed.",
+            TDCBF_OK_BUTTON, TD_WARNING_ICON, nullptr);
+        return;
+    }
 
     static const wchar_t* PROG_ID      = L"PicassoPictures.ImageFile";
     static const wchar_t* FRIENDLY     = L"Picasso Pictures Image";
@@ -98,19 +112,23 @@ void AssociateFileTypes(HWND hWnd)
         return ok;
     };
 
-    // ProgID + open command
+    bool allOk = true;
+
+    // ProgID + open command. These two are what actually make double-clicking a file
+    // work, so their failure has to reach the result dialog - it used to track only
+    // the per-extension writes below and could announce "Done!" with the ProgID or
+    // its open command missing.
     std::wstring progBase = std::wstring(L"Software\\Classes\\") + PROG_ID;
-    RegSetStr(progBase.c_str(),                               nullptr, FRIENDLY);
-    RegSetStr((progBase + L"\\shell\\open\\command").c_str(), nullptr, openCmd);
+    if (!RegSetStr(progBase.c_str(),                               nullptr, FRIENDLY)) allOk = false;
+    if (!RegSetStr((progBase + L"\\shell\\open\\command").c_str(), nullptr, openCmd))   allOk = false;
 
     // App capabilities (shows up in Windows Settings -> Default Apps)
     static const wchar_t* CAP_KEY = L"Software\\PicassoPictures\\Capabilities";
-    RegSetStr(L"Software\\RegisteredApplications", L"PicassoPictures", CAP_KEY);
-    RegSetStr(CAP_KEY, L"ApplicationName",          L"Picasso Pictures");
-    RegSetStr(CAP_KEY, L"ApplicationDescription",   L"Lightweight image viewer");
+    if (!RegSetStr(L"Software\\RegisteredApplications", L"PicassoPictures", CAP_KEY))  allOk = false;
+    if (!RegSetStr(CAP_KEY, L"ApplicationName",         L"Picasso Pictures"))          allOk = false;
+    if (!RegSetStr(CAP_KEY, L"ApplicationDescription",  L"Lightweight image viewer"))  allOk = false;
 
     // Per-extension association
-    bool allOk = true;
     for (auto ext : exts)
     {
         std::wstring extKey = std::wstring(L"Software\\Classes\\") + ext;
@@ -141,15 +159,16 @@ void AssociateFileTypes(HWND hWnd)
         TaskDialog(hWnd, g_app.instance,
             L"File association",
             L"Some types could not be associated",
-            L"One or more file types could not be registered.\n"
-            L"Try running Picasso Pictures as administrator and trying again.",
+            L"One or more registry values could not be written.\n"
+            L"Everything here goes under the current user's own registry (HKCU), so "
+            L"this is not something running as administrator would fix - a group "
+            L"policy or a per-user file-type lock is the usual cause.",
             TDCBF_OK_BUTTON, TD_WARNING_ICON, nullptr);
     }
 }
 
 INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
-    UNREFERENCED_PARAMETER(lParam);
     switch (message)
     {
     case WM_INITDIALOG:

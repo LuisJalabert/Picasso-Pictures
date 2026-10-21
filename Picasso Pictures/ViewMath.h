@@ -29,6 +29,17 @@ bool OffsetsFromPan(HWND hWnd, float zoom, float imgW, float imgH, float panX, f
 // the unrotated rect. False when no image is loaded.
 bool IsPointOverImage(float x, float y);
 
-// Refresh rate of the monitor hosting hWnd, via EnumDisplaySettings; 60 if unknown.
-// (Not geometry, but it is a monitor query with no dependencies, so it lives here.)
+// Refresh rate of the monitor hosting hWnd, via EnumDisplaySettings. Never
+// returns 0 - falls back to 60 when the query fails or reports 0, because every
+// caller divides by it. (Not geometry, but it is a monitor query with no
+// dependencies, so it lives here.)
 int GetMonitorRefreshRate(HWND hWnd);
+
+// Convert a smoothing factor written as "the fraction one 60 Hz frame consumes" into
+// the factor for the actual frame time dt (seconds), so a fade or a dwell timer takes
+// the same wall-clock time at 60, 120 or 144 Hz. This is the convention
+// SLIDESHOW_FADE_STEP in Globals.h already documents ("UpdateEngine multiplies it by
+// dt * 60"). At dt == 1/60 it returns the input unchanged apart from float rounding
+// (0.08000001 for 0.08f), so 60 Hz behaviour is the same in every practical sense.
+// Clamped at 1 because a lerp factor above 1 overshoots the target.
+float SmoothAlpha(float perFrameAt60Hz, float dt);

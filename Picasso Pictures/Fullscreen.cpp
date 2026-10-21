@@ -165,7 +165,11 @@ void ExitSlideshowMode()
 
     if (g_slideshow.preFade)
     {
-        // Cancelled mid-fade before the slideshow actually started.
+        // Cancel the fade-to-black. Before UpdateEngine's phase 2 this is the whole
+        // of the slideshow, so cancelling the fade cancels the slideshow. Once phase
+        // 2 has run, g_slideshow.active is already true and the fullscreen stage-1
+        // timer is pending, so this leaves the mode on and the slideshow starts
+        // anyway - a known, accepted bug (CODE_MAP.md section 14).
         g_slideshow.preFade      = false;
         g_slideshow.preFadeAlpha = 0.0f;
         return;
@@ -236,7 +240,11 @@ void ResizeOverlayToWorkArea()
 
 void EnterFullscreen(bool preserveView, bool needsDelay)
 {
-    // Prevent duplicate first-stage calls
+    // Only a delayed entry is guarded. Re-entering fullscreen while already
+    // fullscreen would otherwise stack a second stage-1 timer; a direct call
+    // (needsDelay == false) is how the stage-1 timer runs stage 2, and running
+    // stage 2 on an already-fullscreen view is a legitimate rebuild - the
+    // slideshow's phase-2 transition does exactly that.
     if (g_view.isFullscreen && needsDelay) return;
 
     // ----------------------------------------
@@ -319,7 +327,8 @@ void EnterFullscreen(bool preserveView, bool needsDelay)
         {
             g_vignette.topBarHeightPx     = size.height * 0.08f;  // topY=0.00->bottomY=0.08
             g_vignette.bottomBarHeightPx  = size.height * 0.14f;  // topY=0.86->bottomY=1.00
-            // Activation zone: OffsetFromStart for top, OffsetFromEnd for bottom
+            // How far in from the top / bottom edge of the overlay the mouse has to
+            // be for the matching bar to show (compared against mouseY in WM_MOUSEMOVE).
             g_vignette.topActivationPx    = size.height * 0.20f;  // show when mouseY <= this
             g_vignette.bottomActivationPx = size.height * 0.20f;  // show when mouseY >= windowH - this
             g_vignette.heightsCaptured    = true;
@@ -428,64 +437,104 @@ void CompleteExitFullscreen()
     if (!g_view.isFullscreen)
         return;
 
-    if (!g_view.bitmap)
-    {
-        // No bitmap - bail out safely.
-        g_view.isFullscreen = false;
-        if (g_app.overlayWindow)
-        {
-            DestroyWindow(g_app.overlayWindow);
-            g_app.overlayWindow = nullptr;
-        }
-        g_fullscreen.wasInSlideshowOnExit = false;
-        return;
-    }
-
-    D2D1_SIZE_F imgSize = g_view.bitmap->GetSize();
-
-    RECT overlayClient;
-    GetClientRect(g_app.overlayWindow, &overlayClient);
-
-    RECT overlayRect;
-    GetWindowRect(g_app.overlayWindow, &overlayRect);
-
-    float overlayWidth  = (float)(overlayClient.right  - overlayClient.left);
-    float overlayHeight = (float)(overlayClient.bottom - overlayClient.top);
-
-    // The image is rendered rotated around its unrotated centre.
-    // g_view.offsetX/Y is the top-left of the *unrotated* rectangle, so the
-    // visual (post-rotation) bounding box must be derived from the centre
-    // and the effective (possibly swapped) screen dimensions.
-    float fitW = imgSize.width;
-    float fitH = imgSize.height;
-    {
-        const float rotMod = fmodf(fabsf(g_view.rotationAngle), 180.f);
-        if (rotMod > 44.f && rotMod < 136.f)
-            std::swap(fitW, fitH);
-    }
-    // Rotation pivot (screen-space centre of the image, invariant to rotation)
-    float cx = g_view.offsetX + imgSize.width  * g_view.zoom * 0.5f;
-    float cy = g_view.offsetY + imgSize.height * g_view.zoom * 0.5f;
-
-    float imgLeft   = cx - fitW * g_view.zoom * 0.5f;
-    float imgTop    = cy - fitH * g_view.zoom * 0.5f;
-    float imgRight  = cx + fitW * g_view.zoom * 0.5f;
-    float imgBottom = cy + fitH * g_view.zoom * 0.5f;
-
-    float visibleLeft   = max(0.0f, imgLeft);
-    float visibleTop    = max(0.0f, imgTop);
-    float offsetCorrectionX = imgLeft - visibleLeft;
-    float offsetCorrectionY = imgTop  - visibleTop;
-
-    float visibleRight  = min(overlayWidth,  imgRight);
-    float visibleBottom = min(overlayHeight, imgBottom);
-
-    float clientWidth  = visibleRight  - visibleLeft;
-    float clientHeight = visibleBottom - visibleTop;
+    // A fullscreen entry that is still waiting on its stage-1 delay must not
+    // survive this teardown. EnterFullscreen's first stage arms ENTER_FULL_SCREEN
+    // on the main window and nothing else cancels it, so an exit that happens
+    // inside that 150 ms window is followed by stage 2 tearing the device down and
+    // rebuilding it for an overlay this function then throws away - a wasted full
+    // re-upload plus a visible flash.
+    KillTimer(g_app.mainWindow, static_cast<UINT_PTR>(TimerId::ENTER_FULL_SCREEN));
 
     const float MIN_CLIENT_W = 800.0f;
     const float MIN_CLIENT_H = 600.0f;
-    
+
+    // The windowed rect is normally derived from the part of the image that is
+    // visible on the overlay, so the window lands exactly over the picture. Two
+    // cases have nothing to derive it from: the most recent load failed (no bitmap,
+    // so no picture is on screen) and fullscreen stage 1 (isFullscreen is already
+    // true but the overlay has not been created yet). Both fall back to the size and
+    // centring the window opens with - and both still need the rest of this
+    // function, because by then the main window is WS_EX_LAYERED at alpha 0:
+    // returning early leaves the app running with no visible window.
+    const bool haveImage   = g_view.bitmap       != nullptr;
+    const bool haveOverlay = g_app.overlayWindow != nullptr;
+
+    D2D1_SIZE_F imgSize    = { 0, 0 };
+    float fitW = MIN_CLIENT_W, fitH = MIN_CLIENT_H;
+    float visibleLeft = 0.0f, visibleTop = 0.0f;
+    float offsetCorrectionX = 0.0f, offsetCorrectionY = 0.0f;
+    float clientWidth  = MIN_CLIENT_W;
+    float clientHeight = MIN_CLIENT_H;
+
+    RECT baseRect;
+    GetWindowRect(haveOverlay ? g_app.overlayWindow : g_app.mainWindow, &baseRect);
+
+    if (haveImage && haveOverlay)
+    {
+        imgSize = g_view.bitmap->GetSize();
+
+        RECT overlayClient;
+        GetClientRect(g_app.overlayWindow, &overlayClient);
+
+        float overlayWidth  = (float)(overlayClient.right  - overlayClient.left);
+        float overlayHeight = (float)(overlayClient.bottom - overlayClient.top);
+
+        // The image is rendered rotated around its unrotated centre.
+        // g_view.offsetX/Y is the top-left of the *unrotated* rectangle, so the
+        // visual (post-rotation) bounding box must be derived from the centre
+        // and the effective (possibly swapped) screen dimensions.
+        fitW = imgSize.width;
+        fitH = imgSize.height;
+        {
+            const float rotMod = fmodf(fabsf(g_view.rotationAngle), 180.f);
+            if (rotMod > 44.f && rotMod < 136.f)
+                std::swap(fitW, fitH);
+        }
+        // Rotation pivot (screen-space centre of the image, invariant to rotation)
+        float cx = g_view.offsetX + imgSize.width  * g_view.zoom * 0.5f;
+        float cy = g_view.offsetY + imgSize.height * g_view.zoom * 0.5f;
+
+        float imgLeft   = cx - fitW * g_view.zoom * 0.5f;
+        float imgTop    = cy - fitH * g_view.zoom * 0.5f;
+        float imgRight  = cx + fitW * g_view.zoom * 0.5f;
+        float imgBottom = cy + fitH * g_view.zoom * 0.5f;
+
+        visibleLeft   = max(0.0f, imgLeft);
+        visibleTop    = max(0.0f, imgTop);
+        offsetCorrectionX = imgLeft - visibleLeft;
+        offsetCorrectionY = imgTop  - visibleTop;
+
+        float visibleRight  = min(overlayWidth,  imgRight);
+        float visibleBottom = min(overlayHeight, imgBottom);
+
+        clientWidth  = visibleRight  - visibleLeft;
+        clientHeight = visibleBottom - visibleTop;
+    }
+    else
+    {
+        // Nothing to derive the rect from, so reproduce what InitInstance opens
+        // with: half the screen height at the 1536:1024 aspect, centred on the
+        // monitor this window is on. (The minimum-size fallback that used to be
+        // here put the window in the top-left corner, which reads as the window
+        // having lost its place.)
+        MONITORINFO bmi = { sizeof(bmi) };
+        GetMonitorInfo(MonitorFromWindow(haveOverlay ? g_app.overlayWindow : g_app.mainWindow,
+                                         MONITOR_DEFAULTTONEAREST),
+                       &bmi);
+
+        const float launchH = (float)(bmi.rcMonitor.bottom - bmi.rcMonitor.top) * 0.5f;
+        clientWidth  = max(MIN_CLIENT_W, launchH * (1536.0f / 1024.0f));
+        clientHeight = max(MIN_CLIENT_H, launchH);
+
+        // Centred inside the window this one is replacing (the overlay, which covers
+        // the work area, or the main window during stage 1). The frame is symmetric
+        // left/right, so centring the client also centres the window horizontally.
+        const float baseW = (float)(baseRect.right  - baseRect.left);
+        const float baseH = (float)(baseRect.bottom - baseRect.top);
+        visibleLeft = (baseW - clientWidth)  * 0.5f;
+        visibleTop  = (baseH - clientHeight) * 0.5f;
+    }
+
     float oldClientW = clientWidth;
     float oldClientH = clientHeight;
 
@@ -500,8 +549,8 @@ void CompleteExitFullscreen()
     offsetCorrectionX += extraW * 0.5f;
     offsetCorrectionY += extraH * 0.5f;
 
-    int newX = overlayRect.left + (int)visibleLeft;
-    int newY = overlayRect.top  + (int)visibleTop;
+    int newX = baseRect.left + (int)visibleLeft;
+    int newY = baseRect.top  + (int)visibleTop;
 
     g_view.isFullscreen = false;
     g_fullscreen.needsInit = false;
@@ -532,18 +581,17 @@ void CompleteExitFullscreen()
     GetMonitorInfo(MonitorFromPoint({ newX, newY }, MONITOR_DEFAULTTONEAREST), &mi);
     RECT& wa = mi.rcWork;
 
-    if (winX + winW > wa.right)  winX = wa.right  - winW;
-    if (winY + winH > wa.bottom) winY = wa.bottom - winH;
-    if (winX < wa.left)          winX = wa.left;
-    if (winY < wa.top)           winY = wa.top;
-
-    SetWindowPos(
-        g_app.mainWindow,
-        nullptr,
-        winX, winY, winW, winH,
-        SWP_NOZORDER | SWP_NOACTIVATE
-    );
-
+    // Clamp the window into the work area, then measure how far the clamp moved it.
+    // A window that has to be shoved sideways or down (its frame always sticks past
+    // the overlay's right and bottom edges, so this fires on an ordinary exit too)
+    // needs the image moved the opposite way inside it by the same amount, which is
+    // what clampShiftX/Y feed into the offset math below.
+    //
+    // The measurement has to bracket the clamp that actually moves the window, and
+    // there has to be exactly one clamp: the second, identical clamp that used to sit
+    // after SetWindowPos could never change winX/winY, so it reported a shift of zero
+    // and silently dropped the correction - the image landed a frame-width off the
+    // screen position it had while fullscreen.
     int preClampWinX = winX;
     int preClampWinY = winY;
 
@@ -555,19 +603,31 @@ void CompleteExitFullscreen()
     int clampShiftX = winX - preClampWinX;
     int clampShiftY = winY - preClampWinY;
 
+    SetWindowPos(
+        g_app.mainWindow,
+        nullptr,
+        winX, winY, winW, winH,
+        SWP_NOZORDER | SWP_NOACTIVATE
+    );
+
     // offsetCorrectionX/Y is the visual (rotated) image left/top in the new
     // client rect.  g_view.offsetX/Y is the *unrotated* top-left, which is offset
     // from the visual edge by half the difference between unrotated and rotated
     // dimensions.  For non-rotated images fitW==imgW so the adjustment is zero.
-    float cx_new = offsetCorrectionX - (float)clampShiftX + fitW * g_view.zoom * 0.5f;
-    float cy_new = offsetCorrectionY - (float)clampShiftY + fitH * g_view.zoom * 0.5f;
-    g_view.offsetX = cx_new - imgSize.width  * g_view.zoom * 0.5f;
-    g_view.offsetY = cy_new - imgSize.height * g_view.zoom * 0.5f;
+    // Skipped when there is no image: there is no picture to place, and the view
+    // state is about to be rebuilt by the next successful load anyway.
+    if (haveImage)
+    {
+        float cx_new = offsetCorrectionX - (float)clampShiftX + fitW * g_view.zoom * 0.5f;
+        float cy_new = offsetCorrectionY - (float)clampShiftY + fitH * g_view.zoom * 0.5f;
+        g_view.offsetX = cx_new - imgSize.width  * g_view.zoom * 0.5f;
+        g_view.offsetY = cy_new - imgSize.height * g_view.zoom * 0.5f;
 
-    g_view.targetOffsetX = g_view.offsetX;
-    g_view.targetOffsetY = g_view.offsetY;
+        g_view.targetOffsetX = g_view.offsetX;
+        g_view.targetOffsetY = g_view.offsetY;
 
-    UpdateTargetZoom(g_view.zoom);
+        UpdateTargetZoom(g_view.zoom);
+    }
 
     CreateRenderTarget(g_app.mainWindow);
     RecreateImageBitmap();
@@ -601,9 +661,13 @@ void ExitFullscreen(bool immediate)
     if (!g_view.isFullscreen)
         return;
 
-    // Kill the zoom-display timer and hide the textbox in case it was visible.
-    // Safe to do immediately regardless of the fade path.
+    // Hide the zoom readout and stop its auto-hide timer. The timer was armed on
+    // whichever window MakeZoomVisible was called with - the overlay while
+    // fullscreen, or the render-target window for the zoom buttons - so killing it
+    // on the main window alone would not reach it; it dies with the overlay.
     KillTimer(g_app.mainWindow, static_cast<UINT_PTR>(TimerId::ZOOM_DISPLAY));
+    if (g_devices.renderTargetWindow && g_devices.renderTargetWindow != g_app.mainWindow)
+        KillTimer(g_devices.renderTargetWindow, static_cast<UINT_PTR>(TimerId::ZOOM_DISPLAY));
     if (!g_textBoxes.empty())
         g_textBoxes[TextBoxId::ZOOM_INPUT].SetForcedVisibility(false);
 
@@ -629,6 +693,15 @@ void ExitFullscreen(bool immediate)
 }
 void InitFullScreenExit()
 {
+    // No image on screen (the most recent load failed): there is nothing to shrink,
+    // so just start the shutdown. UpdateEngine's exit block waits for the zoom
+    // spring to settle and the overlay dim to fade, then destroys the windows.
+    if (!g_view.bitmap)
+    {
+        g_app.isExiting = true;
+        return;
+    }
+
     D2D1_SIZE_F imgSize = g_view.bitmap->GetSize();
     float centerX = g_view.offsetX + imgSize.width  * g_view.zoom / 2.0f;
     float centerY = g_view.offsetY + imgSize.height * g_view.zoom / 2.0f;

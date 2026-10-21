@@ -9,14 +9,14 @@
 //     ONLY - repeating them here would be C2522.
 //
 // Includes this module needs:
-//   * "ViewMath.h"   - GetMonitorRefreshRate, used by the exit button to
-//                      re-derive g_view.smooth for the current monitor's frame rate.
-//   * "Fullscreen.h" - EnterSlideshowMode, from the slideshow button.
+//   * "ViewMath.h"   - IsPointOverImage, used by ZoomIntoImage's cursor anchoring.
+//   * "Fullscreen.h" - EnterSlideshowMode (slideshow button) and InitFullScreenExit
+//                      (exit button).
 //   * <cmath>        - pow() in ZoomIntoImage.
 
 #include "UI.h"
-#include "ViewMath.h"    // GetMonitorRefreshRate
-#include "Fullscreen.h"  // EnterSlideshowMode
+#include "ViewMath.h"    // IsPointOverImage
+#include "Fullscreen.h"  // EnterSlideshowMode / InitFullScreenExit
 
 #include <cmath>         // pow (ZoomIntoImage)
 
@@ -203,6 +203,11 @@ void InitializeMenuButtons()
     D2D1_SIZE_F size = g_devices.renderTarget->GetSize();
     float width = 0.07f;
     float height = 0.07f;
+    // A 5%-of-height left margin, converted into normalized x: x.value is a
+    // fraction of the render-target WIDTH, so the same pixel margin needs
+    // 0.05 * height / width. Correct only for the surface it is captured on
+    // (the windowed client at startup), which is fine because anchors are
+    // captured once and never re-derived.
     openConfig.layout.x.value = 0.05f*float(size.height)/float(size.width);
     openConfig.layout.y.value = 0.05f;
     openConfig.layout.x.anchor = AnimatedButton::Anchor::OffsetFromStart;
@@ -218,7 +223,8 @@ void InitializeMenuButtons()
     openConfig.layout.referenceWidth  = size.width;
     openConfig.layout.referenceHeight = size.height;
     openConfig.layout.uiPixelScale = min(size.width, size.height);
-    openConfig.layout.tooltipFontSize = 0.03f;
+    // No auto-repeat: the callback opens the modal file dialog, so holding the
+    // button would stack dialogs. Same for the hamburger below (TrackPopupMenu).
     openConfig.holdEnabled = false;
     openConfig.pressAnimation = false;
     g_buttons[ButtonId::OPEN].Initialize(
@@ -237,9 +243,17 @@ void InitializeMenuButtons()
     // Hamburger Menu Button
     // -------------------------
 
+    // Step the hamburger along by 5.6% of the render-target WIDTH. Note this one
+    // is NOT height-normalised like the Open button's margin above, so the gap
+    // between the two buttons is proportional to the surface they were captured
+    // on, not equal to that margin in pixels.
     openConfig.layout.x.value += 0.056f;
     openConfig.text = L"\u2630";
     openConfig.tooltip = L"Menu";
+    // Auto-repeat would reopen the popup menu while the previous TrackPopupMenu
+    // is still pumping. Stated again here rather than relying on inheriting the
+    // Open button's setting through the reused openConfig.
+    openConfig.holdEnabled = false;
     g_buttons[ButtonId::HELP].Initialize(
         g_devices.renderTarget.Get(),
         g_devices.dwriteFactory.Get(),
@@ -353,6 +367,10 @@ void InitializeButtons()
     buttonConfig.text = L"\u25B6";
     buttonConfig.tooltip = L"Start slideshow\n[F5]";
 
+    // No auto-repeat: the callback toggles slideshow on/off, so holding this
+    // button would start and stop a slideshow a dozen times a second.
+    buttonConfig.holdEnabled = false;
+
     g_buttons[ButtonId::SLIDESHOW].Initialize(
         g_devices.renderTarget.Get(),
         g_devices.dwriteFactory.Get(),
@@ -376,6 +394,10 @@ void InitializeButtons()
     buttonConfig.fontSize = fontSize;
     buttonConfig.text = L"\u2795";
     buttonConfig.tooltip = L"Zoom in\n[W / \u2191]";
+
+    // buttonConfig is reused for the rest of the row, so auto-repeat is back on:
+    // zoom and rotate hold-repeat matches held W/S/Q/E on the keyboard.
+    buttonConfig.holdEnabled = true;
 
     g_buttons[ButtonId::ZOOM_IN].Initialize(
         g_devices.renderTarget.Get(),
@@ -453,6 +475,20 @@ void InitializeButtons()
     buttonConfig.text = L"\u2B9C";
     buttonConfig.tooltip = L"Previous image\n[A / \u2190]";
 
+    // A held prev/next button must not outrun the decoder. The keyboard path gates
+    // auto-repeat on g_fullscreen.navPendingRender, which is only cleared after
+    // Render presents a frame, so at most one navigation is in flight per rendered
+    // frame. The button's own repeat cadence (AnimatedButton::m_repeatInterval)
+    // stays as the rate cap; this adds the same backpressure on top.
+    // Applies to PREVIOUS and NEXT both - buttonConfig is reused between them.
+    buttonConfig.repeatGate = []()
+    {
+        if (g_fullscreen.navPendingRender)
+            return false;
+        g_fullscreen.navPendingRender = true;
+        return true;
+    };
+
     g_buttons[ButtonId::PREVIOUS].Initialize(
         g_devices.renderTarget.Get(),
         g_devices.dwriteFactory.Get(),
@@ -482,6 +518,9 @@ void InitializeButtons()
             RestartSlideshowTimer();
         });
     g_buttons[ButtonId::NEXT].UpdateLayout(g_devices.renderTarget.Get());
+    // End of the nav pair: drop the gate so any button added after this one does
+    // not inherit it (the Exit button uses its own exitConfig).
+    buttonConfig.repeatGate = nullptr;
 
     // -------------------------
     // Exit Button
@@ -492,6 +531,12 @@ void InitializeButtons()
     topRightActivationZone.right  = 1.0f;
     topRightActivationZone.bottom = 0.1f;
 
+    // Exit button inset. x.value is a fraction of width and y.value of height, so
+    // to get an inset that looks square in pixels the x fraction has to be scaled
+    // by height/width. top * 9/16 hard-codes that ratio for a 16:9 surface - on a
+    // different aspect the X glyph sits closer to (or further from) the right
+    // edge in pixels than from the top. Left as-is: it is captured once per
+    // fullscreen monitor, and the only display in use is 16:9.
     float top = 0.01f;
     float right = 1.0f - top * 9.0f / 16.0f;
 
@@ -520,35 +565,28 @@ void InitializeButtons()
         {
             if (!g_view.bitmap)
             {
-                PostQuitMessage(0);
-                return;    // no image: the shutdown is already queued, and
-                           // g_view.bitmap->GetSize() below would dereference null
+                // Destroy the main window rather than posting a quit message:
+                // WM_DESTROY is what runs the teardown - the background threads, the
+                // device resources, the containers holding COM objects. Quitting the
+                // loop from here would skip all of it. With no image there is also
+                // nothing to shrink, so this quits at once instead of animating -
+                // the same choice windowed Esc makes.
+                DestroyWindow(g_app.mainWindow);
+                return;
             }
 
-            D2D1_SIZE_F imgSize = g_view.bitmap->GetSize();
-            float centerX = g_view.offsetX + imgSize.width  * g_view.zoom / 2.0f;
-            float centerY = g_view.offsetY + imgSize.height * g_view.zoom / 2.0f;
-
-            g_view.targetOffsetX = centerX - (imgSize.width * 0.05f) / 2.0f;
-            g_view.targetOffsetY = centerY - (imgSize.height * 0.05f) / 2.0f;
-
-            int refreshRate = GetMonitorRefreshRate(GetDesktopWindow());
-            g_view.smooth = 0.18f * 60.0f / (float)refreshRate;
-
-            g_view.targetZoom = 0.0005f;
-            g_app.isExiting = true;
+            // Same shrink-to-a-point-then-quit as Esc in fullscreen: calling the one
+            // function keeps the exit animation identical from both entry points
+            // (it also owns the refresh-rate rescale of g_view.smooth).
+            InitFullScreenExit();
         });
     g_buttons[ButtonId::EXIT].UpdateLayout(g_devices.renderTarget.Get());
 
     UpdateSlideshowButton();
 }
 
-// The glyph that replaces the play triangle while a slideshow runs: a pair of
-// heavy vertical bars. U+23F8, the real pause sign, is unusable here - it has
-// emoji presentation by default and DirectWrite has no monochrome copy of it in
-// the fonts the other button glyphs come from, so it falls back to Segoe UI
-// Emoji and arrives inside a rounded square.
-static constexpr const wchar_t kSlideshowStopGlyph[] = L"\u275A\u275A";
+// The glyph that replaces the play triangle while a slideshow runs.
+static constexpr const wchar_t kSlideshowStopGlyph[] = L"\u25A0";
 
 // The slideshow button shows play while no slideshow runs and pause while one
 // does, so it doubles as the stop control. SetText only rewrites the config
@@ -593,9 +631,14 @@ void InitializeImageInfoLabel()
     config.layout.x.mode = UITextBox::PosMode::Normalized;
     config.layout.y.value = 0.97f;
     config.layout.y.anchor = UITextBox::Anchor::OffsetFromEnd;
-    config.layout.x.mode = UITextBox::PosMode::Normalized;
+    config.layout.y.mode = UITextBox::PosMode::Normalized;
 
     config.relativeFontSize = 0.016f;
+    // NOT "the full window width": Layout::width is multiplied by uiPixelScale,
+    // which is min(w,h), so 1.0f here is a box one full min-dimension across
+    // (2160 px on a 4K display) - wider than the 1604 px windowed client. It is
+    // invisible here (backgroundAlpha 0) and the text is centred in it, so the
+    // only thing that matters is that it is comfortably wide enough.
     config.layout.width  = 1.0f;
     config.layout.height = 0.05f;
 
@@ -648,10 +691,35 @@ void InitializeImageInfoLabel()
                     {
                         value = 10000.0f;
                     } 
-                    
-                    UpdateTargetZoom(value/100.0f);
-                    ZoomIntoImage(g_app.overlayWindow, 0, nullptr);
-                    
+
+                    // Anchor the typed zoom on whatever is at the CENTRE OF THE
+                    // SCREEN, the same way wheel zoom anchors on the cursor (see
+                    // ZoomIntoImage). Anchoring on the image's own centre - what
+                    // SetZoomCentered(preserveCenter = true) does - can shove the
+                    // image off screen, because after a cursor-anchored wheel zoom
+                    // the image centre is usually outside the viewport, and
+                    // preserving an off-screen centre keeps it off screen.
+                    if (!g_view.bitmap || g_view.zoom < 0.00001f)
+                        return;   // the readout stays clickable over the load-error
+                                  // screen, where there is no bitmap to measure
+
+                    RECT rc;
+                    GetClientRect(g_devices.renderTargetWindow, &rc);
+                    const float viewCX = (float)(rc.right - rc.left) * 0.5f;
+                    const float viewCY = (float)(rc.bottom - rc.top) * 0.5f;
+
+                    const float newZoom = value / 100.0f;
+
+                    // The image-space point currently sitting at the viewport centre;
+                    // hold that point in place at the new zoom. Live zoom/offset are
+                    // used on purpose, so this is correct mid-spring.
+                    const float imgX = (viewCX - g_view.offsetX) / g_view.zoom;
+                    const float imgY = (viewCY - g_view.offsetY) / g_view.zoom;
+
+                    g_view.targetOffsetX = viewCX - imgX * newZoom;
+                    g_view.targetOffsetY = viewCY - imgY * newZoom;
+                    UpdateTargetZoom(newZoom);
+
                 }
                 catch (...)
                 {

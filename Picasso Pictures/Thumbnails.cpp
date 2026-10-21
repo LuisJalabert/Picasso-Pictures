@@ -28,10 +28,47 @@ bool IsSupportedImage(const std::wstring& path);
 
 void BuildImageList(const wchar_t* filename)
 {
+    std::filesystem::path p(filename);
+    std::filesystem::path dir = p.parent_path();
+
+    // Read the directory into a local list before anything shared is touched, and
+    // with the error_code overloads rather than the throwing ones. This also runs
+    // on the WM_APP_DIRCHANGE path, where the folder can be gone by the time the
+    // notification is handled - deleted or renamed in Explorer, a drive asleep, a
+    // network share dropped - and a filesystem_error thrown there has nothing to
+    // unwind through, which takes the process down (std::terminate, 0xc0000409).
+    //
+    // A failed read is kept distinct from an empty result: if the folder could not
+    // be walked, the existing list stays exactly as it was and nothing else in
+    // this function runs - not the loader restart, not the watcher restart, not
+    // the thumbnail re-align. A transient failure therefore cannot empty the film
+    // strip, and the "nothing left to look at" handling in WM_APP_DIRCHANGE only
+    // fires for a folder that genuinely has no images in it.
+    std::vector<std::wstring> found;
+    std::error_code ec, statEc;
+    for (std::filesystem::directory_iterator it(dir, ec), end; it != end; it.increment(ec))
+    {
+        if (ec)
+            break;
+
+        // A broken symlink, or a file that vanished between the listing and the
+        // status probe, sets statEc and reads as "not a regular file". That is not
+        // a failed walk, so it gets its own error_code instead of poisoning ec.
+        if (!it->is_regular_file(statEc))
+            continue;
+
+        std::wstring path = it->path().wstring();
+        if (IsSupportedImage(path))
+            found.push_back(path);
+    }
+    if (ec)
+        return;
+
     // Stop the loader before touching g_image.files or g_thumb.entries to avoid races.
     StopThumbnailLoader();
 
-    // Snapshot existing thumbnails keyed by full path BEFORE we clear g_image.files.
+    // Snapshot existing thumbnails keyed by full path BEFORE g_image.files is
+    // replaced (the snapshot loop below still reads the previous list).
     // After the sorted list is rebuilt, a new file may land in the middle, shifting
     // all subsequent indices.  A naive resize() would misalign every thumbnail that
     // follows the insertion point.  Keying by path lets us restore each entry to
@@ -41,25 +78,12 @@ void BuildImageList(const wchar_t* filename)
         if (g_thumb.entries[i].wic || g_thumb.entries[i].d2d)
             thumbSnap[g_image.files[i]] = g_thumb.entries[i];
 
-    g_image.files.clear();
+    g_image.files = std::move(found);
     // NOTE: do NOT clear g_view.stateByPath here.  States are keyed by full path, so
     // they never collide when the folder changes, and they must survive directory-
     // change notifications (WM_APP_DIRCHANGE) that are fired after a DEL - clearing
     // them here would erase every other image's saved zoom/pan on every deletion.
     g_image.index = -1;
-
-    std::filesystem::path p(filename);
-    std::filesystem::path dir = p.parent_path();
-
-    for (auto& entry : std::filesystem::directory_iterator(dir))
-    {
-        if (!entry.is_regular_file())
-            continue;
-
-        std::wstring path = entry.path().wstring();
-        if (IsSupportedImage(path))
-            g_image.files.push_back(path);
-    }
 
     // Explorer's default "Name" sort is a natural/logical sort (e.g. "img2"
     // before "img10"), not a plain character-by-character comparison - a
@@ -216,33 +240,48 @@ void StartDirectoryWatcher(const std::wstring& dir)
             DWORD bytesReturned = 0;
             if (!GetOverlappedResult(watchHandle, &ov, &bytesReturned, FALSE))
                 break;
-            if (bytesReturned == 0) continue;
 
             // Check whether any changed file is a supported image
             bool relevant = false;
-            const FILE_NOTIFY_INFORMATION* fni =
-                reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buf);
-            for (;;)
+            if (bytesReturned == 0)
             {
-                std::wstring name(fni->FileName,
-                                  fni->FileNameLength / sizeof(WCHAR));
-                std::wstring fullPath = dir + L"\\" + name;
-                if (IsSupportedImage(fullPath))
+                // Zero bytes from ReadDirectoryChangesW does not mean "nothing
+                // changed" - it means the 4 KB buffer overflowed and the pending
+                // records were dropped. Rebuild anyway; skipping it left the film
+                // strip stale until some later change happened to fit in the buffer.
+                relevant = true;
+            }
+            else
+            {
+                const FILE_NOTIFY_INFORMATION* fni =
+                    reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buf);
+                for (;;)
                 {
-                    relevant = true;
-                    break;
+                    std::wstring name(fni->FileName,
+                                      fni->FileNameLength / sizeof(WCHAR));
+                    std::wstring fullPath = dir + L"\\" + name;
+                    if (IsSupportedImage(fullPath))
+                    {
+                        relevant = true;
+                        break;
+                    }
+                    if (fni->NextEntryOffset == 0) break;
+                    fni = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(
+                        reinterpret_cast<const BYTE*>(fni) + fni->NextEntryOffset);
                 }
-                if (fni->NextEntryOffset == 0) break;
-                fni = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(
-                    reinterpret_cast<const BYTE*>(fni) + fni->NextEntryOffset);
             }
 
             if (relevant)
             {
-                // Post to main window - safe to call from any thread
-                HWND target = g_app.overlayWindow ? g_app.overlayWindow : g_app.mainWindow;
-                if (target)
-                    PostMessage(target, WM_APP_DIRCHANGE, 0, 0);
+                // Always the main window. It is created before any watcher can
+                // start and lives until WM_DESTROY stops this thread, WndProc is
+                // the same procedure for both window classes, and unlike the
+                // overlay handle its value never changes while this thread runs -
+                // reading g_app.overlayWindow here raced with the UI thread
+                // destroying it, which could drop the notification or, worse, post
+                // to a handle the system had already handed to another window.
+                if (g_app.mainWindow)
+                    PostMessage(g_app.mainWindow, WM_APP_DIRCHANGE, 0, 0);
             }
         }
         CloseHandle(ov.hEvent);
@@ -273,8 +312,10 @@ void StartThumbnailLoader()
     // On the very first BuildImageList g_thumb.entries is empty, so nothing is carried
     // over and every file is decoded fresh.
 
-    // Grow/shrink the vector to the new file count. Entries BuildImageList has
-    // already re-deposited keep their bitmaps; new slots start null.
+    // Sizes the vector to the file count. Both callers that exist today -
+    // BuildImageList and DeleteCurrentImage in the main file - have already
+    // sized it themselves, so this is a no-op for them; it stays as the guard
+    // for a caller that arrives with a stale size.
     g_thumb.entries.resize(n);  // new slots default-construct to null wic+d2d
 
     {
@@ -387,8 +428,11 @@ void StartThumbnailLoader()
                 const UINT TARGET_H = 180u;
                 Microsoft::WRL::ComPtr<IWICBitmap> thumb;
 
-                // ---- Fast path: use the embedded JPEG thumbnail if it exists
-                // and is at least TARGET_H pixels tall (or wide for 90/270).
+                // ---- Fast path: use the embedded thumbnail if it exists and its
+                // SHORTER side is at least TARGET_H, whatever the image's
+                // orientation is - this test never looks at wicTransform, and it
+                // works because every slot is square and DrawThumbnailStrip
+                // centre-crops the bitmap into it. ----
                 // Only WIC-native formats (frame/decoder both non-null) have this. ----
                 if (frame && decoder)
                 {
@@ -482,6 +526,13 @@ void StartThumbnailLoader()
                     g_thumb.readyQueue.push({ idx, thumb });
                 }
             }
+            // Release the factory before leaving the apartment. Left to its own
+            // scope, the ComPtr destructs after CoUninitialize, and releasing a
+            // WIC factory into a shut-down apartment reads the vtable of an
+            // unmapped windowscodecs.dll (0xc0000005). It is masked today only
+            // because g_devices.wicFactory keeps that DLL loaded for the whole
+            // process; do not rely on that.
+            wic.Reset();
             CoUninitialize();
         });
 }
@@ -523,7 +574,13 @@ void DrawThumbnailStrip(float visibility)
         if (g_thumb.entries[i].d2d && clipGeo)
         {
             // Translate the RT so the cached origin-centred geometry aligns with
-            // this slot, push the clip layer, then restore the identity transform.
+            // this slot, then push the clip layer - the geometry is placed by the
+            // transform that is current at PushLayer time. The transform is then
+            // SET to identity for the bitmap draw, because the destination rect
+            // is already in absolute render-target coordinates. PopLayer does not
+            // put the translation back: the transform stays identity, which is
+            // what the dim and placeholder fills further down rely on, since they
+            // use absolute rectangles too.
             rt->SetTransform(D2D1::Matrix3x2F::Translation(cx, cy));
             rt->PushLayer(
                 D2D1::LayerParameters(D2D1::InfiniteRect(), clipGeo,
@@ -553,7 +610,11 @@ void DrawThumbnailStrip(float visibility)
         }
         else
         {
-            // Placeholder while thumbnail is still loading
+            // Placeholder brush. Reached two ways: the thumbnail has not been
+            // decoded yet, OR it has been decoded but g_thumb.clipGeos is empty,
+            // in which case there is no cached shape to clip it with and no slot
+            // can show its bitmap (the geometry is created in fullscreen stage 2;
+            // if that creation fails this is what draws instead).
             Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> ph;
             rt->CreateSolidColorBrush(
                 D2D1::ColorF(0.22f, 0.22f, 0.22f, 0.8f * visibility), &ph);

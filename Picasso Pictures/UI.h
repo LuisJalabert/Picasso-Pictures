@@ -4,13 +4,20 @@
 //
 // Read CODE_MAP.md section 8 before changing anything here - the ordering and
 // the shared globals are load-bearing:
-//   * The three Initialize* functions build the whole widget set once, at
-//     startup, against the *initial* render target: InitializeMenuButtons
-//     (Open + hamburger, always visible), InitializeButtons (the 9 in-image
-//     buttons, each with its own ActivationZone + normalized anchor +
-//     uiPixelScale = min(w,h)) and InitializeImageInfoLabel (filename display
-//     + the numeric zoom box). WM_SIZE only calls UpdateLayout on them - never
-//     re-Initialize - so any per-button state has to survive a resize.
+//   * The three Initialize* functions each run ONCE, but not together and not
+//     all at startup: InitializeMenuButtons (Open + hamburger) is called from
+//     wWinMain right after InitInstance, against the initial *windowed* render
+//     target. InitializeButtons (the 9 in-image buttons, each with its own
+//     ActivationZone + normalized anchor + uiPixelScale = min(w,h)) and
+//     InitializeImageInfoLabel (filename display + the numeric zoom box) are
+//     called only from fullscreen stage 2, against the *overlay* - so those 11
+//     widgets do not exist until the first fullscreen, and they carry a
+//     different frozen uiPixelScale from the two menu buttons.
+//     InitializeButtons also clears the menu buttons' forced visibility, so
+//     after the first fullscreen they are zone-driven (top-left corner) rather
+//     than permanently shown.
+//     WM_SIZE only calls UpdateLayout on all of them - never re-Initialize - so
+//     any per-widget state has to survive a resize.
 //   * The button click handlers are lambdas that call straight back into the
 //     navigation code (OpenImageFile / OpenPrevImage / OpenNextImage) and into
 //     Fullscreen (EnterSlideshowMode). That is why UI sits at the TOP of the
@@ -59,8 +66,10 @@ void UpdateTargetZoom(float newZoom);
 // DeleteCurrentImage.
 void InitializeImageLayout(HWND hWnd, bool hard = false);
 
-// ---- the widget set (called once, in this order, from InitInstance) ----
-void InitializeMenuButtons();      // Open (folder glyph) + hamburger, always visible
+// ---- the widget set ----
+// InitializeMenuButtons runs once from wWinMain; InitializeButtons and
+// InitializeImageInfoLabel run once from fullscreen stage 2 (Fullscreen.cpp).
+void InitializeMenuButtons();      // Open (folder glyph) + hamburger, forced visible until InitializeButtons clears that
 void InitializeButtons();          // the 9 in-image buttons + their activation zones
 void InitializeImageInfoLabel();   // TextBoxId::FILE_NAME + TextBoxId::ZOOM_INPUT
 

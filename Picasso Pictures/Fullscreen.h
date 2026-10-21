@@ -42,10 +42,16 @@ void ExitFullscreen(bool immediate = false);
 
 // Inner teardown; called from ExitFullscreen's immediate path and from
 // UpdateEngine once the exit fade finishes. It has external linkage precisely
-// because that caller lives in the main file.
+// because that caller lives in the main file. It also cancels a pending
+// stage-1 entry timer, and it runs in full even with no image or no overlay:
+// the main window is layered and fully transparent by that point, so skipping
+// the rest of the teardown would leave the app running but invisible.
 void CompleteExitFullscreen();
 
-// Shrink-to-0.0005 + g_app.isExiting; used by Esc and by "no files left".
+// Shrink-to-0.0005 + g_app.isExiting = true: this quits the whole program, it is
+// not a fullscreen exit. Callers: Esc while fullscreen, the exit button, and
+// deleting the last file in the folder. With no image on screen it only sets the
+// flag, because there is nothing to shrink.
 void InitFullScreenExit();
 
 // ---- slideshow ----

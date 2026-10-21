@@ -4,13 +4,15 @@
 // order, so the whole set can be found in one place and every module reaches
 // it via #include "Globals.h".
 //
-// Nothing in this file may depend on another global's initialisation: all
-// initialisers here are compile-time constants, so there is no static
-// init-order hazard regardless of which TU touches them first.
+// Nothing in this file may depend on another global's initialisation: no
+// definition here reads another global, so the order in which TUs run their
+// dynamic initialisation cannot matter. The struct members' defaults are all
+// constant expressions, and the two control maps default-construct empty.
 //
-// The two std::thread members here (g_anim.decodeThread, g_thumb.loaderThread) and
-// the watcher thread in Thumbnails.cpp are all joined explicitly during
-// WM_DESTROY - a joinable std::thread destructing at exit calls std::terminate.
+// The two std::thread members here (g_anim.decodeThread, g_thumb.loaderThread)
+// and the watcher thread that Thumbnails.cpp keeps to itself are all stopped and
+// joined during WM_DESTROY - a joinable std::thread destructing at exit calls
+// std::terminate.
 
 #include "Globals.h"
 

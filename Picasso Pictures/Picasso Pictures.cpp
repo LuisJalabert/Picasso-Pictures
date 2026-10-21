@@ -151,7 +151,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     std::wstring initialFile = GetInitialFileFromCommandLine();
     g_app.launchedWithFile = !initialFile.empty();
     // --- Load the strings early so we can find the existing window by class name ---
-    // (these load the same values you load later; moving them here lets FindWindow use them)
     LoadStringW(hInstance, IDS_APP_TITLE, g_app.title, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_PICASSOPICTURES, g_app.windowClass, MAX_LOADSTRING);
 
@@ -309,8 +308,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     g_devices.textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     g_devices.textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-    // Initialize global strings (already loaded above but we keep this for consistency)
-    // (If you prefer, you can remove the earlier LoadString calls and keep these here.)
+    // The same two strings again, into the same buffers: the earlier pair exists so
+    // the single-instance check could match the class name with FindWindow.
     LoadStringW(hInstance, IDS_APP_TITLE, g_app.title, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_PICASSOPICTURES, g_app.windowClass, MAX_LOADSTRING);
     MyRegisterClass(hInstance);
@@ -452,7 +451,7 @@ void UpdateEngine(float dt)
             const UINT readyCount = (UINT)max(0, g_anim.framesReadyUpTo.load());
 
             // While the background decode thread is still working through a
-            // large animated image (GIF, WebP, or AVIF), don't advance past
+            // large animated image (GIF, WebP, APNG or AVIF), don't advance past
             // the last frame it's actually produced yet (this also blocks
             // wrapping around to frame 0 before the tail end of a long
             // animation has been decoded even once). Just hold on the
@@ -633,12 +632,14 @@ void UpdateEngine(float dt)
         btn.Update(dt);
 
     for (auto& [id, txt] : g_textBoxes)
-        txt.UpdateVisibility();
+        txt.UpdateVisibility(dt, 0.08f);
 
-    // Smooth-animate vignette visibility (same feel as buttons: ~0.08 falloff)
-    const float VIGN_FALLOFF = 0.08f;
-    g_vignette.topVisibility    += (g_vignette.topTarget    - g_vignette.topVisibility)    * VIGN_FALLOFF;
-    g_vignette.bottomVisibility += (g_vignette.bottomTarget - g_vignette.bottomVisibility) * VIGN_FALLOFF;
+    // Smooth-animate vignette visibility (same falloff as the buttons' visibility,
+    // 0.08 per 60 Hz frame, rescaled by dt so the fade takes the same real time at
+    // any refresh rate - see SmoothAlpha).
+    const float vignetteAlpha = SmoothAlpha(0.08f, dt);
+    g_vignette.topVisibility    += (g_vignette.topTarget    - g_vignette.topVisibility)    * vignetteAlpha;
+    g_vignette.bottomVisibility += (g_vignette.bottomTarget - g_vignette.bottomVisibility) * vignetteAlpha;
 
     InvalidateRect(renderWindow, nullptr, FALSE);
 
@@ -646,15 +647,35 @@ void UpdateEngine(float dt)
         std::fabs(g_view.zoom - g_view.targetZoom) < 0.0005f &&
         g_fullscreen.overlayAlpha < 0.01f)
     {
-        if (g_app.overlayWindow)
+        // Destroy the main window rather than only posting a quit message:
+        // WM_DESTROY is what stops the three background threads and empties the
+        // containers holding COM objects, it destroys the overlay along with it,
+        // and it posts WM_QUIT itself. Quitting with the windows still alive
+        // leaves those threads joinable when the process's static destructors
+        // run, and a joinable std::thread destructing calls std::terminate -
+        // that is the 0xc0000409 seen on exit. The teardown used to be gated on
+        // g_app.overlayWindow, so an exit with no overlay (deleting the last
+        // file in a folder while windowed, for instance) skipped all of it.
+        //
+        // g_app.mainWindow is cleared only AFTER DestroyWindow returns: the
+        // WM_DESTROY guard is `hWnd == g_app.mainWindow`, so clearing it first
+        // would make that handler skip the whole teardown. By the time it
+        // returns, WM_DESTROY has already destroyed and cleared the overlay.
+        if (g_app.mainWindow)
         {
             DestroyWindow(g_app.mainWindow);
             g_app.mainWindow = nullptr;
+        }
+        else if (g_app.overlayWindow)
+        {
             DestroyWindow(g_app.overlayWindow);
             g_app.overlayWindow = nullptr;
+            PostQuitMessage(0);
         }
-
-        PostQuitMessage(0);
+        else
+        {
+            PostQuitMessage(0);
+        }
     }
 }
 
@@ -681,6 +702,13 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
+
+    // The one process-wide UI scale, set before any widget exists so it is never the
+    // 1.0f default. Fullscreen stage 2 overwrites it with the monitor actually being
+    // fullscreened (Fullscreen.cpp), which is what lets a tooltip on a different
+    // monitor re-measure itself. Tooltips are the only thing that reads this today:
+    // every widget sizes itself from its own Layout::uiPixelScale snapshot instead.
+    g_view.uiPixelScale = (float)min(screenW, screenH);
 
     // Use 50% of screen height
     int windowHeight = screenH / 2;
@@ -910,6 +938,25 @@ void DeleteCurrentImage(HWND hWnd, bool permanent)
 // WM_LBUTTONUP, so one click cannot both press a button and count as "clicked
 // outside the image". Only WndProc touches it, so it stays out of Globals.h.
 static bool g_buttonClaimedClick = false;
+
+// The film-strip row: the band of client y values the strip occupies, measured
+// from the same pixel-fixed anchor DrawThumbnailStrip uses. WM_LBUTTONDOWN claims
+// the row to start a drag/click gesture, and WM_LBUTTONDBLCLK has to recognize it
+// too: the second press of a double-click arrives as DBLCLK rather than another
+// WM_LBUTTONDOWN, so a handler that does not know about the row lets that press
+// fall through to the image branches.
+static bool PointInStripRow(float y, HWND hWnd)
+{
+    if (!g_thumb.sizeCaptured)
+        return false;
+
+    RECT rc;
+    GetClientRect(hWnd, &rc);
+    const float rtH     = (float)(rc.bottom - rc.top);
+    const float stripCY = rtH - g_thumb.stripInsetFromBottomPx;
+    return y >= stripCY - g_thumb.height * 0.5f &&
+           y <= stripCY + g_thumb.height * 0.5f;
+}
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -1170,14 +1217,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         case static_cast<int>(ContextMenuId::WALLPAPER):
         {
-            // Both MessageBoxW calls below are owned by hWnd, so they're
-            // recognized automatically by IsOwnedByOurWindow() - no manual
-            // suppression needed. (The old version set the suppress flag
-            // true at the top of this block and had two early `break`s
-            // before the reset at the bottom, which used to leave
-            // fullscreen-exit permanently disabled after hitting either
-            // one - that whole class of bug goes away once nothing here
-            // has to set/reset a flag by hand.)
+            // Both MessageBoxW calls below are owned by hWnd, so WM_ACTIVATE's
+            // IsOwnedByOurWindow() recognizes them and no FullscreenExitSuppressor is
+            // needed. Nothing in this block opens a suppression scope, so none of its
+            // early `break`s can leave fullscreen-exit permanently disabled.
             if (g_image.path.empty()) break;
             auto ext = g_image.path.substr(g_image.path.rfind(L'.'));
             std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
@@ -1268,7 +1311,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 g_devices.d3dDevice->CreateRenderTargetView(backBuf.Get(), nullptr, &g_devices.swapRTV);
         }
 
- 
         if (g_view.bitmap)
         {
             if (wParam == SIZE_MAXIMIZED || wParam == SIZE_RESTORED)
@@ -1277,9 +1319,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 SetZoomCentered(g_view.zoom, hWnd, true, false);
             }
         }
-
-        //return DefWindowProc(hWnd, message, wParam, lParam);
-  
     }
     break;
 
@@ -1347,7 +1386,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         for (auto& [id, box] : g_textBoxes)
         {
             if (box.OnMouseDown(x, y))
-                return 0;  // STOP - message box handled it
+            {
+                // Same claim as a button. Without it, WM_LBUTTONUP below reads this
+                // click as "clicked outside the image" and exits fullscreen - which
+                // is exactly what happens when the zoom readout (screen centre) does
+                // not happen to be over the image, e.g. after a cursor-anchored wheel
+                // zoom has panned the image away from the centre.
+                g_buttonClaimedClick = true;
+                return 0;  // STOP - text box handled it
+            }
         }
         // Thumbnail strip interaction.
         // The entire strip row is claimed on mouse-down so the user can drag to
@@ -1357,13 +1404,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (g_thumb.sizeCaptured)
         {
             RECT rc2; GetClientRect(hWnd, &rc2);
-            const float rtH      = (float)(rc2.bottom - rc2.top);
             const float rtW      = (float)(rc2.right  - rc2.left);
-            const float stripCY  = rtH - g_thumb.stripInsetFromBottomPx;
-            const float stripTop = stripCY - g_thumb.height * 0.5f;
-            const float stripBot = stripCY + g_thumb.height * 0.5f;
 
-            if (y >= stripTop && y <= stripBot)
+            if (PointInStripRow(y, hWnd))
             {
                 // Identify which slot (if any) the cursor is over - we'll need
                 // this if the gesture turns out to be a click, not a drag.
@@ -1452,6 +1495,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         // --------------------------------------------------------------------------
 
+        // A release must ALWAYS end the button press, whatever the image state is.
+        // Buttons act on the press, so if the release is skipped the button keeps
+        // m_pressed / m_holdActive set and its auto-repeat runs free, gated only by
+        // m_mouseOverSelf: hovering off pauses it, hovering back resumes it with
+        // nobody holding the mouse. Navigating onto a file that fails to load clears
+        // g_view.bitmap (LoadImageD2D resets it before decoding), which used to make
+        // the guard below swallow the release entirely.
+        for (auto& [id, btn] : g_buttons)
+        {
+            btn.OnMouseUp(x, y);
+        }
+
         if (!g_view.bitmap) break;
 
         g_view.isDragging = false;
@@ -1468,11 +1523,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (g_view.isFullscreen && !overImage && !wasReallyDragging && !buttonClaimed)
         {
             ExitFullscreen();
-        }
-
-        for (auto& [id, btn] : g_buttons)
-        {
-            btn.OnMouseUp(x, y);
         }
 
         // Handle incomplete rotations
@@ -1600,24 +1650,51 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
     case WM_LBUTTONDBLCLK:
     {
-        if (!g_view.bitmap){ 
-            OpenImageFile(hWnd);
-            break;
-        }
-
         float x = static_cast<float>(GET_X_LPARAM(lParam));
         float y = static_cast<float>(GET_Y_LPARAM(lParam));
 
         for (auto& [id, btn] : g_buttons)
         {
             if (btn.OnMouseDown(x, y))
+            {
+                // Same claim as WM_LBUTTONDOWN: the release that follows this DBLCLK
+                // must not read the gesture as "clicked outside the image".
+                g_buttonClaimedClick = true;
                 return 0;  // STOP - button handled it
+            }
         }
 
         for (auto& [id, box] : g_textBoxes)
         {
             if (box.OnMouseDown(x, y))
-                return 0;
+            {
+                g_buttonClaimedClick = true;
+                return 0;  // STOP - text box handled it
+            }
+        }
+
+        // The strip claims its whole row on the first press, so it claims this press
+        // as well. Nothing else happens here: the first press already started the
+        // gesture and the release after this message resolves it as a click or a
+        // drag. Swallowing the press keeps a double-click on a thumbnail - or on any
+        // part of the strip row - from also reaching the image branches below, which
+        // toggled the image's fit/1:1 zoom whenever the image showed behind the slot.
+        if (PointInStripRow(y, hWnd))
+        {
+            g_buttonClaimedClick = true;
+            return 0;  // STOP - strip row handled it
+        }
+
+        // No image loaded (the most recent load failed): a double-click on empty space
+        // opens the file dialog so the user can pick another file. This has to come
+        // AFTER the widget loops above - while the load-error screen is up, a
+        // double-click that landed on a button opened the dialog instead of acting on
+        // the button, because the second click of a rapid pair arrives as DBLCLK and
+        // this branch used to run before the buttons saw it.
+        if (!g_view.bitmap)
+        {
+            OpenImageFile(hWnd);
+            break;
         }
 
         bool overImage = IsPointOverImage(x, y);
@@ -1626,8 +1703,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
             EnterFullscreen(true, true); // preserve zoom & position
         }
-        else if (g_view.isFullscreen)
+        else if (g_view.isFullscreen && g_app.overlayWindow)
         {
+            // The overlay window is required: these two functions take the window
+            // whose client rect defines the fit, and during fullscreen stage 1
+            // (the 150 ms before the overlay exists) isFullscreen is already true
+            // while the overlay is still null.
             if (overImage)
             {
                 if (g_view.targetZoom == 1.0f)
@@ -1644,7 +1725,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (wParam == static_cast<UINT_PTR>(TimerId::ENTER_FULL_SCREEN))
         {
             KillTimer(hWnd, static_cast<UINT_PTR>(TimerId::ENTER_FULL_SCREEN));
-            EnterFullscreen(g_fullscreen.pendingPreserveView, false);
+            // Run stage 2 only if the delayed entry is still wanted. CompleteExitFullscreen
+            // kills this timer, but a WM_TIMER already sitting in the queue survives
+            // KillTimer, so without this an exit that happened inside the 150 ms gap
+            // would still raise an overlay for a view that is no longer fullscreen.
+            if (g_view.isFullscreen && !g_fullscreen.pendingExit && !g_app.isExiting)
+                EnterFullscreen(g_fullscreen.pendingPreserveView, false);
         }
         if (wParam == static_cast<UINT_PTR>(TimerId::KILL_ROTATION))
         {
@@ -1713,7 +1799,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             {
                 if (!g_view.bitmap)
                 {
-                    PostQuitMessage(0);
+                    // Destroy the window rather than posting a quit message:
+                    // WM_DESTROY is what runs the teardown - the three background
+                    // threads, the device resources, the containers holding COM
+                    // objects. Quitting the loop from here skips all of it and leaves
+                    // those globals to release after COM has gone away.
+                    DestroyWindow(g_app.mainWindow);
                     return 0;
                 }
                 if (g_slideshow.active)
@@ -1728,7 +1819,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 }
                 else
                 {
-                    PostQuitMessage(0);
+                    // Windowed Esc quits, but through DestroyWindow so that WM_DESTROY
+                    // runs the same teardown every other exit path gets.
+                    DestroyWindow(g_app.mainWindow);
                 }
             }
             break;
@@ -1853,6 +1946,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             const std::wstring currentPath = g_image.path;
             BuildImageList(currentPath.c_str());
 
+            // Nothing left to look at: the folder really does have no supported
+            // images any more - all of them deleted or moved out in Explorer. (A
+            // folder that cannot be read at all never reaches this point:
+            // BuildImageList keeps the previous list and returns early, so a
+            // sleeping drive or a dropped network share cannot end the program.)
+            // Same treatment as deleting the last picture in the folder: quit
+            // rather than sit on a stale bitmap with an empty film strip.
+            if (g_image.files.empty())
+            {
+                InitFullScreenExit();
+                return 0;
+            }
+
             // BuildImageList sets g_image.index to -1 if the current
             // file no longer exists; clamp to a valid image in that case.
             if (g_image.index < 0 && !g_image.files.empty())
@@ -1881,6 +1987,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             StopThumbnailLoader();
             StopAnimDecodeThread();
             DiscardDeviceResources();
+
+            // Empty the containers that still hold COM objects the discard above did
+            // not touch, while the factories that created them are still alive -
+            // CoUninitialize happens later, in wWinMain, once the message loop has
+            // exited. These are globals: anything left in them is
+            // destroyed only after main returns, releasing into a COM runtime that has
+            // already gone away. That is the crash on exit - 0xc0000005 inside ~vector
+            // -> ~ComPtr::InternalRelease.
+            // g_thumb.entries keeps the CPU-side IWICBitmap thumbnails and g_thumb
+            // .clipGeos the factory-created slot geometries; DiscardDeviceResources
+            // touches neither, and both only exist after fullscreen stage 2 - which is
+            // why closing the windowed UI never crashed and closing fullscreen always
+            // did. g_textBoxes / g_buttons are deliberately not in this list: the
+            // widgets' only COM members are DWrite objects (their factory, text format
+            // and tooltip layout), never a WIC bitmap or an object made by the device
+            // context, so nothing device-dependent is left behind there.
+            g_thumb.entries.clear();
+            g_thumb.clipGeos.clear();
+            while (!g_thumb.readyQueue.empty()) g_thumb.readyQueue.pop();
+            g_anim.frames.clear();
+            g_anim.gpuFrames.clear();
+
             g_background.wicDefaultBitmap.Reset();
             g_background.wicBitmap.Reset();
             g_image.source.Reset();
@@ -1888,7 +2016,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             g_devices.d2dFactory.Reset();
             g_devices.textFormat.Reset();
             g_devices.dwriteFactory.Reset();
-            CoUninitialize();
+            // No CoUninitialize here on purpose: CoInitialize runs once in wWinMain and
+            // its matching CoUninitialize is on the shutdown label after the message
+            // loop. This handler runs while that loop is still alive, so uninitializing
+            // COM here would unbalance the pair - the loop's own call would be the
+            // second one.
             PostQuitMessage(0);
         }
     }

@@ -6,9 +6,7 @@
 //     calls it to re-create the D2D target bitmap from the new swap-chain
 //     buffer.
 //   * ExtractMipAsD2DBitmap and RenderImageD3D11 are used before they are
-//     defined, so they are declared file-locally below. RenderImageD3D11's
-//     default argument belongs to that declaration ONLY (C2522 if it also
-//     appears on the definition).
+//     defined, so they are declared file-locally below.
 
 #include "Rendering.h"
 #include "Fullscreen.h"   // Render tears down the slideshow black-cover window
@@ -31,7 +29,7 @@
 // before first use and need no declaration.
 // ============================================================================
 static ComPtr<ID2D1Bitmap> ExtractMipAsD2DBitmap(UINT targetMaxPx);
-static void RenderImageD3D11(float imgW, float imgH, float opacity, bool isPrev = false);
+static void RenderImageD3D11(float imgW, float imgH, float opacity);
 
 bool LoadDefaultBackgroundFromResource()
 {
@@ -107,6 +105,13 @@ void DiscardDeviceResources()
     // Cached brushes
     g_pipeline.dimBrush.Reset();
     g_pipeline.blackBrush.Reset();
+    g_pipeline.errorTitleBrush.Reset();
+    g_pipeline.errorDetailBrush.Reset();
+
+    // Cached vignette brushes, keys included, so the next device context
+    // rebuilds them instead of reusing a brush made by the one being released.
+    g_pipeline.vignetteBrush[0] = {};
+    g_pipeline.vignetteBrush[1] = {};
 
     // D2D context
     g_devices.renderTarget.Reset();
@@ -181,6 +186,12 @@ bool CreateBackgroundBitmap()
 // level directly from the already-built GPU mip chain via a staging readback
 // - the GPU already downscaled the image for free as part of GenerateMips.
 // Must be called outside BeginDraw/EndDraw (or before BeginDraw in Render).
+//
+// The wash is oriented by g_view.exifRotation, NOT by g_view.rotationAngle,
+// and that is deliberate: the EXIF orientation is baked in at load and never
+// changes, so rotating with Q/E during a slideshow intentionally leaves the
+// blurred background as it was. It is also only rebuilt when bgBitmap is empty
+// (a new image, or a device rebuild), not on rotation.
 // -----------------------------------------------------------------------
 void CreateSlideshowBgBitmap()
 {
@@ -236,21 +247,25 @@ void CreateSlideshowBgBitmap()
 
     D2D1_SIZE_U smallSz = smallBmp->GetPixelSize();
 
-    // ----- 2. Create off-screen render target at the small bitmap's size -----
+    // ----- 2. Properties for the off-screen bitmap the blur is drawn into -----
     D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_TARGET,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
 
     // ----- 3. Render the Gaussian blur into the off-screen bitmap -----
-    // If the image has an EXIF rotation we must rotate the small source bitmap
-    // before blurring so the background matches the displayed orientation.
+    // The blur is applied to the unrotated small bitmap and the EXIF rotation is
+    // applied to the DRAW transform as the blurred result is drawn, which rotates
+    // the finished wash. Same visual result, cheaper than rotating the source
+    // before blurring: one small blur instead of a rotate plus a blur.
     g_slideshow.blurEffect->SetInput(0, smallBmp.Get());
 
     ComPtr<ID2D1Image> prevTarget;
     g_devices.renderTarget->GetTarget(&prevTarget);
 
     // For 90/270 rotations the blurred bg needs to be portrait, not landscape -
-    // create the offscreen target with swapped dimensions in that case.
+    // create the offscreen target with swapped dimensions in that case. The same
+    // "swap when the rotation is near 90 degrees" rule also appears in
+    // InitializeImageLayout (UI.cpp); the two have to stay in step.
     const float rotMod = fmodf(fabsf(g_view.exifRotation), 180.f);
     const bool swapDims = (rotMod > 44.f && rotMod < 136.f);
     D2D1_SIZE_U bgSz = swapDims
@@ -395,11 +410,13 @@ void CreateRenderTarget(HWND hWnd)
 
     if (!g_background.shadowEffect)
     {
-        HRESULT hr = g_devices.renderTarget->CreateEffect(
+        // hrEffect, not hr: the outer hr tracks the device/swap-chain steps above
+        // and shadowing it here would be a trap for later edits.
+        HRESULT hrEffect = g_devices.renderTarget->CreateEffect(
             CLSID_D2D1Shadow,
             &g_background.shadowEffect);
 
-        if (SUCCEEDED(hr))
+        if (SUCCEEDED(hrEffect))
         {
             g_background.shadowEffect->SetValue(
                 D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION,
@@ -409,11 +426,11 @@ void CreateRenderTarget(HWND hWnd)
 
     if (!g_slideshow.blurEffect)
     {
-        HRESULT hr = g_devices.renderTarget->CreateEffect(
+        HRESULT hrEffect = g_devices.renderTarget->CreateEffect(
             CLSID_D2D1GaussianBlur,
             &g_slideshow.blurEffect);
 
-        if (SUCCEEDED(hr))
+        if (SUCCEEDED(hrEffect))
         {
             // The std-dev is in pixels of the small bitmap this effect is fed - a
             // ~200 px mip extract, or a <=400 px WIC downscale when there is no mip
@@ -692,11 +709,10 @@ bool CreateMipTextureFromSource(IWICBitmapSource* wicSrc)
     UINT texW = max(1u, (UINT)(srcW * ratio));
     UINT texH = max(1u, (UINT)(srcH * ratio));
 
-    // Compute how many mip levels fit
-    UINT mipLevels = 1u + (UINT)floorf(log2f((float)max(texW, texH)));
-
     // Create texture with D3D11_RESOURCE_MISC_GENERATE_MIPS so GenerateMips works.
     // We must include D3D11_BIND_RENDER_TARGET for GenerateMips to work.
+    // MipLevels = 0 lets the driver allocate the whole chain for these dimensions;
+    // the SRV below asks for every level, so the count is never needed here.
     D3D11_TEXTURE2D_DESC texDesc = {};
     texDesc.Width              = texW;
     texDesc.Height             = texH;
@@ -710,9 +726,6 @@ bool CreateMipTextureFromSource(IWICBitmapSource* wicSrc)
 
     ComPtr<ID3D11Texture2D> tex;
     if (FAILED(g_devices.d3dDevice->CreateTexture2D(&texDesc, nullptr, &tex))) return false;
-
-    // ----- Get the actual mip count that was allocated -----
-    tex->GetDesc(&texDesc);   // mipLevels is now filled by the driver
 
     // ----- Decode (and optionally scale) the image to BGRA pixels -----
     ComPtr<IWICBitmapSource> src = wicSrc;
@@ -846,7 +859,7 @@ static ComPtr<ID2D1Bitmap> ExtractMipAsD2DBitmap(UINT targetMaxPx)
 // Must be called BETWEEN two D2D EndDraw/BeginDraw pairs (not inside BeginDraw).
 // Uses the global g_view.zoom / g_view.offsetX / g_view.offsetY / g_view.rotationAngle to build
 // the transform matrix each frame.
-static void RenderImageD3D11(float imgW, float imgH, float opacity, bool /*isPrev*/)
+static void RenderImageD3D11(float imgW, float imgH, float opacity)
 {
     if (!g_pipeline.ready || !g_pipeline.srv || !g_devices.swapRTV) return;
     if (!g_devices.d3dDevice || !g_devices.d3dContext)                    return;
@@ -1036,35 +1049,62 @@ static void DrawVignetteBar(ID2D1DeviceContext* rt,
     D2D1_SIZE_F sz = rt->GetSize();
     const float y0 = topY    * sz.height;
     const float y1 = bottomY * sz.height;
+    const float alpha = peakAlpha * visibility;
 
-    // stop 0 = startPoint (y0 = topY),  stop 1 = endPoint (y1 = bottomY)
-    D2D1_GRADIENT_STOP stops[2];
-    if (darkAtBottom)
+    // The stop collection is fixed when the brush is created, so the brush can
+    // only be reused while the geometry and the stop alpha are identical. That
+    // holds for every idle frame (a vignette sitting fully visible or fully
+    // hidden), which is where the frame count lives; during a fade the alpha
+    // moves each frame and the brush is rebuilt, exactly as before.
+    // The slot follows the bar's shape, which is unique here: the bottom bar is
+    // dark at the bottom, the top bar dark at the top. A second bar of the same
+    // shape would share a slot and just rebuild more often - never draw wrong.
+    auto& cache = g_pipeline.vignetteBrush[darkAtBottom ? 1 : 0];
+    const bool reusable = cache.brush
+                       && cache.y0 == y0 && cache.y1 == y1 && cache.alpha == alpha;
+
+    if (!reusable)
     {
-        stops[0].color = D2D1::ColorF(0.f, 0.f, 0.f, 0.f);               // transparent at top
-        stops[1].color = D2D1::ColorF(0.f, 0.f, 0.f, peakAlpha * visibility); // dark at bottom
+        // stop 0 = startPoint (y0 = topY),  stop 1 = endPoint (y1 = bottomY)
+        D2D1_GRADIENT_STOP stops[2];
+        if (darkAtBottom)
+        {
+            stops[0].color = D2D1::ColorF(0.f, 0.f, 0.f, 0.f);   // transparent at top
+            stops[1].color = D2D1::ColorF(0.f, 0.f, 0.f, alpha); // dark at bottom
+        }
+        else
+        {
+            stops[0].color = D2D1::ColorF(0.f, 0.f, 0.f, alpha); // dark at top
+            stops[1].color = D2D1::ColorF(0.f, 0.f, 0.f, 0.f);   // transparent at bottom
+        }
+        stops[0].position = 0.f;
+        stops[1].position = 1.f;
+
+        ComPtr<ID2D1GradientStopCollection> coll;
+        if (FAILED(rt->CreateGradientStopCollection(stops, 2, &coll)) || !coll)
+        {
+            cache = {};          // nothing usable to fall back on
+            return;
+        }
+
+        D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props;
+        props.startPoint = D2D1::Point2F(0.f, y0);
+        props.endPoint   = D2D1::Point2F(0.f, y1);
+
+        ComPtr<ID2D1LinearGradientBrush> brush;
+        if (FAILED(rt->CreateLinearGradientBrush(props, coll.Get(), &brush)) || !brush)
+        {
+            cache = {};
+            return;
+        }
+
+        cache.brush = brush;
+        cache.y0 = y0;
+        cache.y1 = y1;
+        cache.alpha = alpha;
     }
-    else
-    {
-        stops[0].color = D2D1::ColorF(0.f, 0.f, 0.f, peakAlpha * visibility); // dark at top
-        stops[1].color = D2D1::ColorF(0.f, 0.f, 0.f, 0.f);               // transparent at bottom
-    }
-    stops[0].position = 0.f;
-    stops[1].position = 1.f;
 
-    ComPtr<ID2D1GradientStopCollection> coll;
-    if (FAILED(rt->CreateGradientStopCollection(stops, 2, &coll)) || !coll)
-        return;
-
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES props;
-    props.startPoint = D2D1::Point2F(0.f, y0);
-    props.endPoint   = D2D1::Point2F(0.f, y1);
-
-    ComPtr<ID2D1LinearGradientBrush> brush;
-    if (FAILED(rt->CreateLinearGradientBrush(props, coll.Get(), &brush)) || !brush)
-        return;
-
-    rt->FillRectangle(D2D1::RectF(0.f, y0, sz.width, y1), brush.Get());
+    rt->FillRectangle(D2D1::RectF(0.f, y0, sz.width, y1), cache.brush.Get());
 }
 
 // Stretches a bitmap to cover the full render target at the given opacity.
@@ -1090,6 +1130,75 @@ static void DrawCoverBg(ID2D1Bitmap* bmp, float alpha)
         alpha,
         D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
 }
+
+// The overlay drawn on top of the image every frame: vignette bars, zoom
+// readout, film strip, buttons, text boxes. The three-pass and single-pass paths
+// drew this block twice, verbatim, so the two copies had already drifted (a
+// commented-out `if (g_view.isFullscreen)` in one of them) and each had its own
+// `s_lastDisplayedZoom` static. One copy now, one static.
+static void DrawUiOverlay(const D2D1_SIZE_F& rtSize)
+{
+    // Gradient vignette bars - only when an image is loaded.
+    // Bar thickness is fixed in pixels (captured at fullscreen init); we
+    // back-convert to normalized fractions for the current RT so the bars
+    // never grow/shrink when the window is resized.
+    if (g_view.bitmap)
+    {
+        const float vigRTH        = rtSize.height > 0.f ? rtSize.height : 1.f;
+        const float vigTopNorm    = g_vignette.heightsCaptured ? (g_vignette.topBarHeightPx    / vigRTH) : 0.08f;
+        const float vigBottomNorm = g_vignette.heightsCaptured ? (g_vignette.bottomBarHeightPx / vigRTH) : 0.14f;
+
+        // Bottom bar: transparent at (1-vigBottomNorm) -> dark at 1.0
+        DrawVignetteBar(g_devices.renderTarget.Get(),
+                        1.f - vigBottomNorm, 1.f,
+                        /*peakAlpha=*/0.65f,
+                        g_vignette.bottomVisibility,
+                        /*darkAtBottom=*/true);
+        // Top bar: dark at 0.0 -> transparent at vigTopNorm
+        DrawVignetteBar(g_devices.renderTarget.Get(),
+                        0.f, vigTopNorm,
+                        /*peakAlpha=*/0.65f,
+                        g_vignette.topVisibility,
+                        /*darkAtBottom=*/false);
+    }
+
+    // Zoom readout. Skipped while the box has focus so typing is not overwritten;
+    // the static keeps SetText off the idle frames.
+    {
+        static float s_lastDisplayedZoom = -1.f;
+        if (!g_textBoxes[TextBoxId::ZOOM_INPUT].IsFocused() &&
+            g_view.zoom != s_lastDisplayedZoom)
+        {
+            const int zoomPct = int(std::round(g_view.zoom * 100));
+            g_textBoxes[TextBoxId::ZOOM_INPUT].SetText(std::to_wstring(zoomPct));
+            s_lastDisplayedZoom = g_view.zoom;
+        }
+    }
+
+    // Thumbnail film strip (fades in/out with bottom vignette)
+    DrawThumbnailStrip(g_vignette.bottomVisibility);
+
+    for (auto& [id, btn] : g_buttons)
+    {
+        if (!g_view.isFullscreen && id == ButtonId::EXIT)
+            continue;
+        btn.Draw(g_devices.renderTarget.Get());
+    }
+
+    for (auto& [id, txt] : g_textBoxes)
+        txt.Draw(g_devices.renderTarget.Get());
+}
+
+// Cached formats for the load-error screen. An IDWriteTextFormat comes from the
+// IDWriteFactory rather than the render target, so it is device-independent and
+// survives DiscardDeviceResources. The text size is frozen the way the rest of the
+// UI is: derived from g_view.uiPixelScale (set at startup from the primary monitor,
+// refreshed at fullscreen stage 2), so a windowed resize never changes it.
+// s_errorUiScale records the scale the formats were built for; -1 = never built.
+static ComPtr<IDWriteTextFormat> s_errorTitleFmt;
+static ComPtr<IDWriteTextFormat> s_errorDetailFmt;
+static float s_errorBasePx  = 0.f;   // px the cached formats were built with
+static float s_errorUiScale = -1.f;  // g_view.uiPixelScale they belong to
 
 void Render(HWND hWnd)
 {
@@ -1377,6 +1486,11 @@ void Render(HWND hWnd)
     {
         // The last load failed: instead of the default background, show a
         // centered message over a plain dark panel covering the whole target.
+        // Windowed / slideshow: an opaque panel, because whatever is underneath is
+        // just the previous image. Fullscreen: deliberately NOT cleared - the
+        // background there is the desktop capture, which should stay put and merely
+        // be dimmed. If dimBrush is unavailable the previous content simply shows
+        // through, which is acceptable for an error screen.
         if (!g_view.isFullscreen)
             g_devices.renderTarget->Clear(D2D1::ColorF(0.12f, 0.12f, 0.12f));
         else if (g_pipeline.dimBrush)
@@ -1385,37 +1499,71 @@ void Render(HWND hWnd)
             g_devices.renderTarget->FillRectangle(D2D1::RectF(0, 0, rtSize.width, rtSize.height), g_pipeline.dimBrush.Get());
         }
 
-        const float basePx = max(12.f, min(rtSize.width, rtSize.height) * 0.035f);
-        ComPtr<IDWriteTextFormat> titleFmt, detailFmt;
-        g_devices.dwriteFactory->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, basePx, L"", &titleFmt);
-        g_devices.dwriteFactory->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, basePx * 0.55f, L"", &detailFmt);
-
-        ComPtr<ID2D1SolidColorBrush> titleBrush, detailBrush;
-        g_devices.renderTarget->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 1.f), &titleBrush);
-        g_devices.renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.75f, 0.75f, 0.75f, 1.f), &detailBrush);
-
-        if (titleFmt && detailFmt && titleBrush && detailBrush)
+        // Frozen text size, matching how the rest of the UI is sized. The scale
+        // comes from g_view.uiPixelScale - set in InitInstance from the primary
+        // monitor before anything is drawn, and overwritten by fullscreen stage 2
+        // with the monitor actually being fullscreened - NOT from the live
+        // render-target size. So a small windowed main window still gets readable
+        // text, and resizing the window cannot change it, because WM_SIZE never
+        // touches that scale.
+        // Only a complete pair is cached, so a failure leaves the cache unmarked
+        // and the next frame retries.
+        if (s_errorUiScale != g_view.uiPixelScale)
         {
-            titleFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            titleFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR);
-            detailFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            detailFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            const float basePx = max(12.f, g_view.uiPixelScale * 0.035f);
 
+            s_errorTitleFmt.Reset();
+            s_errorDetailFmt.Reset();
+
+            const HRESULT hrFmt1 = g_devices.dwriteFactory->CreateTextFormat(
+                L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, basePx, L"",
+                &s_errorTitleFmt);
+            const HRESULT hrFmt2 = g_devices.dwriteFactory->CreateTextFormat(
+                L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, basePx * 0.55f, L"",
+                &s_errorDetailFmt);
+
+            if (SUCCEEDED(hrFmt1) && s_errorTitleFmt &&
+                SUCCEEDED(hrFmt2) && s_errorDetailFmt)
+            {
+                s_errorTitleFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                s_errorTitleFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR);
+                s_errorDetailFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                s_errorDetailFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+
+                s_errorBasePx = basePx;
+                s_errorUiScale = g_view.uiPixelScale;
+            }
+        }
+
+        // The two text colours are constants, so these brushes live for the life
+        // of the device context (DiscardDeviceResources resets them).
+        if (!g_pipeline.errorTitleBrush)
+            g_devices.renderTarget->CreateSolidColorBrush(
+                D2D1::ColorF(1.f, 1.f, 1.f, 1.f), &g_pipeline.errorTitleBrush);
+        if (!g_pipeline.errorDetailBrush)
+            g_devices.renderTarget->CreateSolidColorBrush(
+                D2D1::ColorF(0.75f, 0.75f, 0.75f, 1.f), &g_pipeline.errorDetailBrush);
+
+        if (s_errorTitleFmt && s_errorDetailFmt &&
+            g_pipeline.errorTitleBrush && g_pipeline.errorDetailBrush)
+        {
             const float margin = rtSize.width * 0.08f;
             const float midY   = rtSize.height * 0.5f;
 
             const std::wstring title = L"This file is corrupted and cannot be opened.";
-            g_devices.renderTarget->DrawText(title.c_str(), (UINT32)title.size(), titleFmt.Get(),
-                D2D1::RectF(margin, 0.f, rtSize.width - margin, midY), titleBrush.Get());
+            g_devices.renderTarget->DrawText(title.c_str(), (UINT32)title.size(), s_errorTitleFmt.Get(),
+                D2D1::RectF(margin, 0.f, rtSize.width - margin, midY), g_pipeline.errorTitleBrush.Get());
 
             std::wstring detail = g_image.loadAttemptName;
             if (!g_image.lastLoadError.empty())
                 detail += (detail.empty() ? L"" : L"\n") + g_image.lastLoadError;
-            g_devices.renderTarget->DrawText(detail.c_str(), (UINT32)detail.size(), detailFmt.Get(),
-                D2D1::RectF(margin, midY + basePx * 0.4f, rtSize.width - margin, rtSize.height),
-                detailBrush.Get());
+            // s_errorBasePx, not a live size: the gap under the title belongs to the
+            // frozen text, so it stays put when the window is resized.
+            g_devices.renderTarget->DrawText(detail.c_str(), (UINT32)detail.size(), s_errorDetailFmt.Get(),
+                D2D1::RectF(margin, midY + s_errorBasePx * 0.4f, rtSize.width - margin, rtSize.height),
+                g_pipeline.errorDetailBrush.Get());
         }
     }
     else if (g_background.defaultBitmap)
@@ -1484,56 +1632,8 @@ void Render(HWND hWnd)
             // ----- Pass 3: D2D draws UI on top -----
             g_devices.renderTarget->BeginDraw();
 
-            // Gradient vignette bars - only when an image is loaded.
-            // Bar thickness is fixed in pixels (captured at fullscreen init); we
-            // back-convert to normalized fractions for the current RT so the bars
-            // never grow/shrink when the window is resized.
-            if (g_view.bitmap)
-            {
-                const float vigRTH        = rtSize.height > 0.f ? rtSize.height : 1.f;
-                const float vigTopNorm    = g_vignette.heightsCaptured ? (g_vignette.topBarHeightPx    / vigRTH) : 0.08f;
-                const float vigBottomNorm = g_vignette.heightsCaptured ? (g_vignette.bottomBarHeightPx / vigRTH) : 0.14f;
-
-                // Bottom bar: transparent at (1-vigBottomNorm) -> dark at 1.0
-                DrawVignetteBar(g_devices.renderTarget.Get(),
-                                1.f - vigBottomNorm, 1.f,
-                                /*peakAlpha=*/0.65f,
-                                g_vignette.bottomVisibility,
-                                /*darkAtBottom=*/true);
-                // Top bar: dark at 0.0 -> transparent at vigTopNorm
-                DrawVignetteBar(g_devices.renderTarget.Get(),
-                                0.f, vigTopNorm,
-                                /*peakAlpha=*/0.65f,
-                                g_vignette.topVisibility,
-                                /*darkAtBottom=*/false);
-            }
-
-            // Update zoom text box
-            {
-                static float s_lastDisplayedZoom = -1.f;
-                int zoomPct = int(std::round(g_view.zoom * 100));
-                if (!g_textBoxes[TextBoxId::ZOOM_INPUT].IsFocused())
-                {
-                    if (g_view.zoom != s_lastDisplayedZoom)
-                    {
-                        g_textBoxes[TextBoxId::ZOOM_INPUT].SetText(std::to_wstring(zoomPct));
-                        s_lastDisplayedZoom = g_view.zoom;
-                    }
-                }
-            }
-
-            // Thumbnail film strip (fades in/out with bottom vignette)
-            DrawThumbnailStrip(g_vignette.bottomVisibility);
-
-            for (auto& [id, btn] : g_buttons)
-            {
-                if (!g_view.isFullscreen && id == ButtonId::EXIT)
-                    continue;
-                btn.Draw(g_devices.renderTarget.Get());
-            }
-
-            for (auto& [id, txt] : g_textBoxes)
-                txt.Draw(g_devices.renderTarget.Get());
+            // Vignette bars, zoom readout, film strip, buttons, text boxes.
+            DrawUiOverlay(rtSize);
 
             hr = g_devices.renderTarget->EndDraw();
 
@@ -1552,52 +1652,8 @@ void Render(HWND hWnd)
     {
         // ----- Single-pass: everything in one BeginDraw/EndDraw -----
 
-        // Gradient vignette bars (same as three-pass path, pixel-fixed thickness)
-        if (g_view.bitmap)
-        {
-                const float vigRTH        = rtSize.height > 0.f ? rtSize.height : 1.f;
-                const float vigTopNorm    = g_vignette.heightsCaptured ? (g_vignette.topBarHeightPx    / vigRTH) : 0.08f;
-                const float vigBottomNorm = g_vignette.heightsCaptured ? (g_vignette.bottomBarHeightPx / vigRTH) : 0.14f;
-
-                DrawVignetteBar(g_devices.renderTarget.Get(),
-                                1.f - vigBottomNorm, 1.f,
-                                /*peakAlpha=*/0.65f,
-                                g_vignette.bottomVisibility,
-                                /*darkAtBottom=*/true);
-                DrawVignetteBar(g_devices.renderTarget.Get(),
-                                0.f, vigTopNorm,
-                                /*peakAlpha=*/0.65f,
-                                g_vignette.topVisibility,
-                                /*darkAtBottom=*/false);
-        }
-
-        // Update zoom text box
-        {
-            static float s_lastDisplayedZoom = -1.f;
-            int zoomPct = int(std::round(g_view.zoom * 100));
-            if (!g_textBoxes[TextBoxId::ZOOM_INPUT].IsFocused())
-            {
-                if (g_view.zoom != s_lastDisplayedZoom)
-                {
-                    g_textBoxes[TextBoxId::ZOOM_INPUT].SetText(std::to_wstring(zoomPct));
-                    s_lastDisplayedZoom = g_view.zoom;
-                }
-            }
-        }
-
-        // Thumbnail film strip (fades in/out with bottom vignette)
-        //if (g_view.isFullscreen)
-            DrawThumbnailStrip(g_vignette.bottomVisibility);
-
-        for (auto& [id, btn] : g_buttons)
-        {
-            if (!g_view.isFullscreen && id == ButtonId::EXIT)
-                continue;
-            btn.Draw(g_devices.renderTarget.Get());
-        }
-
-        for (auto& [id, txt] : g_textBoxes)
-            txt.Draw(g_devices.renderTarget.Get());
+        // Vignette bars, zoom readout, film strip, buttons, text boxes.
+        DrawUiOverlay(rtSize);
 
         hr = g_devices.renderTarget->EndDraw();
 

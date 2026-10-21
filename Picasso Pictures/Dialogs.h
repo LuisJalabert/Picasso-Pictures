@@ -11,7 +11,10 @@
 //     Software\PicassoPictures\Capabilities keys and one
 //     Software\Classes\<ext> -> ProgID value per extension, and finally
 //     SHChangeNotify(SHCNE_ASSOCCHANGED) so Explorer picks it up without a
-//     restart. The result TaskDialog reports whether every extension took.
+//     restart. The result TaskDialog reports whether every write succeeded (the
+//     ProgID, its open command, the Capabilities keys and the per-extension values
+//     all feed that verdict), and a GetModuleFileNameW failure or truncated path
+//     aborts before anything is written.
 //   * About is ONE dialog proc serving TWO templates: IDD_ABOUTBOX (IDM_ABOUT,
 //     MenuCommandId::ABOUT) and IDD_COMMANDBOX (ID_HELP_COMMANDS,
 //     MenuCommandId::SHORTCUTS). There is no separate "Keyboard shortcuts" function

@@ -1,5 +1,4 @@
 #include "UITextBox.h"
-#include <cwctype>
 #include <cmath>
 
 using Microsoft::WRL::ComPtr;
@@ -64,14 +63,21 @@ void UITextBox::Draw(ID2D1RenderTarget* rt)
 
         if (bg)
             rt->FillRoundedRectangle(&rounded, bg.Get());
+    }
 
-        float borderAlpha = m_focused ? 1.0f : 0.0f;
+    //
+    // ---- Focus border ----
+    //
+    // Deliberately NOT inside the backgroundAlpha block above: an editable box with
+    // no background would otherwise get no focus feedback at all. m_focused alone is
+    // the right condition - only an editable box can ever take focus.
+    //
+    if (m_focused)
+    {
         ComPtr<ID2D1SolidColorBrush> borderBrush;
-        rt->CreateSolidColorBrush(
-            D2D1::ColorF(1.f, 1.f, 1.f, borderAlpha * m_visibility),
-            &borderBrush);
-
-        if (borderBrush)
+        if (SUCCEEDED(rt->CreateSolidColorBrush(
+                D2D1::ColorF(1.f, 1.f, 1.f, m_visibility),
+                &borderBrush)) && borderBrush)
         {
             rt->DrawRoundedRectangle(
                 &rounded,
@@ -81,11 +87,17 @@ void UITextBox::Draw(ID2D1RenderTarget* rt)
     }
 
     //
-    // ---- Selection Highlight (full box highlight) ----
+    // ---- "Whole string selected" highlight ----
+    //
+    // Not a text selection - the box has no caret and no selection range. This
+    // pulses while the entire string counts as selected, i.e. right after the box
+    // gained focus and before the first keystroke replaces it.
     //
     if (m_focused && m_selectAllOnFocus && !m_text.empty())
     {
-        float pulse = 0.5f + 0.5f * sinf(m_focusPulseTime*2.0);
+        // 0.5 .. 1.5, then scaled by the 0.25 below, so the pulse covers an alpha of
+        // 0.125 .. 0.375. Not an alpha on its own despite the name.
+        float pulse = 0.5f + 0.5f * sinf(m_focusPulseTime * 2.0f);
         float highlightAlpha = 0.5f + 1.0f * pulse;
         ComPtr<ID2D1SolidColorBrush> highlight;
         rt->CreateSolidColorBrush(
@@ -130,64 +142,50 @@ void UITextBox::SetText(const std::wstring& text)
     m_text = text;
 }
 
-bool UITextBox::AcceptChar(wchar_t c) const
-{
-    if (!m_config.isEditable)
-        return false;
-
-    if (c == L'\r' || c == L'\n')
-        return false;
-
-    switch (m_config.inputMode)
-    {
-    case InputMode::Any:
-        return (c >= 32);
-
-    case InputMode::NumericInteger:
-        return (std::iswdigit(c) || c == L'-');
-
-    case InputMode::NumericFloat:
-        return (std::iswdigit(c) || c == L'-' || c == L'.');
-
-    default:
-        return false;
-    }
-}
-
+// The single place that decides what may be typed. There used to be a separate
+// AcceptChar() describing these rules, but nothing called it and its rules did not
+// match what was actually enforced (it allowed '-', which was never inserted), so
+// it read as the spec while being dead code.
 void UITextBox::OnChar(wchar_t c)
 {
     if (!m_config.isEditable || !m_focused)
         return;
+
+    // The whole string counts as selected right after the box gains focus, so the
+    // first character typed replaces it.
     if (m_selectAllOnFocus)
     {
         m_text.clear();
         m_selectAllOnFocus = false;
     }
+
+    // Control characters never insert. This is what keeps Enter, Escape and
+    // Backspace out of the text: on the WM_CHAR path they arrive here as 13 / 27 / 8.
     if (c < 32)
         return;
 
-    if (m_config.inputMode == InputMode::Any)
+    switch (m_config.inputMode)
     {
+    case InputMode::Any:
+        // No further filtering beyond the control-character check above. No
+        // editable Any-mode box exists today.
         m_text += c;
-    }
-    else if (m_config.inputMode == InputMode::NumericInteger)
-    {
+        break;
+
+    case InputMode::NumericInteger:
         if (c >= L'0' && c <= L'9')
             m_text += c;
-    }
-    else if (m_config.inputMode == InputMode::NumericFloat)
-    {
-        if ((c >= L'0' && c <= L'9') ||
-            (c == L'.' && m_text.find(L'.') == std::wstring::npos))
-        {
-            m_text += c;
-        }
+        break;
 
-        // Ignore percentage symbol silently
-        else if (c == L'%')
-        {
-            return;
-        }
+    case InputMode::NumericFloat:
+        // Digits plus at most one decimal point. A minus sign is deliberately not
+        // accepted: the only editable box is the zoom readout, where a negative
+        // value has no meaning (its callback clamps to 1..10000 anyway).
+        if (c >= L'0' && c <= L'9')
+            m_text += c;
+        else if (c == L'.' && m_text.find(L'.') == std::wstring::npos)
+            m_text += c;
+        break;
     }
 }
 
@@ -204,14 +202,28 @@ void UITextBox::OnKeyDown(WPARAM key)
     }
     if (key == VK_BACK && !m_text.empty())
     {
-        m_text.pop_back();
+        // While the whole string counts as selected, Backspace replaces that
+        // "selection" instead of deleting a single character - what a box with a
+        // real selection would do.
+        if (m_selectAllOnFocus)
+        {
+            m_text.clear();
+            m_selectAllOnFocus = false;
+        }
+        else
+        {
+            m_text.pop_back();
+        }
     }
     else if (key == VK_RETURN)
     {
+        // Enter commits: the callback applies the value and the box loses focus.
+        // m_selectAllOnFocus is deliberately left set - nothing reads it while the
+        // box is unfocused, and OnMouseDown re-sets it on the next focus click.
         if (m_callback)
             m_callback(m_text);
 
-        m_focused = false; // optional: lose focus after enter
+        m_focused = false;
     }
 }
 

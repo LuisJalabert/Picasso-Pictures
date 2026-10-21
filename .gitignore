@@ -378,9 +378,11 @@ FodyWeavers.xsd
 *.bak
 
 
-# Session handoff notes, not project documentation: KICKOFF.md is the "what to do
-# next" brief for the next session, TODO.md is the working bug list, hello.txt is
-# free-form scratch space. All three stay in the working copy only.
+# Session handoff notes and working trackers, not project documentation:
+# KICKOFF.md is the "what to do next" brief for the next session, MODULE_AUDIT.md
+# tracks which modules have had their line-by-line comment-vs-code pass, hello.txt
+# is free-form scratch space. All of these stay in the working copy only.
 KICKOFF.md
 hello.txt
 TODO.md
+MODULE_AUDIT.md

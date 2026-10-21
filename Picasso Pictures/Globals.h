@@ -1,22 +1,25 @@
 #pragma once
 // Globals.h : shared global state + shared types for Picasso Pictures.
 //
-// Every module (Rendering / Decoding / Metadata / Fullscreen / Thumbnails /
-// UI / Dialogs) touches these variables, so they are DECLARED here (extern)
-// and DEFINED once, in the same order, in "Globals.cpp" - defining a global
-// in a header would be an ODR violation, and per-module accessors would be
-// pure noise.
+// Every module (ViewMath / Fullscreen / Rendering / Decoding / Thumbnails / UI /
+// Metadata / Dialogs) and the main file touch these variables, so they are
+// DECLARED here (extern) and DEFINED once, in the same order, in "Globals.cpp"
+// - defining a global in a header would be an ODR violation, and per-module
+// accessors would be pure noise.
 //
-// The section banners below mark the groups of state that belong together. Most
-// of them are structs with one instance each: ViewState (g_view.zoom),
-// FullscreenState (g_fullscreen.initDone), ImageState (g_image.path),
-// AnimState (g_anim.frames), RenderPipeline (g_pipeline.mipTex),
+// The section banners below mark the groups of state that belong together. All
+// but the two control maps are structs with one instance each: AppIdentity
+// (g_app.mainWindow), DeviceResources (g_devices.renderTarget), ViewState
+// (g_view.zoom), BackgroundArt (g_background.bitmap), FullscreenState
+// (g_fullscreen.initDone), ImageState (g_image.path), AnimState (g_anim.frames),
+// RenderPipeline (g_pipeline.mipTex), AppSettings (g_settings.useHQFilter),
 // VignetteState (g_vignette.topVisibility), ThumbState (g_thumb.entries) and
-// SlideshowState (g_slideshow.active). Everything else in this file is a flat
-// global: the windows, the factories and devices, the control maps and the
-// ID enums at the bottom.
+// SlideshowState (g_slideshow.active). The only flat globals are the two control
+// maps, g_textBoxes and g_buttons; the ID enums and the slideshow timings are
+// not state at all.
 //
 // Two rules for anyone adding to this file:
+//   1. Declare here (extern), define in Globals.cpp - never define a
 //      global in a header. (The `constexpr` values and the ID enums below are
 //      the exception: a namespace-scope constexpr and an enumerator both have
 //      internal linkage, so each TU gets its own copy and that is fine and
@@ -61,7 +64,9 @@ using Microsoft::WRL::ComPtr;
 
 // Per-file view state (pan/zoom/rotation), remembered per image path so
 // returning to a file restores how you left it. Held in ViewState's
-// stateByPath map; read by the loader (Decoding) and written by UI + engine.
+// stateByPath map, which only image navigation touches: LoadImageD2D saves the
+// outgoing file's state, FinishImageLoad restores the incoming file's, and
+// DeleteCurrentImage erases the entry for a file that was deleted.
 struct ImageViewState {
     float zoom;
     float panX;        // image-center minus window-center, in pixels
@@ -178,18 +183,17 @@ constexpr float SLIDESHOW_FADE_STEP = 0.05f;
 #define WM_APP_EXITFULLSCREEN (WM_APP + 2)
 
 // ============================================================================
-// Globals - declared here, defined in Globals.cpp. The order is deliberate:
-// it fixes construction/destruction order for the whole process, so keep
-// Globals - declared here, defined in Globals.cpp. The order is deliberate:
-// it fixes construction/destruction order for the whole process, so keep
-// Globals.cpp in the same order. Each section banner below marks one struct,
-// with one instance (see the note at the top of this file).
+// Globals - declared here, defined in Globals.cpp. The order is deliberate: it
+// fixes construction/destruction order for the whole process, so keep
+// Globals.cpp in the same order. Each section banner below marks one group of
+// state (see the note at the top of this file).
 // ============================================================================
 
 // ---- Identity / lifetime ----
-// The module handle, the strings LoadString fills in, the three windows this app
-// creates, and the two flags that say whether it is going away or started from a
-// file. One instance: g_app.
+// The module handle, the strings LoadString fills in, the four windows this app
+// creates (main, fullscreen overlay, black cover, metadata viewer), and the two
+// flags that say whether it is going away or started from a file.
+// One instance: g_app.
 struct AppIdentity
 {
     HINSTANCE                                          instance;            // current instance
@@ -208,9 +212,9 @@ extern AppIdentity                                      g_app;
 // ---- Factories / devices ----
 // The D2D / WIC / DWrite / D3D11 factories and devices, the device contexts, the
 // swap chain and its views, plus the window the render target was created for.
-// DiscardDeviceResources releases the device-dependent ones; the factories
-// outlive them. Member order is the order they were declared in before, so
-// construction and destruction order is unchanged. One instance: g_devices.
+// DiscardDeviceResources releases the device-dependent ones; the factories and
+// the device-independent DWrite text format outlive them. One instance:
+// g_devices.
 struct DeviceResources
 {
     ComPtr<ID2D1Factory1>                              d2dFactory;
@@ -246,6 +250,11 @@ struct ViewState
     POINT                                            lastMouse = {};
     POINT                                            mouseFromDown = {};
     bool                                             isFullscreen = false;
+    // Process-wide UI scale in pixels: the smaller dimension of the monitor the app
+    // is on. Set in InitInstance from the primary monitor and overwritten by
+    // fullscreen stage 2 with the monitor actually being fullscreened. Read by
+    // UIElement's tooltip sizing; the widgets themselves use their own frozen
+    // Layout::uiPixelScale instead (see the anchor-capture row in CODE_MAP.md).
     float                                            uiPixelScale = 1.0f;
     float                                            rotationAngle = 0.0f;
     float                                            targetRotationAngle = 0.0f; // New rotation target
@@ -253,6 +262,12 @@ struct ViewState
     float                                            exifRotation = 0.0f;        // EXIF orientation for current image (degrees CW)
     std::unordered_map<std::wstring, ImageViewState> stateByPath;
     bool                                             restoredStateThisLoad = false;
+    // Spring rate for the zoom / pan / film-strip easing in UpdateEngine: the
+    // fraction of the remaining distance one 60 Hz frame consumes. It is
+    // re-derived from the monitor's refresh rate at three sites - wWinMain
+    // scales this default once per process, UI.cpp and Fullscreen.cpp assign
+    // their own base for the current monitor - so changing 0.13f on its own
+    // only moves the windowed start.
     float                                            smooth = 0.13f;
 };
 
@@ -342,10 +357,11 @@ extern ImageState                                      g_image;
 // Every animated format this app supports (GIF, WebP, APNG and AVIF) is decoded
 // into this same set of frame vectors and played back through the same code in
 // UpdateEngine/RecreateImageBitmap - only the per-frame *decode* routine differs
-// (DecodeGifCompositeFrames / DecodeWebpFrames / DecodeAvifFrames), because GIF
-// frames must be composited against prior frames' disposal state, while WebP and
-// AVIF frames each decode (or seek) independently. See LoadImageD2D for where the
-// three formats' loaders meet back up and populate this shared state.
+// (DecodeGifCompositeFrames / DecodeWebpFrames / DecodeApngFrames /
+// DecodeAvifFrames), because GIF and APNG frames must be composited against
+// prior frames' disposal state, while WebP and AVIF frames each decode (or seek)
+// independently. See LoadImageD2D for where the four formats' loaders meet back
+// up and populate this shared state.
 // One instance: g_anim.
 struct AnimState
 {
@@ -354,8 +370,8 @@ struct AnimState
     // GIF the frames cannot be parallelized at all (disposal makes them
     // inherently sequential - frame N's canvas state depends on frame N-1's
     // disposal); the only freedom is to run the whole sequential decode somewhere
-    // other than the UI thread. WebP frames are independent but are still decoded
-    // on this same background thread for a uniform loading path.
+    // other than the UI thread. WebP and AVIF frames are independent but are
+    // still decoded on this same background thread for a uniform loading path.
     // framesReadyUpTo is the count of frames, starting from 0, that are safe to
     // display right now; it only ever grows, and only that thread writes past
     // index 0.
@@ -364,7 +380,7 @@ struct AnimState
     ULONGLONG                              lastFrameTime = 0;
     std::vector<UINT>                      frameDelays;
     UINT                                   currentFrame = 0;
-    bool                                   isAnimated = false;  // animated GIF, WebP and AVIF alike
+    bool                                   isAnimated = false;  // GIF, WebP, APNG and AVIF alike
     std::thread                            decodeThread;
     std::atomic<bool>                      decodeStop{ false };
     std::atomic<int>                       framesReadyUpTo{ 0 };
@@ -373,19 +389,43 @@ struct AnimState
 extern AnimState                                         g_anim;
 
 // ---- UI controls ----
+// The widgets themselves, keyed by the control IDs above. The two menu buttons
+// are created by InitializeMenuButtons at startup; the 9 in-image buttons and
+// the two text boxes only exist after the first fullscreen stage 2 (see
+// CODE_MAP.md section 8). Every COM object they hold comes from the DWrite
+// factory rather than the render target, so DiscardDeviceResources leaves them
+// alone and they survive a device loss.
 extern std::unordered_map<TextBoxId, UITextBox>          g_textBoxes;
 extern std::unordered_map<ButtonId, AnimatedButton>      g_buttons;
 
 // ---- D3D11 mip-mapped image rendering pipeline ----
-// The objects the image pass builds once at device-init and reuses every frame:
-// the mip chain for the current image, the shaders and fixed-function state that
-// draw it, and the two D2D solid brushes the surrounding passes reuse. Member
-// order is the order they were declared in before, so construction and
-// destruction order is unchanged. One instance: g_pipeline.
+// The objects the image pass reuses every frame: the shaders and fixed-function
+// state that draw it (built once per device), the mip chain for the current
+// image (rebuilt per image), and the D2D brushes the surrounding passes reuse.
+// Every D2D resource here belongs to the device context that made it, so
+// DiscardDeviceResources (Rendering.cpp, the same file that creates them) resets
+// all of them - the D3D11 objects along with them. One instance: g_pipeline.
 struct RenderPipeline
 {
     ComPtr<ID2D1SolidColorBrush>                       dimBrush;
     ComPtr<ID2D1SolidColorBrush>                       blackBrush;
+
+    // The load-error screen's text brushes. Their colours are constants, so they
+    // are created once per device context instead of once per frame.
+    ComPtr<ID2D1SolidColorBrush>                       errorTitleBrush;
+    ComPtr<ID2D1SolidColorBrush>                       errorDetailBrush;
+
+    // Cached vignette gradient brushes, one per bar: slot 0 is the top bar (dark
+    // at the top), slot 1 the bottom bar (dark at the bottom). A gradient brush's
+    // stops are fixed when it is created, so the brush can only be reused while
+    // the bar geometry and the stop alpha are unchanged - true for every idle
+    // frame, not during a fade. See DrawVignetteBar.
+    struct VignetteBrushCache
+    {
+        ComPtr<ID2D1LinearGradientBrush>               brush;
+        float y0 = -1.f, y1 = -1.f, alpha = -1.f;      // -1 = nothing cached
+    };
+    VignetteBrushCache                                 vignetteBrush[2];
 
     ComPtr<ID3D11Texture2D>                            mipTex;        // Full mip chain for the current image
     ComPtr<ID3D11ShaderResourceView>                   srv;           // SRV: all mip levels
@@ -432,7 +472,9 @@ struct VignetteState
     // grow/shrink with the window.
     float                                           topBarHeightPx = 0.f;
     float                                           bottomBarHeightPx = 0.f;
-    // Activation zone thresholds captured at fullscreen init (OffsetFromStart / OffsetFromEnd).
+    // Activation zone thresholds in pixels, captured at the same fullscreen
+    // stage 2 as the bar heights: how far in from the top / bottom edge of the
+    // overlay the zone reaches.
     // Top zone:    show when mouseY <= topActivationPx                  (inset from top)
     // Bottom zone: show when mouseY >= windowHeight - bottomActivationPx (inset from bottom)
     float                                           topActivationPx = 0.f;
@@ -460,9 +502,12 @@ struct ThumbState
     float                                                             gap                    = 0.f;
     float                                                             stripInsetFromBottomPx = 0.f;  // pixels from RT bottom to strip centre (anchored like vignettes)
     bool                                                              sizeCaptured           = false;
-    // Exactly ONE geometry: every slot has the same shape, and DrawThumbnailStrip
-    // places each slot by transforming the render target rather than building a
-    // geometry per slot. The vector is plural because it is indexed by position.
+    // Holds exactly ONE element, and DrawThumbnailStrip always uses clipGeos[0]:
+    // every slot has the same shape, so each one is placed by transforming the
+    // render target instead of building a geometry per slot. Created at
+    // fullscreen stage 2 once the strip size has been re-captured, and cleared
+    // there (and in WM_DESTROY) so it is rebuilt against the new size. It comes
+    // from the D2D factory, not the device context, so it survives a device loss.
     std::vector<Microsoft::WRL::ComPtr<ID2D1RoundedRectangleGeometry>> clipGeos; // one shared slot shape, placed by the RT transform
 
     // Drag / momentum, while LMB is held over the strip.
